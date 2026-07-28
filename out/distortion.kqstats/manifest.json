@@ -1,0 +1,59 @@
+{
+ "schema_version": 1,
+ "producer": "kquant-distortion",
+ "model": "moonshotai/Kimi-K3",
+ "revision": "9f62e4e9fffbd0a83ddd60e1c209d828994b3569",
+ "keys": [
+  "distortion.nf2",
+  "distortion.nf2_refit",
+  "distortion.nf3",
+  "distortion.nf3_refit",
+  "distortion_fold.nf2",
+  "distortion_fold.nf2_refit",
+  "distortion_fold.nf3",
+  "distortion_fold.nf3_refit",
+  "fold_ref"
+ ],
+ "kind": "distortion",
+ "formats": {
+  "nf3": [
+   -1.0,
+   -0.6047,
+   -0.3563,
+   -0.1275,
+   0.1275,
+   0.3563,
+   0.6047,
+   1.0
+  ],
+  "nf2": [
+   -1.0,
+   -0.3563,
+   0.3563,
+   1.0
+  ],
+  "nf3_refit": [
+   -1.0,
+   -0.5872467351515301,
+   -0.3084304301834062,
+   -0.10214881220886773,
+   0.10214881220886773,
+   0.3084304301834062,
+   0.5872467351515301,
+   1.0
+  ],
+  "nf2_refit": [
+   -1.0,
+   -0.31143847072721575,
+   0.31143847072721575,
+   1.0
+  ]
+ },
+ "fold_u": true,
+ "scale_search": [
+  1.0
+ ],
+ "device": "cuda:2",
+ "batches": 3864,
+ "elapsed_s": 2037.3
+}

@@ -1,0 +1,27 @@
+{
+ "schema_version": 1,
+ "producer": "kquant-static",
+ "model": "moonshotai/Kimi-K3",
+ "revision": "9f62e4e9fffbd0a83ddd60e1c209d828994b3569",
+ "keys": [
+  "code_hist",
+  "entropy",
+  "joint_hist",
+  "kurtosis",
+  "m2_sum",
+  "n_elem",
+  "present_count",
+  "router_bias",
+  "router_row_norm",
+  "sat_frac",
+  "scale_exp_max",
+  "scale_exp_mean",
+  "scale_exp_min",
+  "zero_frac"
+ ],
+ "kind": "static",
+ "device": "cuda:2",
+ "batches": 1932,
+ "elapsed_s": 1672.0,
+ "layers_restricted": null
+}
