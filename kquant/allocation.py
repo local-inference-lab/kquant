@@ -19,12 +19,13 @@ def save_allocation(
     budget_info: dict,
     ranker_info: dict,
     solver_info: dict,
+    revision: str = C.REVISION,
 ) -> Path:
     path = Path(path)
     doc = {
         "schema_version": SCHEMA_VERSION,
         "model": C.MODEL_ID,
-        "revision": C.REVISION,
+        "revision": revision,
         "formats": alloc.formats,
         "budget": budget_info,
         "ranker": ranker_info,

@@ -140,7 +140,7 @@ def pack_artifact(
     config = {
         "kind": "kquant_hybrid_artifact",
         "model": C.MODEL_ID,
-        "revision": C.REVISION,
+        "revision": cache.snapshot_dir.name,
         "non_expert_source": "original checkpoint (tensors unchanged)",
         "formats": {
             "keep_mxfp4": {"storage": "source compressed-tensors passthrough"},

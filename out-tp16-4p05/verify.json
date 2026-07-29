@@ -1,0 +1,18 @@
+{
+ "samples": 256,
+ "keep_bitwise_ok": 203,
+ "keep_bitwise_bad": 0,
+ "demoted_deterministic_ok": 53,
+ "demoted_deterministic_bad": 0,
+ "mse_by_format": {
+  "nf3": {
+   "mean": 2.513617670596226e-05,
+   "max": 2.7672387659549713e-05,
+   "n": 53
+  }
+ },
+ "artifact_tensor_bytes": 1378385068032,
+ "artifact_file_bytes": 1378459503896,
+ "config_total_bytes": 1378385068032,
+ "ok": true
+}

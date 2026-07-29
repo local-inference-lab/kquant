@@ -151,6 +151,7 @@ def cmd_rank(args):
         {"ranker": "l0", "traffic": args.traffic, "alpha": args.traffic_alpha,
          "w2": args.w2, "demoted_formats": demoted},
         {"min_keep_per_layer": args.min_keep},
+        revision=args.revision,
     )
     print(
         f"allocation: {alloc.counts()} | ranked layers: {len(alloc.layers_solved)} "
