@@ -18,6 +18,7 @@ long as experts of a layer share it.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -114,7 +115,9 @@ def write_layer_shard(
 ) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     path = dest / f"exl3-layer-{layer:05d}.safetensors"
-    save_file(tensors, str(path))
+    tmp = dest / f".exl3-layer-{layer:05d}.{os.getpid()}.safetensors.tmp"
+    save_file(tensors, str(tmp))
+    tmp.rename(path)
     return path
 
 

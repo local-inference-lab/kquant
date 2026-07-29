@@ -59,17 +59,18 @@ def compute_allocation(dest: Path, keep_frac: float) -> dict:
     return alloc
 
 
-def worker(worker_id: int, dest: Path) -> None:
+def worker(worker_id: int, dest: Path, layers: list[int] | None = None) -> None:
     import torch
 
     from kquant.io.hf_cache import resolve
     from kquant.pack.exl3 import make_shared_h, quantize_layer, write_layer_shard
 
     alloc = json.loads((dest / "allocation-exl3.json").read_text())["layers"]
-    layers = [
-        int(layer) for i, layer in enumerate(sorted(alloc, key=int))
-        if i % NUM_GPUS == worker_id
-    ]
+    if layers is None:
+        layers = [
+            int(layer) for i, layer in enumerate(sorted(alloc, key=int))
+            if i % NUM_GPUS == worker_id
+        ]
     cache = resolve()
     dev = torch.device("cuda", 0)  # CUDA_VISIBLE_DEVICES pins the physical GPU
     shared_h = {k: make_shared_h(k, dev) for k in (3584, 3072)}
@@ -119,8 +120,13 @@ if __name__ == "__main__":
     ap.add_argument("--dest", type=Path, required=True)
     ap.add_argument("--keep-frac", type=float, default=0.152)
     ap.add_argument("--worker", type=int, default=None)
+    ap.add_argument("--layers", type=str, default=None,
+                    help="comma-separated explicit layer list (overrides modulo)")
     args = ap.parse_args()
     if args.worker is None:
         parent(args.dest, args.keep_frac)
     else:
-        worker(args.worker, args.dest)
+        layers = (
+            [int(x) for x in args.layers.split(",")] if args.layers else None
+        )
+        worker(args.worker, args.dest, layers)
