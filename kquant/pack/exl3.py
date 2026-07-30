@@ -94,17 +94,23 @@ def quantize_layer(
                     load_tensor(cache, base + ".weight_scale").to(device),
                 ).float()
                 weights.append(w.T.contiguous())  # (in, out)
-                qas.append(
-                    {
-                        "K": BITS,
-                        "seed": expert_seed(layer, e, matrix),
-                        "sigma_reg": SIGMA_REG,
-                        "devices": [f"cuda:{device.index or 0}"],
-                        "device_ratios": None,
-                        "apply_out_scales": False,
-                        "mcg": True,
-                    }
-                )
+                qa = {
+                    "K": BITS,
+                    "seed": expert_seed(layer, e, matrix),
+                    "sigma_reg": SIGMA_REG,
+                    "devices": [f"cuda:{device.index or 0}"],
+                    "device_ratios": None,
+                    "apply_out_scales": False,
+                    "mcg": True,
+                }
+                if SHARED_SU and matrix in ("w1", "w3"):
+                    # Collapse the TP-replicated H-side su across experts:
+                    # shared channel-scale profile + g_scale folded into the
+                    # sharded sv instead. (w2's replicated vector is svh,
+                    # already pure shared-seed signs.)
+                    qa["shared_input_scales_key"] = f"{layer}:{matrix}"
+                    qa["g_scale_into_sv"] = True
+                qas.append(qa)
             kdim = weights[0].shape[0]
             shared_h = shared_h_by_k[kdim]
             results = quantize_exl3_batch(weights, [shared_h] * len(group), qas)
