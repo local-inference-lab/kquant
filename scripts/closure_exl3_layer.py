@@ -64,7 +64,7 @@ def reference_forward(cache, layer, experts, x, topk_ids, topk_w):
 def trellis_forward(art, layer, experts, x, topk_ids, topk_w, mcg,
                     broadcast=False):
     """TP12-sliced trellis kernel forward; per-rank partials summed."""
-    from sparkinfer.moe import trellis_moe
+    from sparkinfer.moe import fused_moe
 
     dev = x.device
     E = len(experts)
@@ -111,38 +111,49 @@ def trellis_forward(art, layer, experts, x, topk_ids, topk_w, mcg,
         inter_rot = torch.cat(
             [w13_svh[:, 0, sl], w2_suh[:, sl], w13_svh[:, 1, sl]], dim=1
         ).contiguous()
-        weights = trellis_moe.prepare_weights(
-            w13_tr[:, :, :, sl_t].permute(1, 0, 2, 3, 4).contiguous(),
-            w2_tr[:, sl_t].contiguous(),
+        wplan = fused_moe.plan_weights(
+            quant_modes="w4a16",
+            source_format="exl3_trellis_mcg",
+            activation="situ",
+            params_dtype=x.dtype,
+            num_experts=E,
+            hidden_size=HIDDEN,
+            intermediate_size=INTER // TP,
+            w13_layout="w13",
+            trellis_bits=3,
+        )
+        weights = fused_moe.prepare_weights(
+            plan=wplan,
+            params_dtype=x.dtype,
+            w1_fp4=w13_tr[:, :, :, sl_t].permute(1, 0, 2, 3, 4).contiguous(),
+            w2_fp4=w2_tr[:, sl_t].contiguous(),
             gate_suh=w13_suh[:, 0].contiguous(),
             up_suh=w13_suh[:, 1].contiguous(),
             intermediate_rotations=inter_rot,
             down_svh=w2_svh.contiguous(),
-            codebook="mcg",
-            mcg=mcg,
+            trellis_mcg=mcg,
         )
-        caps = trellis_moe.Caps(
-            max_tokens=m,
-            num_topk=TOPK,
-            num_experts=E,
-            hidden_size=HIDDEN,
-            intermediate_size=INTER // TP,
-            device=dev.index or 0,
-            activation="situ",
-            trellis_bits=3,
-            route_num_experts=E,
+        plan = fused_moe.plan(
+            fused_moe.Caps(
+                max_tokens=m,
+                num_topk=TOPK,
+                device=dev,
+                weight_plan=weights.plan,
+                quant_mode="w4a16",
+                route_num_experts=E,
+            )
         )
-        plan = trellis_moe.plan(caps)
-        scratch = torch.empty(plan.scratch_nbytes, dtype=torch.uint8, device=dev)
-        binding = trellis_moe.bind(
+        spec = plan.scratch_specs()[0]
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        binding = fused_moe.bind(
             plan,
             scratch=scratch,
             a=x.contiguous(),
-            weights=weights,
+            experts=weights,
             topk_weights=topk_w,
             topk_ids=topk_ids,
         )
-        y += trellis_moe.run(binding=binding)[:m]
+        y += fused_moe.run(binding=binding)[:m].to(y.dtype)
         del weights, scratch
         torch.cuda.empty_cache()
     return y

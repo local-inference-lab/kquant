@@ -18,7 +18,7 @@ from pathlib import Path
 from safetensors import safe_open
 
 ART = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/models/Kimi-K3-EXL3-3p19")
-NONEXPERT_SRC = Path("/models/Kimi-K3-NF3R-Uniform-3p25-serve")
+NONEXPERT_SRC = Path("/models/Kimi-K3-mxfp8-nonexpert")
 DEST = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(str(ART) + "-serve")
 
 
@@ -87,6 +87,13 @@ def main() -> None:
         "trellis": {"bits": 3, "codebook": "mcg",
                     "mcg_mult": manifest["mcg_mult"],
                     "shared_su": artifact_is_shared_su(ART, alloc)},
+        # Non-expert linears are offline-baked MXFP8 (fp8 + e8m0 scales);
+        # the listed modules stay BF16.
+        "dense_format": "mxfp8",
+        "ignored_layers": [
+            "kv_b_proj", "g_proj", "f_a_proj", "f_b_proj", "b_proj",
+            "vision_tower", "mm_projector",
+        ],
     }
     cfg.pop("quantization_config", None)
     (DEST / "config.json").write_text(json.dumps(cfg, indent=1))
