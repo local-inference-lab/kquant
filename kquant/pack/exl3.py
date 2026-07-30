@@ -36,7 +36,15 @@ SIGMA_REG = 0.025
 MCG_MULT = 0xCBAC1FED  # exllamav3 codebook_mcg_mult; recorded in the manifest
 
 
+# Shared-su mode: one seed per (layer, matrix) so every expert draws the same
+# su/sv sign vectors. Collapses the TP-replicated H-side vectors from [E, H]
+# to [H]. Quality gate: A/B closure test vs per-expert seeds.
+SHARED_SU = os.environ.get("KQUANT_EXL3_SHARED_SU") == "1"
+
+
 def expert_seed(layer: int, expert: int, matrix: str) -> int:
+    if SHARED_SU:
+        return layer * 1_000_000 + MATRICES.index(matrix)
     return layer * 1_000_000 + expert * 10 + MATRICES.index(matrix)
 
 
