@@ -38,6 +38,8 @@ def reference_forward(cache, layer, experts, x, topk_ids, topk_w):
     """fp32 SiTU MoE over dequantized MXFP4 source weights."""
     y = torch.zeros(x.shape[0], HIDDEN, dtype=torch.float32, device=x.device)
     ws = {}
+    # fp16 storage (fp32 doesn't fit alongside a running pack worker); GPU
+    # matmuls accumulate fp32, and both A/B arms share the same reference.
     for e in experts:
         base = (
             f"language_model.model.layers.{layer}.block_sparse_moe."
@@ -47,18 +49,20 @@ def reference_forward(cache, layer, experts, x, topk_ids, topk_w):
             dequant(
                 load_tensor(cache, f"{base}.{m}.weight_packed"),
                 load_tensor(cache, f"{base}.{m}.weight_scale"),
-            ).to(x.device, torch.float32)
+            ).to(x.device, torch.float16)
             for m in ("w1", "w3", "w2")
         ]
     for t in range(x.shape[0]):
+        xt = x[t].to(torch.float16)
         for k in range(TOPK):
             w1, w3, w2 = ws[experts[int(topk_ids[t, k])]]
-            h = situ(x[t].float() @ w1.T, x[t].float() @ w3.T)
-            y[t] += topk_w[t, k].float() * (h @ w2.T)
+            h = situ((xt @ w1.T).float(), (xt @ w3.T).float())
+            y[t] += topk_w[t, k].float() * (h.half() @ w2.T).float()
     return y
 
 
-def trellis_forward(art, layer, experts, x, topk_ids, topk_w, mcg):
+def trellis_forward(art, layer, experts, x, topk_ids, topk_w, mcg,
+                    broadcast=False):
     """TP12-sliced trellis kernel forward; per-rank partials summed."""
     from sparkinfer.moe import trellis_moe
 
@@ -88,6 +92,15 @@ def trellis_forward(art, layer, experts, x, topk_ids, topk_w, mcg):
         w2_tr = torch.stack([g(e, "w2", "trellis") for e in experts]).to(dev)
         w2_suh = torch.stack([g(e, "w2", "suh") for e in experts]).to(dev)
         w2_svh = torch.stack([g(e, "w2", "svh") for e in experts]).to(dev)
+
+    if broadcast:
+        # shared-su artifact: collapse identical per-expert H-side rows to
+        # [1, H] broadcast tables, exercising the zero-expert-stride kernels
+        assert torch.equal(w13_suh[0], w13_suh[1]) and torch.equal(
+            w2_svh[0], w2_svh[1]
+        ), "--broadcast requires a shared-su artifact"
+        w13_suh = w13_suh[:1]
+        w2_svh = w2_svh[:1]
 
     it, m = INTER // TP // 16, x.shape[0]
     y = torch.zeros(m, HIDDEN, dtype=x.dtype, device=dev)
@@ -141,6 +154,7 @@ def main() -> None:
     ap.add_argument("--layer", type=int, default=46)
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--broadcast", action="store_true")
     args = ap.parse_args()
 
     cache = resolve()
@@ -166,7 +180,7 @@ def main() -> None:
 
     y_q = trellis_forward(
         args.artifact, args.layer, experts, x, topk_ids, topk_w,
-        manifest["mcg_mult"],
+        manifest["mcg_mult"], broadcast=args.broadcast,
     )
     y_ref = reference_forward(cache, args.layer, experts, x, topk_ids, topk_w)
 

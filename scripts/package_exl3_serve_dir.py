@@ -17,9 +17,27 @@ from pathlib import Path
 
 from safetensors import safe_open
 
-ART = Path("/models/Kimi-K3-EXL3-3p19")
+ART = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/models/Kimi-K3-EXL3-3p19")
 NONEXPERT_SRC = Path("/models/Kimi-K3-NF3R-Uniform-3p25-serve")
-DEST = Path("/models/Kimi-K3-EXL3-3p19-serve")
+DEST = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(str(ART) + "-serve")
+
+
+def artifact_is_shared_su(art: Path, alloc: dict) -> bool:
+    """True if the artifact stores identical H-side su rows across experts
+    (kquant shared-su pack); verified against real tensors, not metadata."""
+    import torch
+
+    layer = sorted(alloc, key=int)[0]
+    dem = alloc[layer]["exl3"]
+    base = (
+        f"language_model.model.layers.{layer}.block_sparse_moe.experts"
+    )
+    with safe_open(
+        str(art / f"exl3-layer-{int(layer):05d}.safetensors"), framework="pt"
+    ) as sf:
+        a = sf.get_tensor(f"{base}.{dem[0]}.w1.exl3_suh")
+        b = sf.get_tensor(f"{base}.{dem[1]}.w1.exl3_suh")
+    return torch.equal(a, b)
 
 
 def main() -> None:
@@ -67,7 +85,8 @@ def main() -> None:
         "kept_format": "mxfp4_e8m0k32",
         "demoted_format": "exl3_3",
         "trellis": {"bits": 3, "codebook": "mcg",
-                    "mcg_mult": manifest["mcg_mult"]},
+                    "mcg_mult": manifest["mcg_mult"],
+                    "shared_su": artifact_is_shared_su(ART, alloc)},
     }
     cfg.pop("quantization_config", None)
     (DEST / "config.json").write_text(json.dumps(cfg, indent=1))
