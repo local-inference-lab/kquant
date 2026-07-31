@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import re
 from concurrent.futures import ProcessPoolExecutor
@@ -30,6 +31,8 @@ from safetensors.torch import save_file
 SRC = "/models/Kimi-K3-NF3R-Uniform-3p25-serve"
 DEST = "/models/Kimi-K3-mxfp8-nonexpert"
 BLOCK = 32
+SHARD_BYTES = 8 << 30
+EXPERT = re.compile(r"\.experts\.\d+\.(w1|w2|w3)\.")
 
 # Mirrors the serving overlay: linear+shared_experts -> mxfp8, minus ignores.
 TARGET = re.compile(
@@ -87,12 +90,96 @@ def process_shard(args: tuple) -> str:
     return f"{Path(src_file).name}: {n_baked} baked"
 
 
+def process_source_checkpoint(dest_dir: str) -> None:
+    """Extract and bake non-expert tensors directly from the HF checkpoint.
+
+    This avoids materializing the roughly 135-GiB BF16 Phase-A side shards
+    before converting their eligible 2-D linears to MXFP8.  The emitted file
+    names intentionally match the overlay contract consumed by
+    package_exl3_serve_dir.py.
+    """
+    from kquant.io.hf_cache import resolve
+
+    cache = resolve()
+    index_path = Path(cache.snapshot_dir) / "model.safetensors.index.json"
+    weight_map = json.loads(index_path.read_text())["weight_map"]
+    nonexpert = [name for name in weight_map if not EXPERT.search(name)]
+    by_shard: dict[str, list[str]] = {}
+    for name in nonexpert:
+        by_shard.setdefault(weight_map[name], []).append(name)
+
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    buf: dict[str, torch.Tensor] = {}
+    buf_bytes = 0
+    out_idx = 0
+    total_bytes = 0
+    total_baked = 0
+
+    def flush() -> None:
+        nonlocal buf, buf_bytes, out_idx
+        if not buf:
+            return
+        out_path = dest / f"00-nonexpert-{out_idx:05d}.safetensors"
+        save_file(buf, str(out_path))
+        print(
+            f"{out_path.name}: {buf_bytes / 2**30:.2f} GiB, "
+            f"{len(buf)} tensors",
+            flush=True,
+        )
+        out_idx += 1
+        buf = {}
+        buf_bytes = 0
+
+    for shard_name, names in sorted(by_shard.items()):
+        with safe_open(str(cache.shard_paths[shard_name]), framework="pt") as sf:
+            for name in names:
+                tensor = sf.get_tensor(name)
+                emitted = {name: tensor}
+                if is_target(name, tuple(tensor.shape)):
+                    quantized, scale = mxfp8_quantize_cpu(tensor)
+                    scale_name = name.replace(".weight", ".weight_scale")
+                    if scale_name in weight_map:
+                        raise ValueError(
+                            f"generated MXFP8 scale collides with source tensor "
+                            f"{scale_name}"
+                        )
+                    emitted = {name: quantized, scale_name: scale}
+                    total_baked += 1
+                for emitted_name, emitted_tensor in emitted.items():
+                    if emitted_name in buf:
+                        raise ValueError(f"duplicate output tensor {emitted_name}")
+                    buf[emitted_name] = emitted_tensor
+                    nbytes = emitted_tensor.numel() * emitted_tensor.element_size()
+                    buf_bytes += nbytes
+                    total_bytes += nbytes
+                if buf_bytes >= SHARD_BYTES:
+                    flush()
+    flush()
+    print(
+        f"done: {len(nonexpert)} source tensors, {total_baked} MXFP8 linears, "
+        f"{total_bytes / 2**30:.2f} GiB in {out_idx} shards",
+        flush=True,
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=SRC)
     ap.add_argument("--dest", default=DEST)
     ap.add_argument("--jobs", type=int, default=12)
+    ap.add_argument(
+        "--from-source-checkpoint",
+        action="store_true",
+        help=(
+            "extract non-expert tensors from the resolved official checkpoint "
+            "and bake MXFP8 directly, without Phase-A side shards"
+        ),
+    )
     args = ap.parse_args()
+    if args.from_source_checkpoint:
+        process_source_checkpoint(args.dest)
+        return
     os.makedirs(args.dest, exist_ok=True)
     shards = sorted(glob.glob(f"{args.src}/00-nonexpert-*.safetensors"))
     work = [(s, args.dest) for s in shards]
