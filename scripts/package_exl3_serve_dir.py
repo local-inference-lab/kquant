@@ -107,7 +107,10 @@ def main() -> None:
             "g_proj",
             "f_a_proj",
             "f_b_proj",
-            "b_proj",
+            # The loader matches ignored entries as substrings.  Keep the
+            # KDA projection ignored without accidentally matching MLA's
+            # q_b_proj, which is present in the offline MXFP8 overlay.
+            ".b_proj",
             "vision_tower",
             "mm_projector",
         ],
