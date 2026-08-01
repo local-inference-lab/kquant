@@ -253,6 +253,7 @@ def _run_prepared(
             # global routing workspace here silently changes that contract.
             route_num_experts=0,
             quant_mode="w4a16",
+            w4a16_block_size_m=64,
             frozen=True,
         )
     )
