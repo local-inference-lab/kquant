@@ -19,6 +19,12 @@ from safetensors import safe_open
 
 DEFAULT_ARTIFACT = Path("/models/Kimi-K3-EXL3-3p19")
 DEFAULT_NONEXPERT = Path("/models/Kimi-K3-mxfp8-nonexpert")
+_TP_LOCAL_TRELLIS_KEYS = (
+    "compatible_tp_sizes",
+    "tp_local_quantization",
+    "tp_local_intermediate_size",
+    "intermediate_hadamard_blocks",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +51,50 @@ def artifact_is_shared_su(art: Path, alloc: dict) -> bool:
     return torch.equal(a, b)
 
 
+def trellis_config(manifest: dict, *, shared_su: bool) -> dict:
+    config = {
+        "bits": 3,
+        "codebook": "mcg",
+        "mcg_mult": manifest["mcg_mult"],
+        "shared_su": bool(shared_su),
+    }
+    for key in _TP_LOCAL_TRELLIS_KEYS:
+        if key in manifest:
+            config[key] = manifest[key]
+    return config
+
+
+def require_complete_tp_build(artifact: Path, manifest: dict, alloc: dict) -> None:
+    if not manifest.get("tp_local_quantization"):
+        return
+    if manifest.get("build_complete") is not True:
+        raise RuntimeError("refusing to package an incomplete TP-local EXL3 artifact")
+    compatible = manifest.get("compatible_tp_sizes")
+    if not isinstance(compatible, list) or len(compatible) != 1:
+        raise RuntimeError("TP-local artifact must declare exactly one TP size")
+    build_id = manifest.get("build_id")
+    if not isinstance(build_id, str) or not build_id:
+        raise RuntimeError("TP-local artifact has no build_id")
+
+    try:
+        from scripts.pack_exl3_12gpu import layer_is_complete
+    except ModuleNotFoundError:
+        # Direct ``python /path/to/scripts/package_exl3_serve_dir.py`` puts the
+        # scripts directory, rather than the repository root, on sys.path.
+        from pack_exl3_12gpu import layer_is_complete
+
+    missing = [
+        int(layer)
+        for layer in sorted(alloc, key=int)
+        if not layer_is_complete(artifact, int(layer), build_id, int(compatible[0]))
+    ]
+    if missing:
+        raise RuntimeError(
+            f"refusing TP-local artifact with {len(missing)} incomplete layer(s); "
+            f"sample={missing[:8]}"
+        )
+
+
 def main() -> None:
     from kquant.io.hf_cache import resolve
 
@@ -54,9 +104,11 @@ def main() -> None:
     nonexpert = args.nonexpert
     cache = resolve()
     snap = Path(cache.snapshot_dir)
-    destination.mkdir(parents=True, exist_ok=True)
     alloc_doc = json.loads((artifact / "allocation-exl3.json").read_text())
     alloc = alloc_doc["layers"]
+    manifest = json.loads((artifact / "kquant_exl3_manifest.json").read_text())
+    require_complete_tp_build(artifact, manifest, alloc)
+    destination.mkdir(parents=True, exist_ok=True)
 
     weight_map: dict[str, str] = {}
     total = 0
@@ -80,12 +132,12 @@ def main() -> None:
     )
     print(f"index: {len(weight_map)} tensors, {total / 2**30:.1f} GiB", flush=True)
 
-    manifest = json.loads((artifact / "kquant_exl3_manifest.json").read_text())
     bit_map = {
         layer: [4 if e in set(v["keep"]) else 3 for e in range(896)]
         for layer, v in ((k, alloc[k]) for k in sorted(alloc, key=int))
     }
     cfg = json.loads((snap / "config.json").read_text())
+    trellis = trellis_config(manifest, shared_su=artifact_is_shared_su(artifact, alloc))
     cfg["text_config"]["quantization_config"] = {
         "quant_method": "modelopt",
         "quant_algo": "NVFP4",
@@ -93,12 +145,7 @@ def main() -> None:
         "hybrid_bit_map": bit_map,
         "kept_format": "mxfp4_e8m0k32",
         "demoted_format": "exl3_3",
-        "trellis": {
-            "bits": 3,
-            "codebook": "mcg",
-            "mcg_mult": manifest["mcg_mult"],
-            "shared_su": artifact_is_shared_su(artifact, alloc),
-        },
+        "trellis": trellis,
         # Non-expert linears are offline-baked MXFP8 (fp8 + e8m0 scales);
         # the listed modules stay BF16.
         "dense_format": "mxfp8",

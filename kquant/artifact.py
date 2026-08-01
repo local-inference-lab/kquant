@@ -17,6 +17,7 @@ _EXPERT_RE = re.compile(
 _MATRICES = ("w1", "w2", "w3")
 _KEPT_SUFFIXES = ("weight_packed", "weight_scale")
 _EXL3_SUFFIXES = ("exl3_suh", "exl3_svh", "exl3_trellis")
+_TP_LOCAL_BUILD_VERSION = 1
 
 
 @dataclass
@@ -85,10 +86,7 @@ def _expert_names(
     kept: bool,
 ) -> Iterator[str]:
     suffixes = _KEPT_SUFFIXES if kept else _EXL3_SUFFIXES
-    base = (
-        f"language_model.model.layers.{layer}.block_sparse_moe."
-        f"experts.{expert}"
-    )
+    base = f"language_model.model.layers.{layer}.block_sparse_moe.experts.{expert}"
     for matrix in _MATRICES:
         for suffix in suffixes:
             yield f"{base}.{matrix}.{suffix}"
@@ -135,9 +133,7 @@ def _load_allocation(
             issues.add(f"layer {layer}: duplicate EXL3 expert ID")
         overlap = kept & exl3
         if overlap:
-            issues.add(
-                f"layer {layer}: {len(overlap)} experts occur in both tiers"
-            )
+            issues.add(f"layer {layer}: {len(overlap)} experts occur in both tiers")
         covered = kept | exl3
         if covered != universe:
             missing = sorted(universe - covered)
@@ -171,9 +167,7 @@ def validate_exl3_artifact(
     num_hidden_layers = int(text["num_hidden_layers"])
     expected_layers = list(range(1, num_hidden_layers))
     if hidden_size % 32 or intermediate_size % 32:
-        issues.add(
-            "routed hidden and intermediate sizes must both be divisible by 32"
-        )
+        issues.add("routed hidden and intermediate sizes must both be divisible by 32")
 
     allocation, allocation_document = _load_allocation(
         artifact_dir / "allocation-exl3.json",
@@ -181,9 +175,7 @@ def validate_exl3_artifact(
         num_experts=num_experts,
         issues=issues,
     )
-    manifest = json.loads(
-        (artifact_dir / "kquant_exl3_manifest.json").read_text()
-    )
+    manifest = json.loads((artifact_dir / "kquant_exl3_manifest.json").read_text())
     if manifest.get("kind") != "kquant_exl3_artifact":
         issues.add("manifest kind is not kquant_exl3_artifact")
     if int(manifest.get("bits", -1)) != 3:
@@ -192,22 +184,86 @@ def validate_exl3_artifact(
         issues.add("manifest codebook is not mcg")
     if not isinstance(manifest.get("mcg_mult"), int):
         issues.add("manifest mcg_mult is not an integer")
+    tp_local = bool(manifest.get("tp_local_quantization", False))
+    if tp_local:
+        compatible_tp = manifest.get("compatible_tp_sizes")
+        if not isinstance(compatible_tp, list) or len(compatible_tp) != 1:
+            issues.add("TP-local manifest must declare one compatible TP size")
+            compatible_tp = []
+        tp_size = int(compatible_tp[0]) if compatible_tp else -1
+        expected_local = intermediate_size // tp_size if tp_size > 0 else -1
+        if tp_size <= 0 or intermediate_size % tp_size:
+            issues.add(f"TP-local manifest has invalid TP size {tp_size}")
+        if manifest.get("tp_local_intermediate_size") != expected_local:
+            issues.add(
+                "TP-local manifest intermediate mismatch: "
+                f"{manifest.get('tp_local_intermediate_size')} != {expected_local}"
+            )
+        expected_blocks = [128, 64] if expected_local % 128 else [128]
+        if manifest.get("intermediate_hadamard_blocks") != expected_blocks:
+            issues.add("TP-local manifest Hadamard blocks do not match its geometry")
+        if manifest.get("build_complete") is not True:
+            issues.add("TP-local manifest is not marked build_complete")
+        if manifest.get("build_version") != _TP_LOCAL_BUILD_VERSION:
+            issues.add(
+                f"TP-local manifest build_version is not {_TP_LOCAL_BUILD_VERSION}"
+            )
+        if manifest.get("shared_su") is not True:
+            issues.add("TP-local manifest must declare shared_su=true")
+        build_id = manifest.get("build_id")
+        if not isinstance(build_id, str) or not build_id:
+            issues.add("TP-local manifest has no build_id")
+        else:
+            marked_layers: set[int] = set()
+            for marker_path in artifact_dir.glob(".exl3-layer-*.complete.json"):
+                try:
+                    marker = json.loads(marker_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    issues.add(f"invalid completion marker: {marker_path.name}")
+                    continue
+                if marker.get("build_id") != build_id:
+                    continue
+                layer = int(marker.get("layer", -1))
+                shard = artifact_dir / f"exl3-layer-{layer:05d}.safetensors"
+                errs = artifact_dir / f"exl3-layer-{layer:05d}.errs.json"
+                expected_marker = {
+                    "version": _TP_LOCAL_BUILD_VERSION,
+                    "build_id": build_id,
+                    "layer": layer,
+                    "tp_size": tp_size,
+                    "local_intermediate_size": expected_local,
+                    "intermediate_hadamard_blocks": expected_blocks,
+                    "bits": 3,
+                    "codebook": "mcg",
+                    "shared_su": True,
+                    "shard_size": shard.stat().st_size if shard.is_file() else -1,
+                    "errs_size": errs.stat().st_size if errs.is_file() else -1,
+                }
+                if marker != expected_marker:
+                    issues.add(
+                        f"layer {layer}: completion marker does not match files/contract"
+                    )
+                    continue
+                if layer in marked_layers:
+                    issues.add(f"layer {layer}: duplicate completion marker")
+                    continue
+                marked_layers.add(layer)
+            missing_markers = set(expected_layers) - marked_layers
+            if missing_markers:
+                issues.add(
+                    f"TP-local build is missing {len(missing_markers)} layer "
+                    f"markers; sample={sorted(missing_markers)[:8]}"
+                )
 
     total_kept = sum(len(value[0]) for value in allocation.values())
     total_exl3 = sum(len(value[1]) for value in allocation.values())
     meta = allocation_document.get("meta", {})
     if meta.get("n_keep") != total_kept:
-        issues.add(
-            f"allocation meta n_keep={meta.get('n_keep')} != {total_kept}"
-        )
+        issues.add(f"allocation meta n_keep={meta.get('n_keep')} != {total_kept}")
     if meta.get("n_exl3") != total_exl3:
-        issues.add(
-            f"allocation meta n_exl3={meta.get('n_exl3')} != {total_exl3}"
-        )
+        issues.add(f"allocation meta n_exl3={meta.get('n_exl3')} != {total_exl3}")
 
-    index = json.loads(
-        (serve_dir / "model.safetensors.index.json").read_text()
-    )
+    index = json.loads((serve_dir / "model.safetensors.index.json").read_text())
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError("serve model has an invalid weight map")
@@ -221,6 +277,22 @@ def validate_exl3_artifact(
         issues.add("quantization config kept_format is not mxfp4_e8m0k32")
     if quant.get("demoted_format") != "exl3_3":
         issues.add("quantization config demoted_format is not exl3_3")
+    trellis = quant.get("trellis")
+    if not isinstance(trellis, dict):
+        issues.add("quantization config has no trellis object")
+        trellis = {}
+    tp_keys = (
+        "compatible_tp_sizes",
+        "tp_local_quantization",
+        "tp_local_intermediate_size",
+        "intermediate_hadamard_blocks",
+    )
+    if tp_local:
+        for key in tp_keys:
+            if trellis.get(key) != manifest.get(key):
+                issues.add(f"trellis {key} differs from the TP-local manifest")
+    elif trellis.get("tp_local_quantization"):
+        issues.add("serve config is TP-local but the artifact manifest is not")
 
     expected_count = total_kept * 6 + total_exl3 * 9
     expected_files: set[str] = set()
@@ -228,9 +300,7 @@ def validate_exl3_artifact(
     for layer, tiers in allocation.items():
         kept, exl3 = tiers
         configured = bit_map.get(str(layer))
-        expected_bits = [
-            4 if expert in kept else 3 for expert in range(num_experts)
-        ]
+        expected_bits = [4 if expert in kept else 3 for expert in range(num_experts)]
         if configured != expected_bits:
             issues.add(f"layer {layer}: hybrid_bit_map differs from allocation")
         for expert in sorted(kept):
@@ -300,13 +370,9 @@ def validate_exl3_artifact(
                 shape = tuple(int(value) for value in tensor_slice.get_shape())
                 dtype = tensor_slice.get_dtype()
                 if shape != expected_shape:
-                    issues.add(
-                        f"{name}: shape {shape} != expected {expected_shape}"
-                    )
+                    issues.add(f"{name}: shape {shape} != expected {expected_shape}")
                 if dtype != expected_dtype:
-                    issues.add(
-                        f"{name}: dtype {dtype} != expected {expected_dtype}"
-                    )
+                    issues.add(f"{name}: dtype {dtype} != expected {expected_dtype}")
                 mapped_file = weight_map.get(name)
                 if mapped_file != path.name:
                     issues.add(
