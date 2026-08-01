@@ -11,15 +11,22 @@ Builds /models/Kimi-K3-EXL3-3p19-serve with:
 
 from __future__ import annotations
 
+import argparse
 import json
-import sys
 from pathlib import Path
 
 from safetensors import safe_open
 
-ART = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/models/Kimi-K3-EXL3-3p19")
-NONEXPERT_SRC = Path("/models/Kimi-K3-mxfp8-nonexpert")
-DEST = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(str(ART) + "-serve")
+DEFAULT_ARTIFACT = Path("/models/Kimi-K3-EXL3-3p19")
+DEFAULT_NONEXPERT = Path("/models/Kimi-K3-mxfp8-nonexpert")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifact", type=Path, nargs="?", default=DEFAULT_ARTIFACT)
+    parser.add_argument("destination", type=Path, nargs="?")
+    parser.add_argument("--nonexpert", type=Path, default=DEFAULT_NONEXPERT)
+    return parser.parse_args()
 
 
 def artifact_is_shared_su(art: Path, alloc: dict) -> bool:
@@ -27,11 +34,9 @@ def artifact_is_shared_su(art: Path, alloc: dict) -> bool:
     (kquant shared-su pack); verified against real tensors, not metadata."""
     import torch
 
-    layer = sorted(alloc, key=int)[0]
+    layer = min(alloc, key=int)
     dem = alloc[layer]["exl3"]
-    base = (
-        f"language_model.model.layers.{layer}.block_sparse_moe.experts"
-    )
+    base = f"language_model.model.layers.{layer}.block_sparse_moe.experts"
     with safe_open(
         str(art / f"exl3-layer-{int(layer):05d}.safetensors"), framework="pt"
     ) as sf:
@@ -43,35 +48,39 @@ def artifact_is_shared_su(art: Path, alloc: dict) -> bool:
 def main() -> None:
     from kquant.io.hf_cache import resolve
 
+    args = parse_args()
+    artifact = args.artifact
+    destination = args.destination or Path(str(artifact) + "-serve")
+    nonexpert = args.nonexpert
     cache = resolve()
     snap = Path(cache.snapshot_dir)
-    DEST.mkdir(parents=True, exist_ok=True)
-    alloc_doc = json.loads((ART / "allocation-exl3.json").read_text())
+    destination.mkdir(parents=True, exist_ok=True)
+    alloc_doc = json.loads((artifact / "allocation-exl3.json").read_text())
     alloc = alloc_doc["layers"]
 
     weight_map: dict[str, str] = {}
     total = 0
     groups = [
-        sorted(ART.glob("exl3-layer-*.safetensors")),
-        sorted(ART.glob("keep-mxfp4-*.safetensors")),
-        sorted(NONEXPERT_SRC.glob("00-nonexpert-*.safetensors")),
+        sorted(artifact.glob("exl3-layer-*.safetensors")),
+        sorted(artifact.glob("keep-mxfp4-*.safetensors")),
+        sorted(nonexpert.glob("00-nonexpert-*.safetensors")),
     ]
     assert all(groups), "missing a shard group"
     for files in groups:
         for f in files:
-            link = DEST / f.name
+            link = destination / f.name
             if not link.exists():
                 link.symlink_to(f)
             with safe_open(str(f), framework="pt") as sf:
-                for name in sf.keys():
+                for name in sf.keys():  # noqa: SIM118
                     weight_map[name] = f.name
             total += f.stat().st_size
-    (DEST / "model.safetensors.index.json").write_text(
+    (destination / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {"total_size": total}, "weight_map": weight_map})
     )
-    print(f"index: {len(weight_map)} tensors, {total/2**30:.1f} GiB", flush=True)
+    print(f"index: {len(weight_map)} tensors, {total / 2**30:.1f} GiB", flush=True)
 
-    manifest = json.loads((ART / "kquant_exl3_manifest.json").read_text())
+    manifest = json.loads((artifact / "kquant_exl3_manifest.json").read_text())
     bit_map = {
         layer: [4 if e in set(v["keep"]) else 3 for e in range(896)]
         for layer, v in ((k, alloc[k]) for k in sorted(alloc, key=int))
@@ -84,30 +93,39 @@ def main() -> None:
         "hybrid_bit_map": bit_map,
         "kept_format": "mxfp4_e8m0k32",
         "demoted_format": "exl3_3",
-        "trellis": {"bits": 3, "codebook": "mcg",
-                    "mcg_mult": manifest["mcg_mult"],
-                    "shared_su": artifact_is_shared_su(ART, alloc)},
+        "trellis": {
+            "bits": 3,
+            "codebook": "mcg",
+            "mcg_mult": manifest["mcg_mult"],
+            "shared_su": artifact_is_shared_su(artifact, alloc),
+        },
         # Non-expert linears are offline-baked MXFP8 (fp8 + e8m0 scales);
         # the listed modules stay BF16.
         "dense_format": "mxfp8",
         "ignored_layers": [
-            "kv_b_proj", "g_proj", "f_a_proj", "f_b_proj", "b_proj",
-            "vision_tower", "mm_projector",
+            "kv_b_proj",
+            "g_proj",
+            "f_a_proj",
+            "f_b_proj",
+            "b_proj",
+            "vision_tower",
+            "mm_projector",
         ],
     }
     cfg.pop("quantization_config", None)
-    (DEST / "config.json").write_text(json.dumps(cfg, indent=1))
+    (destination / "config.json").write_text(json.dumps(cfg, indent=1))
 
     for f in snap.iterdir():
         if f.suffix == ".safetensors" or f.name in (
-            "config.json", "model.safetensors.index.json",
+            "config.json",
+            "model.safetensors.index.json",
         ):
             continue
-        link = DEST / f.name
+        link = destination / f.name
         if not link.exists():
             link.symlink_to(f)
-    print(f"done: {DEST}", flush=True)
+    print(f"done: {destination}", flush=True)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
