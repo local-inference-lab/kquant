@@ -1,0 +1,86 @@
+From 7192208aef96ce6b6bf734346957167d2ac737c7 Mon Sep 17 00:00:00 2001
+From: Martin Vit <martin@voipmonitor.org>
+Date: Fri, 31 Jul 2026 23:44:04 +0000
+Subject: [PATCH] quant: support shared EXL3 input scales for large MoE
+
+Apply to ExLlamaV3 commit
+028e5e84b81dd61ec66908943b23d7657b9dbcf1.
+---
+ exllamav3/modules/quant/exl3_lib/quantize.py | 41 +++++++++++++++++++--
+ 1 file changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/exllamav3/modules/quant/exl3_lib/quantize.py b/exllamav3/modules/quant/exl3_lib/quantize.py
+index eb9ef0e..3cee3d8 100644
+--- a/exllamav3/modules/quant/exl3_lib/quantize.py
++++ b/exllamav3/modules/quant/exl3_lib/quantize.py
+@@ -10,6 +10,32 @@ from ....util.tensor import save_tensor_image
+ from functools import lru_cache
+ import threading
+ 
++
++# Some very large MoE checkpoints share the input-side EXL3 rotation/scaling
++# row across all experts in a layer.  The caller supplies a stable key for the
++# group; the first expert establishes the channel profile and subsequent
++# experts reuse it.  Keep the canonical copy on CPU so a long conversion does
++# not accumulate device allocations for every layer and projection.
++_shared_input_scales: dict[str, torch.Tensor] = {}
++_shared_input_scales_lock = threading.Lock()
++
++
++def _get_shared_input_scales(
++    key: str,
++    candidate: torch.Tensor,
++) -> torch.Tensor:
++    with _shared_input_scales_lock:
++        shared = _shared_input_scales.get(key)
++        if shared is None:
++            shared = candidate.detach().to(device="cpu", copy=True).contiguous()
++            _shared_input_scales[key] = shared
++        elif tuple(shared.shape) != tuple(candidate.shape):
++            raise ValueError(
++                f"shared input-scale key {key!r} changed shape: "
++                f"{tuple(shared.shape)} != {tuple(candidate.shape)}"
++            )
++    return shared.to(device=candidate.device, dtype=candidate.dtype)
++
+ # Constant
+ had_k, had_n = 128, 128
+ codebook_scale = 1.24371088
+@@ -1073,6 +1099,11 @@ def regularize(
+     # Input sign flips and scales
+     in_channel_scales = block_rms(weight, dim = 1, keepdim = True)
+     in_channel_scales[in_channel_scales.abs() < 1e-30] = 0.1
++    shared_input_scales_key = quant_args.get("shared_input_scales_key")
++    if shared_input_scales_key is not None:
++        in_channel_scales = _get_shared_input_scales(
++            str(shared_input_scales_key), in_channel_scales
++        )
+     su = (su * in_channel_scales / (-codebook_scale) + 1e-10).float()  # mustn't be inplace
+     weight /= su
+     blockwise_preapply_had_l_(weight, had_k)
+@@ -1083,7 +1114,10 @@ def regularize(
+     else:
+         g_scale = 1.0
+     weight *= g_scale
+-    su /= g_scale
++    if quant_args.get("g_scale_into_sv", False):
++        sv /= g_scale
++    else:
++        su /= g_scale
+ 
+     # ext.test_distribution(weight_os, dist_r, dist_ref, -3.8, 3.8)
+     # js_os = jsd(dist_r, dist_ref)
+@@ -1388,7 +1422,10 @@ def quantize_exl3_batch(
+         g_scales = {}
+         for t, (g_scale, _) in zip(batch_idx, scales):
+             regs[t][0] *= g_scale
+-            regs[t][1] /= g_scale
++            if quant_args_list[t].get("g_scale_into_sv", False):
++                regs[t][2] /= g_scale
++            else:
++                regs[t][1] /= g_scale
+             g_scales[t] = g_scale
+         pb.update(100)
+ 
+-- 
+2.43.0
