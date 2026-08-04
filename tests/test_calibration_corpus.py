@@ -9,6 +9,8 @@ from scripts.run_interim_calibration_corpus import (
     _content_hash,
     _fold_selected,
     _load_excluded_documents,
+    _parse_source,
+    _record_tokens,
     _resume_report,
     build_plan,
 )
@@ -74,6 +76,33 @@ def test_weighted_quotas_are_exact() -> None:
     assert _allocate_quotas(101, sources) == [51, 25, 25]
 
 
+def test_source_parser_accepts_per_source_token_cap() -> None:
+    assert _parse_source("deep.jsonl=0.25@4096") == SourceSpec(
+        Path("deep.jsonl"), 0.25, 4096
+    )
+    assert _parse_source("diverse.jsonl=2") == SourceSpec(
+        Path("diverse.jsonl"), 2.0
+    )
+    assert _parse_source("hybrid.jsonl=3@2048::ultrachat") == SourceSpec(
+        Path("hybrid.jsonl"), 3.0, 2048, "ultrachat"
+    )
+
+
+def test_record_tokens_accepts_conversations_alias() -> None:
+    tokenizer = _Tokenizer()
+    row = {
+        "source": "local-hybrid",
+        "conversations": [
+            {"role": "user", "content": "explain the result"},
+            {"role": "assistant", "content": "Here is the explanation."},
+        ],
+    }
+
+    assert _record_tokens(row, tokenizer) == tokenizer.apply_chat_template(
+        row["conversations"], tokenize=True, add_generation_prompt=False
+    )
+
+
 def test_plan_is_deterministic_and_exact(tmp_path: Path) -> None:
     first = tmp_path / "first.jsonl"
     second = tmp_path / "second.jsonl"
@@ -98,6 +127,62 @@ def test_plan_is_deterministic_and_exact(tmp_path: Path) -> None:
     assert all(request.tokens <= 100 for request in plan)
 
 
+def test_plan_honors_per_source_token_cap(tmp_path: Path) -> None:
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    _write_source(first, 100)
+    _write_source(second, 100)
+
+    plan = build_plan(
+        [SourceSpec(first, 1, 40), SourceSpec(second, 1, 80)],
+        _Tokenizer(),
+        target_tokens=600,
+        max_prompt_tokens=100,
+        min_prompt_tokens=20,
+        fold_modulus=1,
+        fold_index=0,
+        fold_mode="include",
+        seed=7,
+    )
+
+    first_path = str(first.resolve())
+    assert max(request.tokens for request in plan if request.source == first_path) <= 40
+    assert max(request.tokens for request in plan if request.source != first_path) <= 80
+
+
+def test_plan_filters_hybrid_records_by_source_label(tmp_path: Path) -> None:
+    source = tmp_path / "hybrid.jsonl"
+    rows = []
+    for index in range(30):
+        rows.append(
+            json.dumps(
+                {
+                    "source": "ultrachat" if index % 2 == 0 else "swe-agent",
+                    "conversations": [
+                        {"role": "user", "content": f"document-{index}-" * 8}
+                    ],
+                }
+            )
+        )
+    source.write_text("\n".join(rows) + "\n")
+
+    plan = build_plan(
+        [SourceSpec(source, 1, 100, "ultrachat")],
+        _Tokenizer(),
+        target_tokens=600,
+        max_prompt_tokens=100,
+        min_prompt_tokens=20,
+        fold_modulus=1,
+        fold_index=0,
+        fold_mode="include",
+        seed=7,
+    )
+
+    selected_lines = {request.line for request in plan}
+    assert selected_lines
+    assert all(line % 2 == 1 for line in selected_lines)
+
+
 def test_plan_deduplicates_repeated_source_records(tmp_path: Path) -> None:
     source = tmp_path / "source.jsonl"
     unique = [
@@ -119,6 +204,39 @@ def test_plan_deduplicates_repeated_source_records(tmp_path: Path) -> None:
     )
 
     hashes = [request.document_hash for request in plan]
+    assert len(hashes) == len(set(hashes))
+
+
+def test_plan_deduplicates_identical_token_sequences(tmp_path: Path) -> None:
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first_rows = [
+        json.dumps({"prompt": f"document-{index}-" * 8, "source": "first"})
+        for index in range(12)
+    ]
+    second_rows = [
+        json.dumps({"prompt": f"document-{index}-" * 8, "source": "second"})
+        for index in range(4)
+    ] + [
+        json.dumps({"prompt": f"replacement-{index}-" * 8})
+        for index in range(12)
+    ]
+    first.write_text("\n".join(first_rows) + "\n")
+    second.write_text("\n".join(second_rows) + "\n")
+
+    plan = build_plan(
+        [SourceSpec(first, 1), SourceSpec(second, 1)],
+        _Tokenizer(),
+        target_tokens=800,
+        max_prompt_tokens=100,
+        min_prompt_tokens=20,
+        fold_modulus=1,
+        fold_index=0,
+        fold_mode="include",
+        seed=7,
+    )
+
+    hashes = [request.prompt_hash for request in plan]
     assert len(hashes) == len(set(hashes))
 
 
@@ -168,9 +286,10 @@ def test_excluded_report_inventory_is_authenticated(tmp_path: Path) -> None:
         )
     )
 
-    hashes, identities = _load_excluded_documents([report])
+    hashes, prompt_hashes, identities = _load_excluded_documents([report])
 
     assert hashes == {"11" * 16, "22" * 16}
+    assert prompt_hashes == set()
     assert identities[0]["path"] == str(report.resolve())
     assert identities[0]["documents"] == 2
     assert len(identities[0]["sha256"]) == 64

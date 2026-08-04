@@ -3,10 +3,10 @@
 
 Only one decoder layer is materialized at a time. Routed experts are
 reconstructed in bulk after routing and released after the layer. The expert
-source may be the official MXFP4 checkpoint or a hybrid EXL3/MXFP4 artifact.
-It may also be a completed fixed-slab mixed-EXL TP12 artifact. Serialized
-MXFP8 non-expert projections can be dequantized into the same official PyTorch
-layer implementation.
+source may be the official MXFP4 checkpoint, a hybrid EXL3/MXFP4 artifact, or
+a completed TP12 QSRT artifact with trellis slabs and exact X4T sidecars.
+Serialized MXFP8 non-expert projections can be dequantized into the same
+official PyTorch layer implementation.
 
 This is a correctness reference, not a serving implementation.  It deliberately
 uses eager PyTorch MLA attention and the official FLA KDA implementation; it
@@ -34,7 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from kquant import constants as KQ_C
 from kquant.correctness import DEFAULT_PROMPT, write_json
-from kquant.exl3_reference import CODEBOOK_MCG, EXL3_CODEBOOKS
+from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3, QSRT_CODEBOOKS
 from kquant.kimi_stream import (
     MODEL_TENSOR_PREFIX,
     IndexedSafetensors,
@@ -47,24 +47,26 @@ from kquant.kimi_stream import (
     write_trace_manifest,
     write_trace_tensor,
 )
-from kquant.mixed_exl3 import (
-    SCHEMA as MIXED_EXL3_SCHEMA,
-    TP_SIZE as MIXED_EXL3_TP_SIZE,
+from kquant.qsrt import (
+    SCHEMA as QSRT_SCHEMA,
+    TP_SIZE as QSRT_TP_SIZE,
     PackedTP12Trellis,
     TP12TrellisDescriptor,
     decode_tp12_exl3_weight,
     matrix_rate_axis,
 )
-from kquant.pack.mixed_materialize import (
+from kquant.pack.qsrt_materialize import (
+    QSRT_ARTIFACT_KIND,
+    QSRT_ARTIFACT_SCHEMA_VERSION,
+    QSRT_MANIFEST_FILENAME,
+)
+from kquant.pack.qsrt_slab import (
     FORMAT_SECTION_BYTES,
     LAYER_HEADER_BYTES,
-    MATERIALIZED_ARTIFACT_KIND,
-    MATERIALIZED_ARTIFACT_SCHEMA_VERSION,
-    MATERIALIZED_LAYER_PREFIX,
-    MATERIALIZED_MANIFEST_FILENAME,
+    QSRT_LAYER_PREFIX,
     SHARED_SCALE_SECTION_BYTES,
     TP12LayerReader,
-    layer_filename as mixed_exl3_layer_filename,
+    layer_filename as qsrt_layer_filename,
 )
 from kquant.teacher_proxy import align_routed_post_situ
 from kquant.teacher_proxy_suite import (
@@ -72,6 +74,7 @@ from kquant.teacher_proxy_suite import (
     load_teacher_proxy_suite,
     parse_layer_list,
 )
+from kquant.x4t import X4T_DATA_OFFSET, X4TLayerReader, x4t_layer_path
 
 DEFAULT_CHECKPOINT = Path(
     "/home/luke/.cache/huggingface/hub/"
@@ -84,28 +87,28 @@ EXL3_PARTS = ("trellis", "suh", "svh")
 
 
 @dataclass(frozen=True)
-class MaterializedTP12Artifact:
-    """Strict, read-only inventory for one completed mixed-EXL TP12 artifact."""
+class QSRTTP12Artifact:
+    """Strict, read-only inventory for one completed TP12 QSRT artifact."""
 
     root: Path
     manifest_path: Path
     manifest: dict[str, Any]
 
     @classmethod
-    def load(cls, root: str | Path) -> "MaterializedTP12Artifact":
+    def load(cls, root: str | Path) -> "QSRTTP12Artifact":
         root = Path(root).expanduser().resolve()
-        manifest_path = root / MATERIALIZED_MANIFEST_FILENAME
+        manifest_path = root / QSRT_MANIFEST_FILENAME
         if not manifest_path.is_file():
             raise FileNotFoundError(manifest_path)
         manifest = json.loads(manifest_path.read_text())
         if not isinstance(manifest, dict):
             raise TypeError(f"{manifest_path}: expected a JSON object")
         expected_scalars = {
-            "kind": MATERIALIZED_ARTIFACT_KIND,
-            "schema_version": MATERIALIZED_ARTIFACT_SCHEMA_VERSION,
+            "kind": QSRT_ARTIFACT_KIND,
+            "schema_version": QSRT_ARTIFACT_SCHEMA_VERSION,
             "complete": True,
-            "format_schema": MIXED_EXL3_SCHEMA,
-            "tp_size": MIXED_EXL3_TP_SIZE,
+            "tp_size": QSRT_TP_SIZE,
+            "codec": "QSRT",
         }
         for name, expected in expected_scalars.items():
             if manifest.get(name) != expected:
@@ -113,10 +116,10 @@ class MaterializedTP12Artifact:
                     f"{manifest_path}: {name}={manifest.get(name)!r}, "
                     f"expected {expected!r}"
                 )
-        codebook = manifest.get("candidate_codebook", CODEBOOK_MCG)
-        if codebook not in EXL3_CODEBOOKS:
+        codebook = manifest.get("trellis_codebook")
+        if codebook not in QSRT_CODEBOOKS:
             raise ValueError(
-                f"{manifest_path}: unsupported candidate_codebook {codebook!r}"
+                f"{manifest_path}: unsupported trellis_codebook {codebook!r}"
             )
         layers = manifest.get("layers")
         expected_layers = {str(layer) for layer in KQ_C.MOE_LAYERS}
@@ -125,38 +128,70 @@ class MaterializedTP12Artifact:
                 f"{manifest_path}: expected exactly {len(expected_layers)} "
                 "MoE layer entries"
             )
-        expected_files = {
-            mixed_exl3_layer_filename(layer) for layer in KQ_C.MOE_LAYERS
+        expected_trellis_files = {
+            str(layers[str(layer)].get("trellis_slab"))
+            for layer in KQ_C.MOE_LAYERS
         }
-        actual_files = {
+        canonical_trellis_files = {
+            qsrt_layer_filename(layer) for layer in KQ_C.MOE_LAYERS
+        }
+        if expected_trellis_files != canonical_trellis_files:
+            raise ValueError(f"{manifest_path}: noncanonical trellis inventory")
+        actual_trellis_files = {
             path.name
-            for path in root.glob(f"{MATERIALIZED_LAYER_PREFIX}*.bin")
+            for path in root.glob(f"{QSRT_LAYER_PREFIX}*.bin")
             if path.is_file()
         }
-        if actual_files != expected_files:
+        if actual_trellis_files != expected_trellis_files:
             raise ValueError(
-                "materialized mixed-EXL layer inventory does not close; "
-                f"missing={sorted(expected_files - actual_files)[:3]}, "
-                f"extra={sorted(actual_files - expected_files)[:3]}"
+                "QSRT trellis layer inventory does not close; "
+                f"missing={sorted(expected_trellis_files - actual_trellis_files)[:3]}, "
+                f"extra={sorted(actual_trellis_files - expected_trellis_files)[:3]}"
+            )
+        expected_x4t_files = {
+            str(layers[str(layer)].get("x4t_sidecar"))
+            for layer in KQ_C.MOE_LAYERS
+        }
+        canonical_x4t_files = {
+            x4t_layer_path(Path("."), layer).name for layer in KQ_C.MOE_LAYERS
+        }
+        if expected_x4t_files != canonical_x4t_files:
+            raise ValueError(f"{manifest_path}: noncanonical X4T inventory")
+        actual_x4t_files = {
+            path.name for path in root.glob("x4t-layer-*.bin") if path.is_file()
+        }
+        if actual_x4t_files != expected_x4t_files:
+            raise ValueError(
+                "QSRT X4T layer inventory does not close; "
+                f"missing={sorted(expected_x4t_files - actual_x4t_files)[:3]}, "
+                f"extra={sorted(actual_x4t_files - expected_x4t_files)[:3]}"
             )
         partials = sorted(root.glob(".*.partial"))
         if partials:
             raise ValueError(
-                f"materialized mixed-EXL artifact contains partials: {partials[:3]}"
+                f"QSRT artifact contains partial files: {partials[:3]}"
             )
         return cls(root=root, manifest_path=manifest_path, manifest=manifest)
 
     def layer_path(self, layer_idx: int) -> Path:
         if layer_idx not in KQ_C.MOE_LAYERS:
             raise ValueError(f"decoder layer {layer_idx} is not a K3 MoE layer")
-        path = self.root / mixed_exl3_layer_filename(layer_idx)
+        path = self.root / qsrt_layer_filename(layer_idx)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+
+    def x4t_layer_path(self, layer_idx: int) -> Path:
+        if layer_idx not in KQ_C.MOE_LAYERS:
+            raise ValueError(f"decoder layer {layer_idx} is not a K3 MoE layer")
+        path = x4t_layer_path(self.root, layer_idx)
         if not path.is_file():
             raise FileNotFoundError(path)
         return path
 
     @property
     def codebook(self) -> str:
-        return str(self.manifest.get("candidate_codebook", CODEBOOK_MCG))
+        return str(self.manifest["trellis_codebook"])
 
 
 def _require_reference_dependencies() -> dict[str, Any]:
@@ -693,16 +728,16 @@ class StagedExperts:
             assign_parameter(expert, f"{matrix}.weight", replacement)
 
 
-def _decode_materialized_exl3_matrix(
+def _decode_qsrt_trellis_matrix(
     reader: TP12LayerReader,
     *,
     expert_id: int,
     matrix: str,
     expected: tuple[int, ...],
     device: torch.device,
-    codebook: str = CODEBOOK_MCG,
+    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
 ) -> tuple[torch.Tensor, int]:
-    """Reconstruct one mixed slab matrix as an official ``[out, in]`` weight."""
+    """Reconstruct one QSRT trellis matrix as an official ``[out, in]`` weight."""
 
     if len(expected) != 2:
         raise ValueError(
@@ -724,7 +759,7 @@ def _decode_materialized_exl3_matrix(
         rate_axis=matrix_rate_axis(matrix),
         k_tiles=expected[1] // 16,
         n_tiles=expected[0] // 16,
-        schema=MIXED_EXL3_SCHEMA,
+        schema=QSRT_SCHEMA,
     )
     packed = PackedTP12Trellis(
         descriptor,
@@ -748,24 +783,30 @@ def _decode_materialized_exl3_matrix(
     return dense, bytes_read
 
 
-class MaterializedTP12StagedExperts:
-    """Stage active experts directly from one fixed-stride TP12 layer slab."""
+class QSRTTP12StagedExperts:
+    """Stage active experts from one QSRT trellis/X4T layer pair."""
 
     def __init__(
         self,
         *,
         reader: TP12LayerReader,
+        x4t_reader: X4TLayerReader,
         layer_idx: int,
         scheme: Any,
         compressor: Any,
         device: torch.device,
-        codebook: str = CODEBOOK_MCG,
+        codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
     ):
         if reader.header.layer != layer_idx:
             raise ValueError(
-                f"mixed slab layer {reader.header.layer} != decoder layer {layer_idx}"
+                f"QSRT slab layer {reader.header.layer} != decoder layer {layer_idx}"
+            )
+        if x4t_reader.layer != layer_idx:
+            raise ValueError(
+                f"X4T sidecar layer {x4t_reader.layer} != decoder layer {layer_idx}"
             )
         self.reader = reader
+        self.x4t_reader = x4t_reader
         self.layer_idx = layer_idx
         self.scheme = scheme
         self.compressor = compressor
@@ -776,6 +817,7 @@ class MaterializedTP12StagedExperts:
                 LAYER_HEADER_BYTES
                 + FORMAT_SECTION_BYTES
                 + SHARED_SCALE_SECTION_BYTES
+                + X4T_DATA_OFFSET
             )
         )
         self._handles: list[Any] = []
@@ -808,7 +850,7 @@ class MaterializedTP12StagedExperts:
         matrix: str,
         expected: tuple[int, ...],
     ) -> tuple[torch.Tensor, int]:
-        return _decode_materialized_exl3_matrix(
+        return _decode_qsrt_trellis_matrix(
             self.reader,
             expert_id=expert_id,
             matrix=matrix,
@@ -842,10 +884,10 @@ class MaterializedTP12StagedExperts:
             for matrix in EXPERT_MATRICES:
                 expected = tuple(getattr(expert, matrix).weight.shape)
                 if format_spec.is_mxfp4:
-                    packed = self.reader.read_kept_matrix(expert_id, matrix)
-                    self.stats.packed_bytes += _tensor_bytes(
-                        packed.packed
-                    ) + _tensor_bytes(packed.scale)
+                    packed = self.x4t_reader.read(expert_id, matrix)
+                    self.stats.packed_bytes += self.x4t_reader.record_bytes(
+                        expert_id, matrix
+                    )
                     dense = self.compressor.decompress(
                         {
                             "weight_packed": packed.packed,
@@ -1232,10 +1274,10 @@ def _load_exl3_mcg_mult(
 @torch.inference_mode()
 def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = args.checkpoint.expanduser().resolve()
-    materialized_artifact = (
+    qsrt_artifact = (
         None
-        if args.mixed_exl3_artifact is None
-        else MaterializedTP12Artifact.load(args.mixed_exl3_artifact)
+        if args.qsrt_artifact is None
+        else QSRTTP12Artifact.load(args.qsrt_artifact)
     )
     expert_checkpoint = (
         checkpoint
@@ -1249,12 +1291,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     expert_source_path = (
         expert_checkpoint
-        if materialized_artifact is None
-        else materialized_artifact.root
+        if qsrt_artifact is None
+        else qsrt_artifact.root
     )
     output_dir = args.output_dir.expanduser().resolve()
     indexed_sources = [checkpoint, nonexpert_checkpoint]
-    if materialized_artifact is None:
+    if qsrt_artifact is None:
         indexed_sources.append(expert_checkpoint)
     for source in indexed_sources:
         if not (source / "model.safetensors.index.json").is_file():
@@ -1274,7 +1316,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint, dependencies
     )
     checkpoint_store = IndexedSafetensors(checkpoint)
-    if materialized_artifact is None:
+    if qsrt_artifact is None:
         expert_store: IndexedSafetensors | None = _store_for(
             expert_checkpoint,
             existing_path=checkpoint,
@@ -1398,8 +1440,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     prompt_text = (
         None if args.input_ids or input_suite is not None else args.prompt
     )
-    if materialized_artifact is not None:
-        expert_kind = "mixed_exl3_tp12_materialized"
+    if qsrt_artifact is not None:
+        expert_kind = "qsrt_tp12"
     else:
         expert_kind = "hybrid_exl3_mxfp4" if mcg_mult is not None else "mxfp4"
     nonexpert_kind = (
@@ -1413,19 +1455,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint": str(checkpoint),
         "expert_checkpoint": str(expert_source_path),
         "nonexpert_checkpoint": str(nonexpert_checkpoint),
-        "mixed_exl3_artifact": (
-            None
-            if materialized_artifact is None
-            else str(materialized_artifact.root)
+        "qsrt_artifact": None if qsrt_artifact is None else str(qsrt_artifact.root),
+        "qsrt_manifest": (
+            None if qsrt_artifact is None else str(qsrt_artifact.manifest_path)
         ),
-        "mixed_exl3_manifest": (
-            None
-            if materialized_artifact is None
-            else str(materialized_artifact.manifest_path)
-        ),
-        "mixed_exl3_codebook": (
-            None if materialized_artifact is None else materialized_artifact.codebook
-        ),
+        "qsrt_codebook": None if qsrt_artifact is None else qsrt_artifact.codebook,
         "exl3_manifest": (
             None if exl3_manifest is None else str(exl3_manifest)
         ),
@@ -1441,9 +1475,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "compressed_tensors MXFP4PackedCompressor"
             ),
             "exl3_reconstruction": (
-                "kquant mixed-TP12 unpack plus independent PyTorch "
-                f"{materialized_artifact.codebook}/Hadamard decode"
-                if materialized_artifact is not None
+                "kquant QSRT TP12 unpack plus independent PyTorch "
+                f"{qsrt_artifact.codebook}/Hadamard decode"
+                if qsrt_artifact is not None
                 else (
                     None
                     if mcg_mult is None
@@ -1529,7 +1563,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.expert_prefetch_trace is not None:
         if expert_store is None:
             raise ValueError(
-                "--expert-prefetch-trace is unavailable for materialized TP12 slabs"
+                "--expert-prefetch-trace is unavailable for QSRT artifacts"
             )
         prefetcher = ExpertRawPrefetcher(
             store=expert_store,
@@ -1553,7 +1587,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         staged_experts = None
         if hasattr(layer, "block_sparse_moe"):
-            if materialized_artifact is None:
+            if qsrt_artifact is None:
                 assert expert_store is not None
                 staged_experts = StagedExperts(
                     store=expert_store,
@@ -1567,16 +1601,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
             else:
                 reader = TP12LayerReader(
-                    materialized_artifact.layer_path(layer_idx)
+                    qsrt_artifact.layer_path(layer_idx)
+                )
+                x4t_reader = X4TLayerReader(
+                    qsrt_artifact.x4t_layer_path(layer_idx)
                 )
                 try:
-                    staged_experts = MaterializedTP12StagedExperts(
+                    staged_experts = QSRTTP12StagedExperts(
                         reader=reader,
+                        x4t_reader=x4t_reader,
                         layer_idx=layer_idx,
                         scheme=scheme,
                         compressor=compressor,
                         device=device,
-                        codebook=materialized_artifact.codebook,
+                        codebook=qsrt_artifact.codebook,
                     )
                 except BaseException:
                     reader.close()
@@ -1751,10 +1789,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     expert_group.add_argument(
-        "--mixed-exl3-artifact",
+        "--qsrt-artifact",
         type=Path,
         help=(
-            "Completed fixed-slab mixed-EXL TP12 artifact used as the expert "
+            "Completed TP12 QSRT trellis/X4T artifact used as the expert "
             "source; the official --checkpoint remains the model-code source"
         ),
     )
@@ -1834,14 +1872,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--lm-head-chunk-rows must be positive")
     if args.no_trace and args.capture_routed_post_situ:
         parser.error("--capture-routed-post-situ requires trace output")
-    if args.mixed_exl3_artifact is not None and args.exl3_manifest is not None:
-        parser.error("--exl3-manifest does not apply to --mixed-exl3-artifact")
+    if args.qsrt_artifact is not None and args.exl3_manifest is not None:
+        parser.error("--exl3-manifest does not apply to --qsrt-artifact")
     if (
-        args.mixed_exl3_artifact is not None
+        args.qsrt_artifact is not None
         and args.expert_prefetch_trace is not None
     ):
         parser.error(
-            "--expert-prefetch-trace is unavailable for materialized TP12 slabs"
+            "--expert-prefetch-trace is unavailable for QSRT artifacts"
         )
     return args
 

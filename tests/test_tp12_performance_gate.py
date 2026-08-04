@@ -59,7 +59,7 @@ def _write_fixture(
         str(capture.resolve()) if capture is not None else "/validation/capture"
     )
     candidate_digest = (
-        _sha256(candidate_pool / "mixed_exl3_candidate_manifest.json")
+        _sha256(candidate_pool / "qsrt-candidate-manifest.json")
         if candidate_pool is not None
         else "a" * 64
     )
@@ -73,7 +73,7 @@ def _write_fixture(
         "schema_version": FIXTURE_SCHEMA_VERSION,
         "candidate_pool": candidate_pool_value,
         "candidate_pool_sealed": sealed,
-        "candidate_logical_trellis_schema": "kquant_mixed_exl3_tp12_proto_v2",
+        "candidate_logical_trellis_schema": "kquant_kimi_k3_qsrt_tp12_v0",
         "candidate_manifest_sha256": candidate_digest,
         "capture": capture_value,
         "capture_manifest_sha256": capture_digest,
@@ -234,7 +234,7 @@ def test_performance_layer_selection_balances_depth_and_hotspots() -> None:
     scores = {layer: 0.0001 * layer for layer in range(1, 93)}
     scores.update({6: 0.9, 24: 0.8, 48: 0.7, 72: 0.6, 92: 0.5})
     runtime_mix = {
-        "kind": "kquant_mixed_exl3_tp12_runtime_mix",
+        "kind": "kquant_kimi_k3_qsrt_tp12_runtime_mix",
         "schema_version": 1,
         "candidate_pool_sealed": True,
         "layers": list(range(1, 93)),
@@ -254,7 +254,7 @@ def test_performance_layer_selection_balances_depth_and_hotspots() -> None:
 
 def test_performance_layer_selection_requires_sealed_complete_p24_mix() -> None:
     runtime_mix = {
-        "kind": "kquant_mixed_exl3_tp12_runtime_mix",
+        "kind": "kquant_kimi_k3_qsrt_tp12_runtime_mix",
         "schema_version": 1,
         "candidate_pool_sealed": False,
         "layers": [1, 24, 48, 72],
@@ -426,7 +426,7 @@ def test_combined_gate_requires_both_components(tmp_path: Path) -> None:
 def test_combined_report_is_recomputed_from_bound_evidence(tmp_path: Path) -> None:
     candidate_pool = tmp_path / "candidate-pool"
     candidate_pool.mkdir()
-    (candidate_pool / "mixed_exl3_candidate_manifest.json").write_text(
+    (candidate_pool / "qsrt-candidate-manifest.json").write_text(
         '{"sealed": true}\n'
     )
     capture = tmp_path / "capture"

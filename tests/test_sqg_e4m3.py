@@ -4,15 +4,21 @@ import pytest
 import torch
 
 from kquant.exl3_reference import (
+    CODEBOOK_SQG_CHEB_NORMAL_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
-    decode_mixed_regularized_weight,
+    decode_qsrt_regularized_weight,
     decode_regularized_weight,
 )
 from kquant.sqg_e4m3 import (
+    sqg_cheb_normal_e4m3_bytes,
+    sqg_cheb_normal_rank_e4m3_bytes,
+    sqg_codebook_bytes,
     sqg_e4m3_bytes,
     sqg_e4m3_bytes_from_rank_lut,
     sqg_e4m3_codebook,
     sqg_e4m3_codebook_from_rank_lut,
+    sqg_k4_eight_stratum_e4m3_bytes_from_rank_lut,
+    sqg_k4_eight_stratum_rank_permutation,
     sqg_rank_permutation,
 )
 
@@ -67,6 +73,45 @@ def test_shared_rank_lut_rejects_nonfinite_e4m3() -> None:
         sqg_e4m3_bytes_from_rank_lut(2, rank_lut)
 
 
+@pytest.mark.parametrize("bits", (2, 3, 4))
+def test_sqg_cheb_normal_named_codebook_uses_exact_shared_rank_law(bits: int) -> None:
+    expected = sqg_cheb_normal_rank_e4m3_bytes().index_select(
+        0, sqg_rank_permutation(bits)
+    )
+    assert torch.equal(sqg_cheb_normal_e4m3_bytes(bits), expected)
+    assert torch.equal(
+        sqg_codebook_bytes(bits, CODEBOOK_SQG_CHEB_NORMAL_E4M3), expected
+    )
+    assert not torch.equal(
+        expected, sqg_codebook_bytes(bits, CODEBOOK_SQG_NORMAL_E4M3)
+    )
+
+
+def test_k4_eight_stratum_mapping_is_bijective_and_exposes_two_per_octile() -> None:
+    ranks = sqg_k4_eight_stratum_rank_permutation()
+    assert torch.equal(torch.sort(ranks).values, torch.arange(1 << 16))
+
+    strata = (ranks >> 13).reshape(1 << 12, 16)
+    expected_twice = torch.arange(8).repeat_interleave(2).expand_as(strata)
+    assert torch.equal(torch.sort(strata, dim=1).values, expected_twice)
+
+    # Holding the virtual-history/refinement bit fixed leaves an exact
+    # eight-stratum K3-like outgoing menu.
+    expected_once = torch.arange(8).expand(1 << 12, 8)
+    assert torch.equal(torch.sort(strata[:, :8], dim=1).values, expected_once)
+    assert torch.equal(torch.sort(strata[:, 8:], dim=1).values, expected_once)
+
+
+def test_k4_eight_stratum_codebook_uses_k3_rank_geometry() -> None:
+    rank_lut = torch.arange(1 << 16, dtype=torch.int64).remainder(126).to(torch.uint8)
+    raw = sqg_k4_eight_stratum_e4m3_bytes_from_rank_lut(rank_lut)
+    expected = rank_lut.index_select(0, sqg_rank_permutation(3))
+    assert torch.equal(raw, expected)
+    assert not torch.equal(
+        sqg_k4_eight_stratum_rank_permutation(), sqg_rank_permutation(4)
+    )
+
+
 def test_reference_decoder_accepts_custom_codebook() -> None:
     states = torch.arange(256, dtype=torch.int16).reshape(1, 1, 256)
     codebook = sqg_e4m3_codebook(3, "normal")
@@ -86,7 +131,7 @@ def test_reference_decoder_applies_rate_specific_sqg_tables(rate_axis: str) -> N
         3, 3, 256
     )
     tile_bits = (2, 3, 4)
-    decoded = decode_mixed_regularized_weight(
+    decoded = decode_qsrt_regularized_weight(
         states,
         rate_axis=rate_axis,
         tile_bits=tile_bits,

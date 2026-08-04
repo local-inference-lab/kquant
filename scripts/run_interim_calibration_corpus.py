@@ -40,6 +40,8 @@ class TokenizerLike(Protocol):
 class SourceSpec:
     path: Path
     weight: float
+    max_prompt_tokens: int | None = None
+    record_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,16 +58,32 @@ class PlannedRequest:
 
 
 def _parse_source(value: str) -> SourceSpec:
+    value, record_separator, record_source = value.partition("::")
+    if record_separator and not record_source:
+        raise argparse.ArgumentTypeError("record source filter must not be empty")
     path_text, separator, weight_text = value.rpartition("=")
     if not separator:
-        return SourceSpec(Path(value), 1.0)
+        return SourceSpec(Path(value), 1.0, record_source=record_source or None)
+    weight_text, cap_separator, cap_text = weight_text.partition("@")
     try:
         weight = float(weight_text)
     except ValueError:
-        return SourceSpec(Path(value), 1.0)
+        return SourceSpec(Path(value), 1.0, record_source=record_source or None)
     if weight <= 0:
         raise argparse.ArgumentTypeError("source weight must be positive")
-    return SourceSpec(Path(path_text), weight)
+    max_prompt_tokens = None
+    if cap_separator:
+        try:
+            max_prompt_tokens = int(cap_text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "source token cap must be an integer"
+            ) from exc
+        if max_prompt_tokens <= 0:
+            raise argparse.ArgumentTypeError("source token cap must be positive")
+    return SourceSpec(
+        Path(path_text), weight, max_prompt_tokens, record_source or None
+    )
 
 
 def _content_hash(raw: str) -> str:
@@ -82,10 +100,11 @@ def _sha256(path: Path) -> str:
 
 def _load_excluded_documents(
     reports: list[Path],
-) -> tuple[set[str], list[dict[str, object]]]:
-    """Authenticate prior corpus reports and collect their document hashes."""
+) -> tuple[set[str], set[str], list[dict[str, object]]]:
+    """Authenticate prior reports and collect document and prompt hashes."""
 
-    hashes: set[str] = set()
+    document_hashes: set[str] = set()
+    prompt_hashes: set[str] = set()
     identities: list[dict[str, object]] = []
     for raw_path in reports:
         path = raw_path.resolve()
@@ -96,6 +115,7 @@ def _load_excluded_documents(
         if not isinstance(documents, list):
             raise ValueError(f"{path} has no document inventory")
         report_hashes: set[str] = set()
+        report_prompt_hashes: set[str] = set()
         for document in documents:
             value = document.get("document_hash") if isinstance(document, dict) else None
             if not isinstance(value, str) or len(value) != 32:
@@ -107,15 +127,30 @@ def _load_excluded_documents(
                     f"{path} contains a non-hex document hash"
                 ) from exc
             report_hashes.add(value)
+            prompt_hash = (
+                document.get("prompt_hash") if isinstance(document, dict) else None
+            )
+            if prompt_hash is not None:
+                if not isinstance(prompt_hash, str) or len(prompt_hash) != 32:
+                    raise ValueError(f"{path} contains an invalid prompt hash")
+                try:
+                    bytes.fromhex(prompt_hash)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path} contains a non-hex prompt hash"
+                    ) from exc
+                report_prompt_hashes.add(prompt_hash)
         identities.append(
             {
                 "path": str(path),
                 "sha256": _sha256(path),
                 "documents": len(report_hashes),
+                "prompts": len(report_prompt_hashes),
             }
         )
-        hashes.update(report_hashes)
-    return hashes, identities
+        document_hashes.update(report_hashes)
+        prompt_hashes.update(report_prompt_hashes)
+    return document_hashes, prompt_hashes, identities
 
 
 def _fold_selected(
@@ -142,8 +177,16 @@ def _record_tokens(row: dict, tokenizer: TokenizerLike) -> list[int]:
     if isinstance(row.get("prompt"), str):
         return list(tokenizer.encode(row["prompt"], add_special_tokens=False))
     messages = row.get("messages")
+    if not isinstance(messages, list):
+        # The locally prepared GLMFlash corpora use ``conversations`` for the
+        # same OpenAI-style role/content sequence.  Accept it directly so the
+        # K3 planner can reuse those authenticated source mixtures without a
+        # lossy rewrite or another multi-gigabyte copy.
+        messages = row.get("conversations")
     if not isinstance(messages, list) or not messages:
-        raise ValueError("record must contain a string prompt or non-empty messages")
+        raise ValueError(
+            "record must contain a string prompt or non-empty messages/conversations"
+        )
     if any(not isinstance(message, dict) for message in messages):
         raise ValueError("messages must be JSON objects")
     return list(
@@ -167,6 +210,7 @@ def _source_requests(
     fold_mode: str,
     seed: int,
     excluded_document_hashes: set[str],
+    excluded_prompt_hashes: set[str],
 ) -> list[PlannedRequest]:
     candidates: list[tuple[str, int, str]] = []
     seen_document_hashes = set(excluded_document_hashes)
@@ -175,6 +219,15 @@ def _source_requests(
             raw = raw.strip()
             if not raw:
                 continue
+            if source.record_source is not None:
+                try:
+                    source_row = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(source_row, dict):
+                    continue
+                if source_row.get("source") != source.record_source:
+                    continue
             document_hash = _content_hash(raw)
             if document_hash in seen_document_hashes:
                 continue
@@ -192,6 +245,7 @@ def _source_requests(
     random.Random(seed ^ int(_content_hash(str(source.path)), 16)).shuffle(candidates)
 
     requests = []
+    seen_prompt_hashes = set(excluded_prompt_hashes)
     used = 0
     for raw, line_number, document_hash in candidates:
         try:
@@ -210,12 +264,16 @@ def _source_requests(
         if not tokens:
             break
         prompt_bytes = b"".join(int(token).to_bytes(4, "little") for token in tokens)
+        prompt_hash = hashlib.blake2b(prompt_bytes, digest_size=16).hexdigest()
+        if prompt_hash in seen_prompt_hashes:
+            continue
+        seen_prompt_hashes.add(prompt_hash)
         requests.append(
             PlannedRequest(
                 source=str(source.path.resolve()),
                 line=line_number,
                 document_hash=document_hash,
-                prompt_hash=hashlib.blake2b(prompt_bytes, digest_size=16).hexdigest(),
+                prompt_hash=prompt_hash,
                 prompt_tokens=tuple(tokens),
             )
         )
@@ -239,8 +297,10 @@ def build_plan(
     fold_mode: str,
     seed: int,
     excluded_document_hashes: set[str] | None = None,
+    excluded_prompt_hashes: set[str] | None = None,
 ) -> list[PlannedRequest]:
     excluded = set(excluded_document_hashes or ())
+    excluded_prompts = set(excluded_prompt_hashes or ())
     quotas = _allocate_quotas(target_tokens, sources)
     plan = []
     for offset, (source, quota) in enumerate(zip(sources, quotas, strict=True)):
@@ -248,18 +308,20 @@ def build_plan(
             source,
             tokenizer,
             token_quota=quota,
-            max_prompt_tokens=max_prompt_tokens,
+            max_prompt_tokens=source.max_prompt_tokens or max_prompt_tokens,
             min_prompt_tokens=min_prompt_tokens,
             fold_modulus=fold_modulus,
             fold_index=fold_index,
             fold_mode=fold_mode,
             seed=seed + offset * 1_000_003,
             excluded_document_hashes=excluded,
+            excluded_prompt_hashes=excluded_prompts,
         )
         plan.extend(source_plan)
         # Also prevent the same raw document from being selected through two
         # different source inventories.
         excluded.update(request.document_hash for request in source_plan)
+        excluded_prompts.update(request.prompt_hash for request in source_plan)
     random.Random(seed).shuffle(plan)
     if sum(request.tokens for request in plan) != target_tokens:
         raise AssertionError("planned corpus does not match the requested token budget")
@@ -398,6 +460,7 @@ def _plan_report(
     plan: list[PlannedRequest],
     excluded_reports: list[dict[str, object]],
     excluded_document_hashes: set[str],
+    excluded_prompt_hashes: set[str],
 ) -> dict:
     return {
         "kind": "kquant_interim_calibration_corpus_run",
@@ -406,7 +469,14 @@ def _plan_report(
         "model_dir": str(args.model_dir.resolve()),
         "capture_dir": str(args.capture_dir.resolve()),
         "sources": [
-            {"path": str(source.path.resolve()), "weight": source.weight}
+            {
+                "path": str(source.path.resolve()),
+                "weight": source.weight,
+                "max_prompt_tokens": (
+                    source.max_prompt_tokens or args.max_prompt_tokens
+                ),
+                "record_source": source.record_source,
+            }
             for source in args.source
         ],
         "fold": {
@@ -417,6 +487,7 @@ def _plan_report(
         },
         "excluded_corpus_reports": excluded_reports,
         "excluded_document_hashes": sorted(excluded_document_hashes),
+        "excluded_prompt_hashes": sorted(excluded_prompt_hashes),
         "seed": args.seed,
         "target_tokens": args.target_tokens,
         "planned_tokens": sum(request.tokens for request in plan),
@@ -449,6 +520,7 @@ def _resume_report(path: Path, planned: dict) -> dict:
         "fold",
         "excluded_corpus_reports",
         "excluded_document_hashes",
+        "excluded_prompt_hashes",
         "seed",
         "target_tokens",
         "planned_tokens",
@@ -472,9 +544,11 @@ def run(args: argparse.Namespace) -> dict:
     for source in args.source:
         if not source.path.is_file():
             raise FileNotFoundError(source.path)
-    excluded_hashes, excluded_reports = _load_excluded_documents(
-        args.exclude_report
-    )
+    (
+        excluded_hashes,
+        excluded_prompt_hashes,
+        excluded_reports,
+    ) = _load_excluded_documents(args.exclude_report)
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -493,12 +567,14 @@ def run(args: argparse.Namespace) -> dict:
         fold_mode=args.fold_mode,
         seed=args.seed,
         excluded_document_hashes=excluded_hashes,
+        excluded_prompt_hashes=excluded_prompt_hashes,
     )
     planned_report = _plan_report(
         args,
         plan,
         excluded_reports,
         excluded_hashes,
+        excluded_prompt_hashes,
     )
     if args.resume:
         if not args.report.is_file():
@@ -598,7 +674,12 @@ def parse_args() -> argparse.Namespace:
         type=_parse_source,
         action="append",
         required=True,
-        metavar="JSONL[=WEIGHT]",
+        metavar="JSONL[=WEIGHT[@MAX_TOKENS][::RECORD_SOURCE]]",
+        help=(
+            "JSONL source, optional mixture weight, and optional per-source "
+            "prompt cap/source-field filter; for example "
+            "hybrid.jsonl=0.2@4096::ultrachat"
+        ),
     )
     parser.add_argument("--target-tokens", type=int, required=True)
     parser.add_argument("--max-prompt-tokens", type=int, default=768)

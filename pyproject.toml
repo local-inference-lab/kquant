@@ -1,7 +1,7 @@
 [project]
 name = "kquant"
 version = "0.1.0"
-description = "Hybrid expert quantization pipeline for Kimi-K3 (MXFP4 keep tier + demoted low-bit tiers)"
+description = "TP12 QSRT quantization and validation pipeline for Kimi-K3"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.7",
@@ -9,9 +9,6 @@ dependencies = [
     "numpy>=2.0",
     "tqdm>=4.66",
 ]
-
-[project.scripts]
-kquant = "kquant.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

@@ -3,9 +3,8 @@ import pytest
 from safetensors.torch import save_file
 
 from kquant import constants as C
-from kquant.interim_weights import weight_name
 from kquant.io.hf_cache import CheckpointCache
-from kquant.source_weights import OfficialMXFP4Store
+from kquant.source_weights import OfficialMXFP4Store, weight_name
 
 
 def test_official_store_streams_one_packed_matrix(tmp_path):
@@ -28,11 +27,17 @@ def test_official_store_streams_one_packed_matrix(tmp_path):
     store = OfficialMXFP4Store(cache)
     raw = store.load_packed_matrix(1, 7, "w2")
     scale_only = store.load_scale_plane(1, 7, "w2")
+    streamed_scales = list(
+        store.iter_layer_scale_planes(1, experts=(7,), matrices=("w2",))
+    )
     matrix = store.load_matrix(1, 7, "w2")
 
     assert torch.equal(raw.packed, packed)
     assert torch.equal(raw.scale, scales)
     assert torch.equal(scale_only, scales)
+    assert len(streamed_scales) == 1
+    assert streamed_scales[0][:2] == (7, "w2")
+    assert torch.equal(streamed_scales[0][2], scales)
     assert matrix.shape == C.EXPERT_SHAPES["w2"]
     assert torch.equal(matrix[:, 0], torch.zeros(out_features))
     assert torch.equal(matrix[:, 1], torch.full((out_features,), 0.5))

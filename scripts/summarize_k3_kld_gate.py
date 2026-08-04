@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-comparison", type=Path, required=True)
     parser.add_argument("--candidate-comparison", type=Path, required=True)
     parser.add_argument("--baseline-label", default="3p09")
-    parser.add_argument("--candidate-label", default="mixed-exl3-tp12")
+    parser.add_argument("--candidate-label", default="qsrt-tp12")
     parser.add_argument("--start-window", type=int, default=0)
     parser.add_argument("--stop-window", type=int)
     parser.add_argument(

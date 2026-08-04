@@ -9,16 +9,27 @@ never materialize the full float32 matrix on CPU.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 
 from kquant import constants as C
-from kquant.interim_weights import weight_name
 from kquant.io.hf_cache import CheckpointCache, resolve
 from kquant.io.mxfp4 import dequant
 from kquant.io.stream import load_tensor
+
+
+def weight_name(layer: int, expert: int, matrix: str, part: str) -> str:
+    """Return the canonical tensor name for one routed-expert weight part."""
+
+    return (
+        f"language_model.model.layers.{layer}.block_sparse_moe.experts."
+        f"{expert}.{matrix}.{part}"
+    )
 
 
 @dataclass(frozen=True)
@@ -145,3 +156,74 @@ class OfficialMXFP4Store:
         if scale.device.type != "cpu":
             raise ValueError("official scale planes must be streamed through CPU")
         return scale.contiguous()
+
+    def iter_layer_scale_planes(
+        self,
+        layer: int,
+        *,
+        experts: tuple[int, ...] | None = None,
+        matrices: tuple[str, ...] = C.EXPERT_MATRICES,
+    ) -> Iterator[tuple[int, str, torch.Tensor]]:
+        """Yield one layer's scale planes while opening each shard only once.
+
+        Kimi-K3 currently stores a complete routed-expert layer in one shard,
+        but the implementation deliberately supports multiple shards.  This
+        avoids reparsing a large safetensors header for every one of the 2,688
+        scale tensors in an all-expert X4T cost scan.
+        """
+
+        if layer not in C.MOE_LAYERS:
+            raise ValueError(f"decoder layer {layer} is not a K3 MoE layer")
+        if not matrices or len(set(matrices)) != len(matrices):
+            raise ValueError("scale-plane matrices must be nonempty and unique")
+        if any(matrix not in C.EXPERT_MATRICES for matrix in matrices):
+            raise ValueError(f"matrices must be drawn from {C.EXPERT_MATRICES}")
+        selected_experts = (
+            tuple(range(C.NUM_EXPERTS)) if experts is None else tuple(experts)
+        )
+        if (
+            not selected_experts
+            or len(set(selected_experts)) != len(selected_experts)
+            or any(
+                isinstance(expert, bool)
+                or not isinstance(expert, int)
+                or not 0 <= expert < C.NUM_EXPERTS
+                for expert in selected_experts
+            )
+        ):
+            raise ValueError("scale-plane experts must be unique IDs in 0..895")
+
+        names = [
+            (expert, matrix, weight_name(layer, expert, matrix, "weight_scale"))
+            for expert in selected_experts
+            for matrix in matrices
+        ]
+        paths: set[Path] = set()
+        for _expert, _matrix, name in names:
+            path = self.cache.tensor_path(name)
+            if path is None:
+                raise FileNotFoundError(f"shard for {name} not downloaded yet")
+            paths.add(Path(path))
+
+        with ExitStack() as stack:
+            handles = {
+                path: stack.enter_context(safe_open(str(path), framework="pt"))
+                for path in paths
+            }
+            for expert, matrix, name in names:
+                path = self.cache.tensor_path(name)
+                if path is None:
+                    raise AssertionError("validated scale tensor became unavailable")
+                scale = handles[Path(path)].get_tensor(name)
+                out_features, in_features = C.EXPERT_SHAPES[matrix]
+                expected = (out_features, in_features // C.MXFP4_BLOCK)
+                if scale.dtype != torch.uint8 or tuple(scale.shape) != expected:
+                    raise ValueError(
+                        f"{name} has {scale.dtype} {tuple(scale.shape)}, expected "
+                        f"torch.uint8 {expected}"
+                    )
+                if scale.device.type != "cpu":
+                    raise ValueError(
+                        "official scale planes must be streamed through CPU"
+                    )
+                yield expert, matrix, scale.contiguous()

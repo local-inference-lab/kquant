@@ -6,24 +6,21 @@ import math
 
 import torch
 
-from kquant.sqg_e4m3 import SQG_NORMAL_E4M3, sqg_e4m3_codebook
+from kquant.sqg_e4m3 import (
+    SQG_CHEB_NORMAL_E4M3,
+    SQG_NORMAL_E4M3,
+    sqg_codebook,
+)
 
 
 TILE_VALUES = 256
 HADAMARD_BLOCK = 128
-CODEBOOK_MCG = "mcg"
-CODEBOOK_MUL1_E4M3 = "mul1-e4m3"
 CODEBOOK_SQG_NORMAL_E4M3 = SQG_NORMAL_E4M3
-EXL3_CODEBOOKS = (
-    CODEBOOK_MCG,
-    CODEBOOK_MUL1_E4M3,
+CODEBOOK_SQG_CHEB_NORMAL_E4M3 = SQG_CHEB_NORMAL_E4M3
+QSRT_CODEBOOKS = (
     CODEBOOK_SQG_NORMAL_E4M3,
+    CODEBOOK_SQG_CHEB_NORMAL_E4M3,
 )
-MCG_MULT = 0xCBAC1FED
-MUL1_MULT = 0x83DCD12D
-MUL1_ACC_BITS = 0x6400
-MUL1_INV_BITS = 0x1EEE
-MUL1_BIAS_BITS = 0xC931
 
 
 def _validate_bits(bits: int) -> None:
@@ -58,106 +55,23 @@ def reconstruct_trellis_states(
     return (states & 0xFFFF).to(dtype=torch.int16).contiguous()
 
 
-def decode_mcg_states(states: torch.Tensor) -> torch.Tensor:
-    """Decode 16-bit EXL MCG states exactly to their FP16 codebook values."""
-
-    if states.dtype == torch.bool or states.is_floating_point():
-        raise TypeError("trellis states must use an integer dtype")
-    values = states.to(dtype=torch.int64) & 0xFFFF
-    product = (values * MCG_MULT) & 0xFFFFFFFF
-    # PTX lop3(a, 0x8fff8fff, 0x3b603b60, 0x6a) has the Boolean
-    # expression c XOR (a AND b), with a as the most-significant LUT input.
-    transformed = 0x3B603B60 ^ (product & 0x8FFF8FFF)
-    low = (transformed & 0xFFFF).to(torch.int16).view(torch.float16)
-    high = ((transformed >> 16) & 0xFFFF).to(torch.int16).view(torch.float16)
-    return (low + high).to(torch.float16).contiguous()
-
-
-def mul1_byte_sums(
-    states: torch.Tensor, *, multiplier: int = MUL1_MULT
-) -> torch.Tensor:
-    """Return MUL1's four-byte statistic for a configurable u32 multiplier."""
-
-    if states.dtype == torch.bool or states.is_floating_point():
-        raise TypeError("trellis states must use an integer dtype")
-    if (
-        isinstance(multiplier, bool)
-        or not isinstance(multiplier, int)
-        or multiplier < 0
-        or multiplier > 0xFFFFFFFF
-    ):
-        raise ValueError("multiplier must be a uint32 integer")
-    values = states.to(dtype=torch.int64) & 0xFFFF
-    product = (values * multiplier) & 0xFFFFFFFF
-    return (
-        (product & 0xFF)
-        + ((product >> 8) & 0xFF)
-        + ((product >> 16) & 0xFF)
-        + ((product >> 24) & 0xFF)
-    ).contiguous()
-
-
-def decode_mul1_states(
-    states: torch.Tensor, *, multiplier: int = MUL1_MULT
-) -> torch.Tensor:
-    """Decode 16-bit EXL MUL1 states to the CUDA decoder's FP16 values.
-
-    EXL multiplies the state by ``0x83DCD12D``, sums the four product bytes
-    with ``dp4a``, reinterprets ``0x6400 + bytesum`` as FP16, and performs one
-    FP16 fused multiply-add using literal half constants. Evaluating those
-    exact half inputs in float64 and rounding once reproduces that half FMA.
-    """
-
-    byte_sum = mul1_byte_sums(states, multiplier=multiplier)
-    accumulator = (byte_sum + MUL1_ACC_BITS).to(torch.int16).view(torch.float16)
-    inv = torch.tensor(MUL1_INV_BITS, dtype=torch.int16, device=states.device).view(
-        torch.float16
-    )
-    bias = torch.tensor(
-        MUL1_BIAS_BITS - 0x10000, dtype=torch.int16, device=states.device
-    ).view(torch.float16)
-    return (accumulator.double() * inv.double() + bias.double()).to(
-        torch.float16
-    ).contiguous()
-
-
-def decode_mul1_e4m3_states(states: torch.Tensor) -> torch.Tensor:
-    """Decode MUL1 states and round each reconstruction to finite E4M3.
-
-    This mirrors the production candidate encoder: the exact EXL MUL1 half
-    result is converted with round-to-nearest-even into the E4M3 finite
-    alphabet, then represented as FP16 for reference arithmetic.
-    """
-
-    return (
-        decode_mul1_states(states)
-        .to(dtype=torch.float8_e4m3fn)
-        .to(dtype=torch.float16)
-        .contiguous()
-    )
-
-
 def _decode_codebook_states(
     states: torch.Tensor,
     codebook: str,
     *,
     bits: int | None = None,
 ) -> torch.Tensor:
-    if codebook == CODEBOOK_MCG:
-        return decode_mcg_states(states)
-    if codebook == CODEBOOK_MUL1_E4M3:
-        return decode_mul1_e4m3_states(states)
-    if codebook == CODEBOOK_SQG_NORMAL_E4M3:
+    if codebook in QSRT_CODEBOOKS:
         if bits is None:
             raise ValueError("SQG reconstruction requires an explicit trellis rate")
         _validate_bits(bits)
         indices = (states.to(dtype=torch.int64) & 0xFFFF).long()
-        values = sqg_e4m3_codebook(
-            bits, "normal", device=states.device, dtype=torch.float16
+        values = sqg_codebook(
+            bits, codebook, device=states.device, dtype=torch.float16
         )
         return values.index_select(0, indices.flatten()).reshape_as(states)
     raise ValueError(
-        f"unsupported EXL3 codebook {codebook!r}; expected one of {EXL3_CODEBOOKS}"
+        f"unsupported QSRT codebook {codebook!r}; expected one of {QSRT_CODEBOOKS}"
     )
 
 
@@ -186,7 +100,7 @@ def tensor_core_permutation(device: torch.device | str = "cpu") -> torch.Tensor:
 def decode_regularized_weight(
     states: torch.Tensor,
     *,
-    codebook: str = CODEBOOK_MCG,
+    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
     codebook_values: torch.Tensor | None = None,
     bits: int | None = None,
 ) -> torch.Tensor:
@@ -218,7 +132,7 @@ def decode_regularized_weight(
     )
 
 
-def decode_mixed_regularized_weight(
+def decode_qsrt_regularized_weight(
     states: torch.Tensor,
     *,
     rate_axis: str,
@@ -227,9 +141,8 @@ def decode_mixed_regularized_weight(
 ) -> torch.Tensor:
     """Decode a K2/K3/K4 tile map to transformed ``[K, N]`` weights.
 
-    Procedural MCG and MUL1 use one reconstruction function at every rate.
-    SQG deliberately uses a different state labelling for K2, K3, and K4, so
-    its physical tile rate is part of the numerical decode contract.
+    SQG uses a distinct state labelling for K2, K3, and K4, so the physical
+    tile rate is part of the numerical decode contract.
     """
 
     if states.ndim != 3 or states.shape[-1] != TILE_VALUES:
@@ -244,8 +157,8 @@ def decode_mixed_regularized_weight(
         for value in tile_bits
     ):
         raise ValueError("tile_bits must contain only integer K2, K3, or K4")
-    if codebook != CODEBOOK_SQG_NORMAL_E4M3:
-        return decode_regularized_weight(states, codebook=codebook)
+    if codebook not in QSRT_CODEBOOKS:
+        raise ValueError(f"unsupported QSRT codebook: {codebook}")
 
     decoded_tiles = torch.empty_like(states, dtype=torch.float32)
     bits_tensor = torch.tensor(tile_bits, dtype=torch.long, device=states.device)
@@ -307,7 +220,7 @@ def decode_exl3_weight(
     suh: torch.Tensor,
     svh: torch.Tensor,
     *,
-    codebook: str = CODEBOOK_MCG,
+    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
     codebook_values: torch.Tensor | None = None,
     bits: int | None = None,
 ) -> torch.Tensor:
@@ -327,18 +240,18 @@ def decode_exl3_weight(
     return weight.contiguous()
 
 
-def decode_mixed_exl3_weight(
+def decode_qsrt_weight(
     states: torch.Tensor,
     suh: torch.Tensor,
     svh: torch.Tensor,
     *,
     rate_axis: str,
     tile_bits: tuple[int, ...],
-    codebook: str = CODEBOOK_MCG,
+    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
 ) -> torch.Tensor:
-    """Decode stored mixed-rate states/scales to an EXL ``[K, N]`` weight."""
+    """Decode stored QSRT states and scales to an EXL ``[K, N]`` weight."""
 
-    weight = decode_mixed_regularized_weight(
+    weight = decode_qsrt_regularized_weight(
         states,
         rate_axis=rate_axis,
         tile_bits=tile_bits,

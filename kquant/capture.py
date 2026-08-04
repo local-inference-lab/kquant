@@ -20,7 +20,7 @@ from safetensors.torch import load_file as load_torch_file
 from safetensors.torch import save_file as save_torch_file
 
 from kquant import constants as C
-from kquant.dynstats import save_bundle
+from kquant.io.stats_bundle import save_stats_bundle
 
 CAPTURE_SCHEMA_VERSION = 2
 HESSIAN_SCHEMA_VERSION = 1
@@ -335,7 +335,9 @@ def merge_stats(
         raise ValueError(
             f"cannot emit production kqstats for non-K3 geometry {geometry}"
         )
-    return save_bundle(output_path, arrays, "vllm-b12x-kquant-capture", manifest)
+    return save_stats_bundle(
+        output_path, arrays, "vllm-b12x-kquant-capture", manifest
+    )
 
 
 @dataclass(frozen=True)

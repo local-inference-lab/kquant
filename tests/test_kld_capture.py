@@ -128,6 +128,8 @@ def test_kld_server_environment_is_tp12_capture_only(
 ) -> None:
     monkeypatch.setenv("K3_KQUANT_CAPTURE_DIR", "/bad/calibration")
     monkeypatch.setenv("VLLM_KQUANT_CAPTURE_DIR", "/bad/calibration")
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "0")
+    monkeypatch.setenv("VLLM_KQUANT_TRELLIS_W4A8", "1")
     gpus = [f"GPU-{index}" for index in range(12)]
 
     env = build_server_environment(
@@ -143,5 +145,10 @@ def test_kld_server_environment_is_tp12_capture_only(
     assert env["K3_KLD_CAPTURE_DIR"] == str(tmp_path / "chunks")
     assert env["K3_MAX_NUM_BATCHED_TOKENS"] == "256"
     assert env["K3_DSPARK"] == "0"
+    assert env["B12X_MOE_REPEAT_CHECK"] == "1"
+    assert env["B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START"] == "1"
+    assert env["B12X_MOE_REPEAT_CHECK_MAX_REPORTS"] == "1"
+    assert env["B12X_MOE_FORCE_A16"] == "0"
+    assert env["VLLM_KQUANT_TRELLIS_W4A8"] == "1"
     assert "K3_KQUANT_CAPTURE_DIR" not in env
     assert "VLLM_KQUANT_CAPTURE_DIR" not in env

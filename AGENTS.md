@@ -1,308 +1,332 @@
 # kquant agent guide
 
-This repository builds and validates hybrid Kimi-K3 checkpoints: selected
-routed experts remain in the official MXFP4 format, the remaining routed
-experts are encoded as EXL3-3 trellis weights, and non-expert linears are
-served from an offline MXFP8 overlay. Read this file before relying on the
-older `docs/handoff-brief.md`; that brief captures useful history, but its
-headline correctness blocker has been resolved.
+This repository builds and validates `Kimi-K3-QSRT`, a TP12 hybrid checkpoint.
+QSRT experts use SQG-E4M3 trellis reconstruction with expert-static K2/K4 rate
+shifts around K3. The high-quality tier uses X4T, which reproduces the official
+MXFP4 tensors exactly while compressing their scale plane. Non-expert linears
+come from the reusable offline MXFP8 overlay.
 
-## Current status (2026-07-31)
+The canonical name is **QSRT**: Quantile-Stratified Rate-shifted Trellis codec.
+Do not introduce TrellisShift, TSH, SQRT-C, `mixed_exl3`, or generic X4 names in
+new code, schemas, artifacts, or documentation. `X4T` is the only current X4
+format. MCG and MUL1 may remain only where they are active numerical controls
+or external EXL encoder APIs.
 
-- Kimi-K3 has 93 decoder layers. Layer 0 is dense; layers 1-92 contain 896
-  routed experts each, for 82,432 layer/expert assignments.
-- The current production artifact is `/models/Kimi-K3-EXL3-3p09` with serve
-  directory `/models/Kimi-K3-EXL3-3p09-serve`. These resolve into
-  `/data/models` on this host.
-- Its allocation keeps 7,007 experts in original MXFP4 and stores 75,425 as
-  EXL3-3 (`keep_frac=0.085`). It uses the shared-su EXL3 representation.
-- `scripts/validate_k3_artifact.py` passes on 3p09: all 720,867 expected expert
-  tensors were found, the allocation/config/index agree, and no structural
-  issues were reported.
-- Full-model streamed PyTorch runs of the official checkpoint and packaged
-  3p09 both select token 28202 (` Berlin`) for the fixed prompt
-  `The capital of France is Paris. The capital of Germany is`. The packaged
-  result is close at the final logit decision, but layer traces show expected
-  accumulated quantization and routing drift. This is a correctness anchor,
-  not a quality benchmark.
-- After the serialized-MXFP8 BF16-ignore loading fix, the full TP12 vLLM path
-  also selects ` Berlin` for that prompt, and interactive Kimi reasoning is
-  coherent. Earlier `pytorch-vs-vllm-full-tp12.json` captures predate that fix
-  and are not the current serving verdict.
-- Original MXFP4 numerical closure uses the ordinary production W4A16 MoE
-  kernel, not the hybrid kept-weight path. Logical TP ranks are simulated
-  sequentially, so TP16 geometry does not require 16 physical GPUs.
-- EXL3 production-kernel closure currently runs at TP4 and TP12. Its logical
-  TP16 reference is simulated, but the physical EXL3 trellis arm is reported
-  as unsupported because K3's TP16 local intermediate width is 192 rather
-  than a multiple of 128. Do not interpret that explicit `not-run` as a
-  numerical mismatch.
-- Correctness infrastructure now includes artifact validation, owned vLLM
-  probes, kernel-path log audits, deterministic truncated checkpoints,
-  sequential TP simulation, streamed official-PyTorch execution, and
-  layer/stage trace comparison.
+## Current state (2026-08-04)
 
-The current production artifact still uses the L0 router-bias traffic proxy
-and identity Hessian. The next quality pipeline is now implemented: vLLM and
-B12X can capture exact all-expert routing, conditional activation moments, and
-raw Hessian samples from the resident interim EXL3 model while the official
-checkpoint remains the offline encoder weight source; kquant can merge TP
-shards, build dense per-layer Hessians, quantize all 82,432 experts before
-allocation, and reuse that candidate pool for later keep-set changes. It has
-unit and CUDA graph-replay coverage, but a full 10M-token production capture
-and regenerated quality artifact have not yet been run. A tiny all-rates-one
-TP12 preflight against the interim EXL3 teacher passed all 92 MoE layers with
-exact TP joins, route/mid pairing, and zero dropped rows. Follow
-`docs/exl3-calibration.md`; do not regenerate the production artifact merely
-to make per-layer keep counts look uniform.
+- Kimi-K3 has 93 decoder layers. Layers 1-92 contain 896 routed experts each,
+  for 82,432 layer/expert assignments.
+- `/models/Kimi-K3-EXL3-3p09` and its serve directory remain the validated
+  interim teacher and comparison checkpoint. They are not the QSRT format.
+- QSRT v1 is TP12 only. Do not add TP4 or TP16 requirements to its storage,
+  allocation, capture, or kernel gates.
+- The lossy search is `R0/R1/R2`, with one `r13` decision shared by `w1` and
+  `w3` and an independent `r2` decision for `w2`.
+- `sqg-normal-e4m3` is the frozen R44 baseline. `sqg-cheb-normal-e4m3` and K2
+  law/stratification variants remain controlled research candidates until the
+  production donor/recipient study selects one.
+- X4T is the exact endpoint. There is no raw-MXFP4 or old variable-rate X4 tier
+  in a QSRT artifact.
+- The earlier layer-global dense `H2` study was invalid as a production metric:
+  post-SiTU coordinate indices are expert-local. Layer-global `H13` is valid,
+  but `H2` must be built from expert-stratified routed rows and shrunk toward
+  identity. Unsupported experts fall back to identity.
+- The immediate calibration target is a source-controlled 1,000,000-token
+  training capture. It is the first scale-up from the 65,536-token pilot, not
+  the final corpus. Mode-selection and final-validation captures must remain
+  document- and prompt-disjoint.
+- The next checkpoint must be built into a fresh artifact after the new capture
+  and Hessian path are validated. Do not resume the stopped R44/X4T build.
 
-## Repository boundaries and hygiene
+The active design is documented in [docs/qsrt-technical-brief.md](docs/qsrt-technical-brief.md).
+Capture and covariance requirements are in
+[docs/qsrt-calibration.md](docs/qsrt-calibration.md) and
+[docs/dense-h-corpus-plan.md](docs/dense-h-corpus-plan.md).
 
-- Quantization and correctness tooling lives here. Production serving changes
-  live in `/home/luke/projects/vllm`; kernels live in
-  `/home/luke/projects/b12x`; the encoder implementation lives in
-  `/home/luke/projects/exllamav3`. Do not stage changes from sibling repos in a
-  kquant commit.
-- Use `.venv/bin/python`, `.venv/bin/pytest`, or `.venv/bin/kquant` so runs use
-  the project environment.
-- Never commit checkpoint payloads, generated traces, `out/correctness`,
-  `__pycache__`, or `*.pyc`. Correctness traces can consume several GiB.
-- Treat `/models` artifacts as valuable. Packaging creates symlinks rather
-  than copying payloads, so a serve directory depends on its artifact and
-  offline non-expert source remaining present.
-- Use a fresh artifact and serve destination for every changed keep fraction,
-  seed/scaling mode, Hessian, or encoder revision. The pack driver skips
-  existing layer shards; mixing settings in one destination silently creates
-  an invalid experiment.
-- The 12-GPU parent currently pins workers to numeric CUDA indices 0-11.
-  Verify GPU enumeration and that every device is idle before launching.
-- A full pack uses roughly 20 GiB of host RAM per worker and has shown heap
-  growth. Keep ample RAM/swap available and monitor worker exits and the OOM
-  log. Per-layer output is atomic and a same-configuration run is resumable.
+## Porting QSRT to another gated MoE model
 
-## Produce an EXL-3 checkpoint
+Treat a model such as GLM 5.2 as a new codec port, not as a Kimi checkpoint
+with renamed dimensions. Do not write payloads until the following contracts
+are explicit and tested.
 
-The production EXL3 path is `scripts/pack_exl3_12gpu.py`, not the generic
-`kquant pack` command used by the earlier NF experiments.
+### 1. Freeze source and architecture identity
 
-### 1. Prepare the environment and source checkpoint
+Pin the repository/model ID, immutable revision, tokenizer/chat template,
+configuration, source tensor index, and every source shard hash. Inventory:
 
-Install the project environment if needed:
+- decoder and MoE layer counts;
+- routed and shared expert counts, top-k routing, gate normalization, and any
+  expert grouping;
+- exact gate/up/down tensor names, stored orientations, dtypes, block scales,
+  and logical matrix shapes;
+- activation equation and the location of multiplicative gates;
+- tensor-parallel sharding axes and local dimensions at the intended TP;
+- non-expert linears and their serving format; and
+- the source checkpoint's exact high-quality representation.
+
+Add a model-specific constants/adapter module and header-only inventory tests.
+Never infer matrix roles merely from a familiar tensor suffix.
+
+### 2. Prove the hidden-coordinate symmetry
+
+QSRT's shared neuron permutation is valid only when the expert's nonlinear
+middle operation is coordinatewise and the same permutation is applied to all
+coupled branches. Write the model's expert function and prove the exact update,
+for example
+
+```text
+W_gate' = P W_gate
+W_up'   = P W_up
+W_down' = W_down P^T.
+```
+
+Test full-precision closure on real source experts before quantization. A
+Hadamard, sign transform, affine scale, cross-channel normalization, or
+model-specific interaction does not inherit this proof. Document where every
+encoder transform is cancelled relative to the activation.
+
+### 3. Derive a model-native fixed payload
+
+Choose logical record width, coding-tile width, pair/super-record structure,
+and TP ownership from the new intermediate dimension and target GPU MMA atoms.
+The general fixed-rate identity is
+
+```text
+K_donor + K_recipient = 2 * K_baseline.
+```
+
+For Kimi v1 this is P24 versus P33 over paired 128-channel records. Another
+model may need a different record width or rank grouping. Prove divisibility,
+constant stride, exact bytes, rank balance, bounded random access, and malformed
+input rejection before freezing a format. Do not copy Kimi's 24-record mode
+table when the new intermediate axis has different geometry.
+
+### 4. Establish the reconstruction law
+
+Select `L`, supported rates, reference distribution, SQG rank permutation, and
+finite reconstruction type. Verify graph bijection, one outgoing edge per
+stratum, all-rank coverage, finite labels, tail-biting closure, and exact
+pack/unpack. Train or synthesize the scalar law on the production transformed
+and BlockLDLQ-feedback domain. A source checkpoint's scalar alphabet is not
+automatically the optimal reconstruction alphabet for the second codec.
+
+### 5. Build a representative resident teacher
+
+The resident checkpoint must fit at the target TP and expose exact routes,
+applied gates, expert inputs, and canonical post-activation rows. The immutable
+official checkpoint remains the offline weight source. Assemble source-pinned,
+document-disjoint training, selection, and final-validation plans with prose,
+dialogue, code, math, multilingual, tools, and realistic long-context traffic.
+
+Run a route census first. Allocate expert-aware row reservoirs, preserve sample
+probabilities, and record distinct-document support. `H13` may be shared only
+when its input basis is actually shared; `H2` is expert-local. Define shrinkage
+and identity fallback before encoding all experts.
+
+### 6. Port the source decoder and candidate encoder
+
+Implement bit-exact source tensor decoding and round-trip tests. Stream one
+expert or bounded expert batch at a time; never materialize the full official
+model on CPU or GPU. For every expert, emit uniform baseline and allowed
+rate-shift candidates, preserve dense-H BlockLDLQ feedback, reconstruct the
+complete expert function, and select modes with paired document evidence.
+Candidate generation must be allocation-independent and resumable by atomic
+layer.
+
+### 7. Define the high-quality endpoint
+
+X4T is specific to an MXFP4 nibble plus UE8M0-scale source. Reuse it only if
+the new model has the same exact source contract. Otherwise design a separate
+endpoint that either reproduces the source tensor exactly or has an explicitly
+validated near-lossless error target. Build an all-expert exact-byte index;
+never allocate from nominal bpw alone.
+
+### 8. Implement the target runtime
+
+Add reference CPU decode first, then the model's target-TP B12X and vLLM paths.
+Prove layout, TP joins, transform order, A16 numerical closure, graph replay,
+register/shared-memory bounds, rank-tail latency, and routed fused-MoE
+performance. A decoder microbenchmark is insufficient if activation conversion,
+scale preparation, or expert scheduling erases the gain.
+
+### 9. Allocate and release
+
+Score candidates on untouched natural-routing data, solve the global
+quality-versus-exact-byte allocation, and materialize only into fresh artifact
+and serve directories. Require structural and bit-exact validation, streamed
+source comparison, live-routing drift, teacher-logit/KLD, task quality, and
+production latency before calling `<Model>-QSRT` usable.
+
+Keep model-specific dimensions, source formats, schema IDs, and kernel support
+out of the shared QSRT theory. A successful new-model port should add a small
+adapter and explicit format version, not weaken Kimi-K3's frozen TP12 contract.
+
+## Repository boundaries
+
+- Quantization, capture analysis, allocation, packaging, and correctness tools
+  live here.
+- Production serving changes live in `/home/luke/projects/vllm`.
+- B12X kernels live in `/home/luke/projects/b12x`.
+- The QSRT offline encoder lives in `kquant/exl3_encoder_backend.py`; its
+  tail-biting SQG CUDA code lives under `kquant/csrc`. The checkout at
+  `/home/luke/projects/exllamav3` must remain an unmodified upstream dependency
+  and supplies only its extension plus Hadamard/tensor utilities. Put every
+  QSRT-specific encoder change in this repository.
+- Never stage sibling-repository changes in a kquant commit.
+- Use `.venv/bin/python` and `.venv/bin/pytest`.
+- Never commit checkpoint payloads, captures, generated traces, `out/`,
+  `__pycache__`, or `*.pyc`.
+- Treat `/models` and `/data/kquant` artifacts as valuable. Use a fresh path for
+  every changed corpus, Hessian policy, codebook, allocation, or encoder build.
+- Candidate layers are atomic and an identical all-layer build is resumable.
+  Never mix settings in an existing destination.
+- Before a 12-GPU run, verify GPU enumeration, free memory, host RAM/swap,
+  destination capacity, and exact worker PIDs. Do not kill by broad name match.
+
+## Current QSRT pipeline
+
+### 1. Validate the official source
+
+The official checkpoint is an offline weight source; it is never loaded as the
+resident calibration model.
 
 ```bash
 cd /home/luke/projects/kquant
 uv sync --dev
-```
 
-The packer imports the compatible local exllamav3 encoder and reads the
-official Kimi-K3 checkpoint through `kquant.io.hf_cache.resolve()`. Verify all
-96 indexed shards and all 92 MoE layers resolve before a long run:
-
-```bash
 .venv/bin/python - <<'PY'
 from kquant.io.hf_cache import resolve
 
 checkpoint = resolve()
 assert not checkpoint.missing_shards, checkpoint.missing_shards
-assert len(checkpoint.shard_paths) == 96, len(checkpoint.shard_paths)
+assert len(checkpoint.shard_paths) == 96
 assert len(checkpoint.complete_moe_layers()) == 92
 print(checkpoint.snapshot_dir)
-print("source checkpoint complete")
 PY
 ```
 
-`out/static.kqstats` supplies the current L0 allocation proxy. Preserve it to
-reproduce 3p09. If it is genuinely absent, regenerate it from the same source
-revision; this is a substantial checkpoint scan:
+### 2. Plan and capture the corpus
+
+Build source-controlled JSONL plans, validate raw-record and post-tokenization
+separation, then drive the resident interim checkpoint with
+`scripts/run_interim_calibration_corpus.py`. Use fresh capture/report paths.
+The immediate training target is 1,000,000 prompt tokens.
 
 ```bash
-.venv/bin/kquant --out out stats --device cuda --batch-size 96
+.venv/bin/python scripts/validate_calibration_corpus_plans.py \
+  <training-report> <selection-report> <final-validation-report> \
+  --output out/qsrt-corpus-integrity.json
 ```
 
-Before packing, check free GPUs, host RAM, swap, destination disk, and stale
-pack workers. Do not kill processes by an unscoped name match; identify the
-actual PIDs first.
+The vLLM launcher must set `K3_KQUANT_CAPTURE_DIR` and use the interim EXL3
+teacher. Finalize the capture exactly once and reject any dropped sample rows,
+TP join mismatch, epoch-zero probe contamination, or document overlap.
 
-### 2. Pack demoted experts
+### 3. Build and seal all-expert candidates
 
-For a reproduction of the current 3p09 allocation, choose a new tag and keep
-fraction 0.085. `KQUANT_EXL3_SHARED_SU=1` is required and must be present in
-the parent environment so every worker imports the encoder in the same mode.
+Candidate generation streams official MXFP4 matrices one expert batch at a
+time. It must use the new capture, the validated Hessian bundle, separate
+`r13/r2` selection, and only R0/R1/R2.
 
 ```bash
-KQ_TAG=3p09-repack
-KQ_ARTIFACT=/models/Kimi-K3-EXL3-${KQ_TAG}
-KQUANT_EXL3_SHARED_SU=1 \
-  .venv/bin/python scripts/pack_exl3_12gpu.py \
-  --dest "${KQ_ARTIFACT}" \
-  --keep-frac 0.085
+.venv/bin/python scripts/pack_qsrt_candidates_tp12.py \
+  --dest <fresh-candidate-pool> \
+  --capture <training-capture> \
+  --training-report <training-report> \
+  --hessians <validated-kqhess> \
+  --hessian-policy captured_blend \
+  --mode-ids 0,1,2 \
+  --codebook sqg-normal-e4m3 \
+  --layout qsrt_guarded_reuse \
+  --ldlq-tf32
+
+.venv/bin/python scripts/finalize_qsrt_candidate_pool.py \
+  <fresh-candidate-pool> --jobs 12
 ```
 
-The parent writes:
+Do not use `captured_blend` until the bundle and candidate path prove that
+`H2` is expert-stratified. Identity H is the scientific control, not a silent
+fallback for a malformed dense-H bundle.
 
-- `allocation-exl3.json` with the complete keep/EXL3 partition;
-- `kquant_exl3_manifest.json` with bits, codebook, multiplier, and Hessian;
-- one `exl3-layer-XXXXX.safetensors` plus `.errs.json` for each MoE layer.
-
-There must be 92 EXL3 layer shards at completion. Existing layer shards are
-skipped on a resumed run. Resume only with identical settings. An explicit
-repair/rebalance worker can be pinned to one physical GPU and given a layer
-list:
+### 4. Score untouched validation data
 
 ```bash
-CUDA_VISIBLE_DEVICES=GPU-REPLACE_WITH_UUID \
-KQUANT_EXL3_SHARED_SU=1 \
-  .venv/bin/python scripts/pack_exl3_12gpu.py \
-  --worker 0 \
-  --layers 17,29 \
-  --dest "${KQ_ARTIFACT}"
+.venv/bin/python scripts/score_qsrt_validation.py \
+  --candidate-pool <candidate-pool> \
+  --validation-capture <validation-capture> \
+  --validation-report <validation-report> \
+  --dest <validation-scores>
+
+.venv/bin/python scripts/score_qsrt_mode_validation.py \
+  --candidate-pool <candidate-pool> \
+  --validation-scores <validation-scores> \
+  --dest <mode-validation-scores>
 ```
 
-With `--layers`, the worker number is only a log label. Without it, the worker
-processes that worker's modulo-12 layer assignment.
+The candidate pool's fit/confirmation folds select expert-static rate shifts.
+The untouched capture estimates keep-tier damage and verifies each accepted
+shift against its R0/R0 counterfactual. Final validation cannot tune modes,
+codebooks, margins, or the X4T allocation.
 
-### 3. Extract the original MXFP4 keep tier
-
-The EXL3 pack intentionally omits kept experts. Copy their original packed
-weights into dedicated shards so vLLM never has to reference a partial source
-checkpoint shard:
+### 5. Index X4T and allocate exact bytes
 
 ```bash
-.venv/bin/python scripts/extract_keep_tier.py "${KQ_ARTIFACT}"
+.venv/bin/python scripts/index_x4t_costs.py \
+  --dest <x4t-cost-index> --jobs 12 --resume
+
+.venv/bin/python scripts/allocate_qsrt_tp12.py \
+  --candidate-pool <candidate-pool> \
+  --validation-scores <validation-scores> \
+  --x4t-cost-index <x4t-cost-index> \
+  --target-container-bytes 1058586247168 \
+  --output <allocation.json>
 ```
 
-This must use the same complete official source checkpoint checked in step 1.
-The current 3p09 artifact produces 15 `keep-mxfp4-*.safetensors` shards; a
-different keep fraction can change that count.
+The allocator chooses between each expert's selected fixed-rate QSRT candidate
+and its exact X4T byte cost. R0/R1/R2 are rate-shift decisions at constant
+three-bit trellis payload; they are not the high-tier allocation.
 
-### 4. Ensure the offline MXFP8 non-expert overlay exists
-
-The reusable production overlay is `/models/Kimi-K3-mxfp8-nonexpert` (14
-shards, about 71 GiB). Do not rebake it for every expert allocation. If it is
-missing or the dense quantization contract changes, recreate it from the Phase
-A non-expert shards:
+### 6. Materialize, package, and validate
 
 ```bash
-.venv/bin/python scripts/bake_mxfp8_nonexpert.py \
-  --src /models/Kimi-K3-NF3R-Uniform-3p25-serve \
-  --dest /models/Kimi-K3-mxfp8-nonexpert \
-  --jobs 12
+.venv/bin/python scripts/materialize_qsrt_tp12.py \
+  --candidate-pool <candidate-pool> \
+  --x4t-cost-index <x4t-cost-index> \
+  --allocation <allocation.json> \
+  --dest <fresh-artifact> --resume
+
+.venv/bin/python scripts/package_qsrt_tp12_serve_dir.py \
+  <fresh-artifact> <fresh-serve-dir> \
+  --x4t-tp12-source <x4t-runtime-source>
+
+.venv/bin/python scripts/validate_qsrt_tp12_artifact.py \
+  --artifact <fresh-artifact> \
+  --verify-payloads \
+  --output out/validate-qsrt.json
 ```
 
-The bake converts only its explicit 2-D target linears. BF16 exclusions such
-as `kv_b_proj`, `g_proj`, `f_a_proj`, `f_b_proj`, and `b_proj` must stay BF16
-and must remain listed in the packaged quantization config's
-`ignored_layers`.
+Every materialized layer is a fixed QSRT trellis slab plus an exact X4T
+sidecar. Validation must close schemas, hashes, byte accounting, zero padding,
+format tables, candidate bytes, and official MXFP4 reconstruction.
 
-### 5. Build the vLLM serve directory
+### 7. Quality and runtime gates
 
-Use a fresh destination. The package script currently takes positional
-artifact/destination arguments and uses the fixed non-expert overlay path
-above:
+Run the TP12 B12X numerical closures, X4T W4A16 closure, performance gate,
+streamed PyTorch comparison, vLLM A16 compatibility path, KLD suite, live
+routing drift checks, and task evaluations. A8 is a separate speed/quality
+tradeoff and must not be used to judge the codec's weight distortion.
 
-```bash
-KQ_SERVE=${KQ_ARTIFACT}-serve
-.venv/bin/python scripts/package_exl3_serve_dir.py \
-  "${KQ_ARTIFACT}" "${KQ_SERVE}"
-```
-
-The packager symlinks EXL3, kept-MXFP4, MXFP8, tokenizer, and auxiliary files;
-builds a merged safetensors index; emits the per-expert hybrid bit map; and
-detects shared-su from the stored tensors rather than trusting a flag.
-
-### 6. Run structural and numerical gates
-
-Structural validation is mandatory and reads safetensors headers without
-materializing the model:
-
-```bash
-.venv/bin/python scripts/validate_k3_artifact.py \
-  --artifact "${KQ_ARTIFACT}" \
-  --serve-dir "${KQ_SERVE}" \
-  --output "out/validate-${KQ_TAG}.json"
-```
-
-Exercise the original checkpoint through the normal W4A16 kernel across the
-important logical TP geometries:
-
-```bash
-.venv/bin/python scripts/closure_exl3_layer.py \
-  --artifact "${KQ_ARTIFACT}" \
-  --serve-dir "${KQ_SERVE}" \
-  --layer 1 \
-  --scenarios source-w4a16 \
-  --tp-sizes 4,12,16 \
-  --output "out/closure-${KQ_TAG}-source-w4a16.json"
-```
-
-Then exercise EXL3 through the production trellis MoE kernel at supported
-geometries:
-
-```bash
-.venv/bin/python scripts/closure_exl3_layer.py \
-  --artifact "${KQ_ARTIFACT}" \
-  --serve-dir "${KQ_SERVE}" \
-  --layer 1 \
-  --scenarios all-exl3 \
-  --tp-sizes 4,12 \
-  --output "out/closure-${KQ_TAG}-exl3.json"
-```
-
-Repeat closures on representative layers if the encoder, allocation logic,
-or kernel contract changed. Layer 1 alone is a smoke test, not a model-quality
-claim.
-
-### 7. Full streamed reference check
-
-Before calling a new artifact usable, stream the fixed prompt through the
-official PyTorch implementation one layer at a time. This path keeps only a
-layer and the carried activation state resident, and records layer/stage
-traces for localization.
-
-```bash
-KQ_SOURCE=/data/cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/c5d1dd4c428bd1ce8b88c5044f3b6ccde9e3b721
-
-.venv/bin/python scripts/stream_k3_pytorch.py \
-  --checkpoint "${KQ_SOURCE}" \
-  --output-dir "out/correctness/${KQ_TAG}-official" \
-  --chunk-size 4 \
-  --finalize
-
-.venv/bin/python scripts/stream_k3_pytorch.py \
-  --checkpoint "${KQ_SOURCE}" \
-  --expert-checkpoint "${KQ_SERVE}" \
-  --nonexpert-checkpoint "${KQ_SERVE}" \
-  --exl3-manifest "${KQ_ARTIFACT}/kquant_exl3_manifest.json" \
-  --output-dir "out/correctness/${KQ_TAG}-packaged" \
-  --chunk-size 4 \
-  --finalize
-
-.venv/bin/python scripts/compare_kimi_traces.py \
-  "out/correctness/${KQ_TAG}-official/trace" \
-  "out/correctness/${KQ_TAG}-packaged/trace" \
-  --output "out/correctness/${KQ_TAG}-official-vs-packaged.json"
-```
-
-Compare final token IDs and logits directly in both `run.json` files. Trace
-thresholds appropriate for TP invariance are too strict for a 4-bit-to-3-bit
-quality comparison; inspect the per-layer trajectory rather than weakening a
-gate until it says `pass`.
-
-Finally serve through the matching vLLM/b12x revisions and run an owned probe
-with `scripts/run_k3_correctness.py`. The current production launcher is
-`/home/luke/projects/vllm/serve-kimi-k3-exl3-3p09-tp12.sh`; point
-`K3_MODEL_DIR` at the new serve directory. Preserve FP8 KV cache, Kimi tool
-and reasoning parsers, graph capture, normal W4A16 MoE, and serialized MXFP8
-loading when comparing against the validated production path.
+The fixed ` Berlin` prompt is a wiring smoke test only. A usable checkpoint
+requires document-disjoint KLD and task quality plus production TP12 latency.
 
 ## Tests
 
-Run the CPU/unit suite for every code change:
+Run the full CPU/unit suite for every code change:
 
 ```bash
 .venv/bin/pytest -q
 ```
 
-Also run the smallest relevant real-data or CUDA closure for changes to
-artifact schemas, source loading, sharding, MXFP8, EXL3, or TP behavior. Unit
-tests cannot establish model or production-kernel correctness.
+For artifact, source-loading, sharding, X4T, QSRT layout, or kernel changes,
+also run the smallest relevant real-data or CUDA closure. Unit tests do not
+establish full-model or production-kernel correctness.

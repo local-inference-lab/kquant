@@ -4,5 +4,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Local correctness captures include model traces and can be many GiB.
-out/correctness/
+# Local research output includes captures, profiles, and model traces and can
+# be many GiB.  Durable checkpoint payloads live outside the repository.
+out/

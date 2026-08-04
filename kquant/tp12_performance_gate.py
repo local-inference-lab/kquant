@@ -19,22 +19,22 @@ from safetensors import safe_open
 import torch
 
 
-KIND = "kquant_mixed_exl3_tp12_performance_gate"
-ISOLATED_KIND = "kquant_mixed_exl3_tp12_isolated_performance_gate"
-ROUTED_KIND = "kquant_mixed_exl3_tp12_routed_performance_gate"
+KIND = "kquant_kimi_k3_qsrt_tp12_performance_gate"
+ISOLATED_KIND = "kquant_kimi_k3_qsrt_tp12_isolated_performance_gate"
+ROUTED_KIND = "kquant_kimi_k3_qsrt_tp12_routed_performance_gate"
 SCHEMA_VERSION = 1
 BENCHMARK_KIND = "b12x_trellis_pair_moe_tp12_benchmark"
 BENCHMARK_SCHEMA_VERSION = 1
 ISOLATED_BENCHMARK_KIND = "b12x_trellis_pair_tp12_benchmark"
 ISOLATED_BENCHMARK_SCHEMA_VERSION = 1
-FIXTURE_KIND = "kquant_mixed_exl3_tp12_benchmark_fixture"
+FIXTURE_KIND = "kquant_kimi_k3_qsrt_tp12_benchmark_fixture"
 FIXTURE_SCHEMA_VERSION = 1
 TP_SIZE = 12
 NUM_EXPERTS = 896
 TOP_K = 16
 HIDDEN_SIZE = 3584
 LOCAL_INTERMEDIATE_SIZE = 256
-RUNTIME_MIX_KIND = "kquant_mixed_exl3_tp12_runtime_mix"
+RUNTIME_MIX_KIND = "kquant_kimi_k3_qsrt_tp12_runtime_mix"
 RUNTIME_MIX_SCHEMA_VERSION = 1
 
 
@@ -974,7 +974,7 @@ def validate_tp12_performance_report(
             f"{path} candidate pool {candidate_pool} does not match "
             f"{Path(expected_candidate_pool).resolve()}"
         )
-    manifest_path = candidate_pool / "mixed_exl3_candidate_manifest.json"
+    manifest_path = candidate_pool / "qsrt-candidate-manifest.json"
     if not manifest_path.is_file():
         raise ValueError(f"{path} candidate manifest is unavailable")
     manifest_sha256 = _sha256(manifest_path)

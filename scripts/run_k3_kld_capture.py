@@ -148,6 +148,12 @@ def build_server_environment(
             "K3_KLD_CAPTURE_DIR": str(capture_dir),
             "K3_MAX_NUM_BATCHED_TOKENS": "256",
             "K3_MAX_NUM_SEQS": "1",
+            # Emit one post-start repeat-check record from the actual MoE
+            # execution path.  The kernel audit must be backed by runtime
+            # evidence rather than merely by checkpoint-loader messages.
+            "B12X_MOE_REPEAT_CHECK": "1",
+            "B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START": "1",
+            "B12X_MOE_REPEAT_CHECK_MAX_REPORTS": "1",
         }
     )
     return env
@@ -287,9 +293,14 @@ def main() -> int:
         "K3_KLD_CAPTURE_DIR",
         "K3_MAX_NUM_BATCHED_TOKENS",
         "K3_MAX_NUM_SEQS",
+        "B12X_MOE_FORCE_A16",
+        "B12X_MOE_REPEAT_CHECK",
+        "B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START",
+        "B12X_MOE_REPEAT_CHECK_MAX_REPORTS",
+        "VLLM_KQUANT_TRELLIS_W4A8",
     )
     runtime["server_environment"] = {
-        name: env[name] for name in recorded_env_names
+        name: env[name] for name in recorded_env_names if name in env
     }
     runtime["server_command"] = [str(launcher)]
     atomic_write_json(runtime_path, runtime)
