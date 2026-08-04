@@ -8,9 +8,9 @@ A bundle is a directory ``<name>.kqstats/`` containing:
                          optionally with trailing dims (e.g. per-matrix [.., 3]).
 
 kquant's own static producers (stats/distortion) emit this same container, so
-rankers consume static and dynamic signals uniformly. The future vLLM hook
-emits L1 keys (`tokens_routed`, `gate_sum`, `gate_sq_sum`) and later L2 keys
-(`damage.<format>`). Unknown keys are preserved and ignored.
+rankers consume static and dynamic signals uniformly.  Schema v2 adds the
+gate-square-weighted activation moments emitted by the vLLM/B12X calibration
+path.  Unknown keys are preserved and ignored.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from safetensors.numpy import load_file, save_file
 
 from kquant import constants as C
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -79,8 +79,14 @@ def save_bundle(
     }
     if extra_manifest:
         manifest.update(extra_manifest)
-    save_file(np_arrays, str(path / "arrays.safetensors"))
-    (path / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    arrays_path = path / "arrays.safetensors"
+    arrays_tmp = path / f".{arrays_path.name}.tmp"
+    manifest_path = path / "manifest.json"
+    manifest_tmp = path / f".{manifest_path.name}.tmp"
+    save_file(np_arrays, str(arrays_tmp))
+    manifest_tmp.write_text(json.dumps(manifest, indent=1))
+    arrays_tmp.replace(arrays_path)
+    manifest_tmp.replace(manifest_path)
     return path
 
 

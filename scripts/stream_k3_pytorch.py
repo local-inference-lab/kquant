@@ -4,8 +4,9 @@
 Only one decoder layer is materialized at a time. Routed experts are
 reconstructed in bulk after routing and released after the layer. The expert
 source may be the official MXFP4 checkpoint or a hybrid EXL3/MXFP4 artifact.
-Serialized MXFP8 non-expert projections can also be dequantized into the same
-official PyTorch layer implementation.
+It may also be a completed fixed-slab mixed-EXL TP12 artifact. Serialized
+MXFP8 non-expert projections can be dequantized into the same official PyTorch
+layer implementation.
 
 This is a correctness reference, not a serving implementation.  It deliberately
 uses eager PyTorch MLA attention and the official FLA KDA implementation; it
@@ -31,7 +32,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from kquant import constants as KQ_C
 from kquant.correctness import DEFAULT_PROMPT, write_json
+from kquant.exl3_reference import CODEBOOK_MCG, EXL3_CODEBOOKS
 from kquant.kimi_stream import (
     MODEL_TENSOR_PREFIX,
     IndexedSafetensors,
@@ -44,6 +47,31 @@ from kquant.kimi_stream import (
     write_trace_manifest,
     write_trace_tensor,
 )
+from kquant.mixed_exl3 import (
+    SCHEMA as MIXED_EXL3_SCHEMA,
+    TP_SIZE as MIXED_EXL3_TP_SIZE,
+    PackedTP12Trellis,
+    TP12TrellisDescriptor,
+    decode_tp12_exl3_weight,
+    matrix_rate_axis,
+)
+from kquant.pack.mixed_materialize import (
+    FORMAT_SECTION_BYTES,
+    LAYER_HEADER_BYTES,
+    MATERIALIZED_ARTIFACT_KIND,
+    MATERIALIZED_ARTIFACT_SCHEMA_VERSION,
+    MATERIALIZED_LAYER_PREFIX,
+    MATERIALIZED_MANIFEST_FILENAME,
+    SHARED_SCALE_SECTION_BYTES,
+    TP12LayerReader,
+    layer_filename as mixed_exl3_layer_filename,
+)
+from kquant.teacher_proxy import align_routed_post_situ
+from kquant.teacher_proxy_suite import (
+    LoadedTeacherProxySuite,
+    load_teacher_proxy_suite,
+    parse_layer_list,
+)
 
 DEFAULT_CHECKPOINT = Path(
     "/home/luke/.cache/huggingface/hub/"
@@ -53,6 +81,82 @@ DEFAULT_CHECKPOINT = Path(
 DEFAULT_EXLLAMAV3_DIR = Path("/home/luke/projects/exllamav3")
 EXPERT_MATRICES = ("w1", "w2", "w3")
 EXL3_PARTS = ("trellis", "suh", "svh")
+
+
+@dataclass(frozen=True)
+class MaterializedTP12Artifact:
+    """Strict, read-only inventory for one completed mixed-EXL TP12 artifact."""
+
+    root: Path
+    manifest_path: Path
+    manifest: dict[str, Any]
+
+    @classmethod
+    def load(cls, root: str | Path) -> "MaterializedTP12Artifact":
+        root = Path(root).expanduser().resolve()
+        manifest_path = root / MATERIALIZED_MANIFEST_FILENAME
+        if not manifest_path.is_file():
+            raise FileNotFoundError(manifest_path)
+        manifest = json.loads(manifest_path.read_text())
+        if not isinstance(manifest, dict):
+            raise TypeError(f"{manifest_path}: expected a JSON object")
+        expected_scalars = {
+            "kind": MATERIALIZED_ARTIFACT_KIND,
+            "schema_version": MATERIALIZED_ARTIFACT_SCHEMA_VERSION,
+            "complete": True,
+            "format_schema": MIXED_EXL3_SCHEMA,
+            "tp_size": MIXED_EXL3_TP_SIZE,
+        }
+        for name, expected in expected_scalars.items():
+            if manifest.get(name) != expected:
+                raise ValueError(
+                    f"{manifest_path}: {name}={manifest.get(name)!r}, "
+                    f"expected {expected!r}"
+                )
+        codebook = manifest.get("candidate_codebook", CODEBOOK_MCG)
+        if codebook not in EXL3_CODEBOOKS:
+            raise ValueError(
+                f"{manifest_path}: unsupported candidate_codebook {codebook!r}"
+            )
+        layers = manifest.get("layers")
+        expected_layers = {str(layer) for layer in KQ_C.MOE_LAYERS}
+        if not isinstance(layers, dict) or set(layers) != expected_layers:
+            raise ValueError(
+                f"{manifest_path}: expected exactly {len(expected_layers)} "
+                "MoE layer entries"
+            )
+        expected_files = {
+            mixed_exl3_layer_filename(layer) for layer in KQ_C.MOE_LAYERS
+        }
+        actual_files = {
+            path.name
+            for path in root.glob(f"{MATERIALIZED_LAYER_PREFIX}*.bin")
+            if path.is_file()
+        }
+        if actual_files != expected_files:
+            raise ValueError(
+                "materialized mixed-EXL layer inventory does not close; "
+                f"missing={sorted(expected_files - actual_files)[:3]}, "
+                f"extra={sorted(actual_files - expected_files)[:3]}"
+            )
+        partials = sorted(root.glob(".*.partial"))
+        if partials:
+            raise ValueError(
+                f"materialized mixed-EXL artifact contains partials: {partials[:3]}"
+            )
+        return cls(root=root, manifest_path=manifest_path, manifest=manifest)
+
+    def layer_path(self, layer_idx: int) -> Path:
+        if layer_idx not in KQ_C.MOE_LAYERS:
+            raise ValueError(f"decoder layer {layer_idx} is not a K3 MoE layer")
+        path = self.root / mixed_exl3_layer_filename(layer_idx)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+
+    @property
+    def codebook(self) -> str:
+        return str(self.manifest.get("candidate_codebook", CODEBOOK_MCG))
 
 
 def _require_reference_dependencies() -> dict[str, Any]:
@@ -589,6 +693,184 @@ class StagedExperts:
             assign_parameter(expert, f"{matrix}.weight", replacement)
 
 
+def _decode_materialized_exl3_matrix(
+    reader: TP12LayerReader,
+    *,
+    expert_id: int,
+    matrix: str,
+    expected: tuple[int, ...],
+    device: torch.device,
+    codebook: str = CODEBOOK_MCG,
+) -> tuple[torch.Tensor, int]:
+    """Reconstruct one mixed slab matrix as an official ``[out, in]`` weight."""
+
+    if len(expected) != 2:
+        raise ValueError(
+            f"layer {reader.header.layer} expert {expert_id} {matrix}: "
+            f"expected a matrix, got {expected}"
+        )
+    if expected[0] % 16 or expected[1] % 16:
+        raise ValueError(
+            f"layer {reader.header.layer} expert {expert_id} {matrix}: "
+            f"shape {expected} is not 16x16 tiled"
+        )
+    format_spec = reader.formats[expert_id]
+    if format_spec.is_mxfp4:
+        raise ValueError(f"expert {expert_id} is not in the compressed tier")
+    parts = reader.read_compressed_matrix(expert_id, matrix)
+    mode_id = format_spec.r2 if matrix == "w2" else format_spec.r13
+    descriptor = TP12TrellisDescriptor(
+        mode_id=mode_id,
+        rate_axis=matrix_rate_axis(matrix),
+        k_tiles=expected[1] // 16,
+        n_tiles=expected[0] // 16,
+        schema=MIXED_EXL3_SCHEMA,
+    )
+    packed = PackedTP12Trellis(
+        descriptor,
+        parts["trellis"].to(device=device).contiguous(),
+    )
+    packed.validate()
+    suh = parts["suh"].to(device=device).contiguous()
+    svh = parts["svh"].to(device=device).contiguous()
+    dense = (
+        decode_tp12_exl3_weight(packed, suh, svh, codebook=codebook)
+        .T.contiguous()
+        .to(dtype=torch.bfloat16)
+    )
+    if tuple(dense.shape) != expected:
+        raise ValueError(
+            f"layer {reader.header.layer} expert {expert_id} {matrix}: "
+            f"reconstructed shape {tuple(dense.shape)} != {expected}"
+        )
+    local_scale = parts["suh"] if matrix == "w2" else parts["svh"]
+    bytes_read = _tensor_bytes(parts["trellis"]) + _tensor_bytes(local_scale)
+    return dense, bytes_read
+
+
+class MaterializedTP12StagedExperts:
+    """Stage active experts directly from one fixed-stride TP12 layer slab."""
+
+    def __init__(
+        self,
+        *,
+        reader: TP12LayerReader,
+        layer_idx: int,
+        scheme: Any,
+        compressor: Any,
+        device: torch.device,
+        codebook: str = CODEBOOK_MCG,
+    ):
+        if reader.header.layer != layer_idx:
+            raise ValueError(
+                f"mixed slab layer {reader.header.layer} != decoder layer {layer_idx}"
+            )
+        self.reader = reader
+        self.layer_idx = layer_idx
+        self.scheme = scheme
+        self.compressor = compressor
+        self.device = device
+        self.codebook = codebook
+        self.stats = ExpertLoadStats(
+            packed_bytes=(
+                LAYER_HEADER_BYTES
+                + FORMAT_SECTION_BYTES
+                + SHARED_SCALE_SECTION_BYTES
+            )
+        )
+        self._handles: list[Any] = []
+        self._loaded_experts: list[torch.nn.Module] = []
+
+    def install(
+        self, gate: torch.nn.Module, experts: torch.nn.ModuleList
+    ) -> None:
+        self._handles.append(
+            gate.register_forward_hook(
+                lambda unused_module, unused_args, output: self._stage(
+                    experts, output[0]
+                )
+            )
+        )
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        for expert in self._loaded_experts:
+            StagedExperts._release(expert)
+        self._loaded_experts.clear()
+        self.reader.close()
+
+    def _reconstruct_compressed(
+        self,
+        *,
+        expert_id: int,
+        matrix: str,
+        expected: tuple[int, ...],
+    ) -> tuple[torch.Tensor, int]:
+        return _decode_materialized_exl3_matrix(
+            self.reader,
+            expert_id=expert_id,
+            matrix=matrix,
+            expected=expected,
+            device=self.device,
+            codebook=self.codebook,
+        )
+
+    def _stage(
+        self,
+        experts: torch.nn.ModuleList,
+        topk_ids: torch.Tensor,
+    ) -> None:
+        if self.stats.expert_ids:
+            raise RuntimeError(
+                f"layer {self.layer_idx}: experts were staged more than once"
+            )
+        started = time.monotonic()
+        expert_ids = sorted(
+            {int(expert_id) for expert_id in topk_ids.view(-1).tolist()}
+        )
+        self.stats.expert_ids = expert_ids
+
+        for expert_id in expert_ids:
+            expert = experts[expert_id]
+            format_spec = self.reader.formats[expert_id]
+            if format_spec.is_mxfp4:
+                self.stats.kept_expert_ids.append(expert_id)
+            else:
+                self.stats.exl3_expert_ids.append(expert_id)
+            for matrix in EXPERT_MATRICES:
+                expected = tuple(getattr(expert, matrix).weight.shape)
+                if format_spec.is_mxfp4:
+                    packed = self.reader.read_kept_matrix(expert_id, matrix)
+                    self.stats.packed_bytes += _tensor_bytes(
+                        packed.packed
+                    ) + _tensor_bytes(packed.scale)
+                    dense = self.compressor.decompress(
+                        {
+                            "weight_packed": packed.packed,
+                            "weight_scale": packed.scale,
+                        },
+                        self.scheme,
+                    )["weight"].to(device=self.device)
+                else:
+                    dense, bytes_read = self._reconstruct_compressed(
+                        expert_id=expert_id,
+                        matrix=matrix,
+                        expected=expected,
+                    )
+                    self.stats.packed_bytes += bytes_read
+                if tuple(dense.shape) != expected:
+                    raise ValueError(
+                        f"layer {self.layer_idx} expert {expert_id} {matrix}: "
+                        f"reconstructed shape {tuple(dense.shape)} != {expected}"
+                    )
+                self.stats.dense_bytes += _tensor_bytes(dense)
+                assign_parameter(expert, f"{matrix}.weight", dense)
+            self._loaded_experts.append(expert)
+        self.stats.load_seconds += time.monotonic() - started
+
+
 def _flatten_trace_tensor(value: torch.Tensor) -> torch.Tensor:
     if value.ndim >= 2 and value.shape[0] == 1:
         return value.squeeze(0)
@@ -596,9 +878,18 @@ def _flatten_trace_tensor(value: torch.Tensor) -> torch.Tensor:
 
 
 class LayerCaptures:
-    def __init__(self, layer: torch.nn.Module):
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        *,
+        capture_routed_post_situ: bool = False,
+    ):
         self.values: dict[str, torch.Tensor] = {}
         self._handles: list[Any] = []
+        self._capture_routed_post_situ = (
+            capture_routed_post_situ and hasattr(layer, "block_sparse_moe")
+        )
+        self._post_situ_by_expert: dict[int, torch.Tensor] = {}
         self._capture_output(layer.self_attn, "attention_output")
         if hasattr(layer, "block_sparse_moe"):
             moe = layer.block_sparse_moe
@@ -626,6 +917,22 @@ class LayerCaptures:
                 self._capture_output(
                     moe.shared_experts, "shared_output_partial"
                 )
+            if self._capture_routed_post_situ:
+                for expert_id, expert in enumerate(moe.experts):
+                    if not hasattr(expert, "act_fn"):
+                        raise AttributeError(
+                            f"expert {expert_id} has no post-SiTU act_fn module"
+                        )
+                    self._handles.append(
+                        expert.act_fn.register_forward_hook(
+                            lambda unused_module,
+                            unused_args,
+                            output,
+                            expert_id=expert_id: self._capture_post_situ(
+                                expert_id, output
+                            )
+                        )
+                    )
         else:
             self._capture_output(layer.mlp, "dense_mlp_output")
 
@@ -633,6 +940,29 @@ class LayerCaptures:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+        self._post_situ_by_expert.clear()
+
+    def finalize(self) -> None:
+        if not self._capture_routed_post_situ:
+            return
+        if "routed_post_situ" in self.values:
+            return
+        topk_ids = self.values.get("canonical_topk_ids")
+        if topk_ids is None:
+            raise RuntimeError("post-SiTU capture requires canonical route IDs")
+        self.values["routed_post_situ"] = align_routed_post_situ(
+            topk_ids,
+            self._post_situ_by_expert,
+        ).detach()
+
+    def _capture_post_situ(
+        self, expert_id: int, output: torch.Tensor
+    ) -> None:
+        if expert_id in self._post_situ_by_expert:
+            raise RuntimeError(
+                f"expert {expert_id} produced post-SiTU output more than once"
+            )
+        self._post_situ_by_expert[expert_id] = output.detach()
 
     def _capture_output(self, module: torch.nn.Module, stage: str) -> None:
         self._handles.append(
@@ -681,6 +1011,7 @@ def _write_layer_trace(
     block_output: torch.Tensor,
     captures: LayerCaptures,
 ) -> None:
+    captures.finalize()
     values = {
         "layer_input": layer_input,
         "block_residual_input": block_input,
@@ -699,20 +1030,28 @@ def _write_layer_trace(
 
 def _tokenize(
     args: argparse.Namespace, dependencies: dict[str, Any], checkpoint: Path
-) -> tuple[Any, torch.Tensor]:
+) -> tuple[Any, torch.Tensor, LoadedTeacherProxySuite | None]:
     tokenizer = dependencies["AutoTokenizer"].from_pretrained(
         str(checkpoint), trust_remote_code=True
     )
-    if args.input_ids:
+    suite = None
+    if args.input_ids_file is not None:
+        suite = load_teacher_proxy_suite(args.input_ids_file)
+        input_ids = suite.input_ids
+    elif args.input_ids:
         ids = [int(value) for value in args.input_ids.split(",") if value]
+        input_ids = torch.tensor([ids], dtype=torch.long)
     else:
         ids = tokenizer(
             args.prompt,
             add_special_tokens=args.add_special_tokens,
         )["input_ids"]
-    if not ids:
+        input_ids = torch.tensor([ids], dtype=torch.long)
+    if not input_ids.numel():
         raise ValueError("the fixed prefill must contain at least one token")
-    return tokenizer, torch.tensor([ids], dtype=torch.long)
+    if input_ids.ndim != 2 or input_ids.shape[1] <= 0:
+        raise ValueError("input IDs must form a nonempty rectangular batch")
+    return tokenizer, input_ids, suite
 
 
 def _initial_state(
@@ -893,6 +1232,11 @@ def _load_exl3_mcg_mult(
 @torch.inference_mode()
 def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = args.checkpoint.expanduser().resolve()
+    materialized_artifact = (
+        None
+        if args.mixed_exl3_artifact is None
+        else MaterializedTP12Artifact.load(args.mixed_exl3_artifact)
+    )
     expert_checkpoint = (
         checkpoint
         if args.expert_checkpoint is None
@@ -903,8 +1247,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.nonexpert_checkpoint is None
         else args.nonexpert_checkpoint.expanduser().resolve()
     )
+    expert_source_path = (
+        expert_checkpoint
+        if materialized_artifact is None
+        else materialized_artifact.root
+    )
     output_dir = args.output_dir.expanduser().resolve()
-    for source in (checkpoint, expert_checkpoint, nonexpert_checkpoint):
+    indexed_sources = [checkpoint, nonexpert_checkpoint]
+    if materialized_artifact is None:
+        indexed_sources.append(expert_checkpoint)
+    for source in indexed_sources:
         if not (source / "model.safetensors.index.json").is_file():
             raise FileNotFoundError(source / "model.safetensors.index.json")
     if not (checkpoint / "config.json").is_file():
@@ -922,24 +1274,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint, dependencies
     )
     checkpoint_store = IndexedSafetensors(checkpoint)
-    expert_store = _store_for(
-        expert_checkpoint,
-        existing_path=checkpoint,
-        existing_store=checkpoint_store,
+    if materialized_artifact is None:
+        expert_store: IndexedSafetensors | None = _store_for(
+            expert_checkpoint,
+            existing_path=checkpoint,
+            existing_store=checkpoint_store,
+        )
+        nonexpert_store = _store_for(
+            nonexpert_checkpoint,
+            existing_path=(
+                expert_checkpoint
+                if expert_store is not checkpoint_store
+                else checkpoint
+            ),
+            existing_store=expert_store,
+        )
+        mcg_mult, exl3_manifest = _load_exl3_mcg_mult(
+            expert_checkpoint, args.exl3_manifest
+        )
+    else:
+        expert_store = None
+        nonexpert_store = _store_for(
+            nonexpert_checkpoint,
+            existing_path=checkpoint,
+            existing_store=checkpoint_store,
+        )
+        mcg_mult, exl3_manifest = None, None
+    tokenizer, input_ids, input_suite = _tokenize(
+        args, dependencies, checkpoint
     )
-    nonexpert_store = _store_for(
-        nonexpert_checkpoint,
-        existing_path=(
-            expert_checkpoint
-            if expert_store is not checkpoint_store
-            else checkpoint
-        ),
-        existing_store=expert_store,
-    )
-    mcg_mult, exl3_manifest = _load_exl3_mcg_mult(
-        expert_checkpoint, args.exl3_manifest
-    )
-    tokenizer, input_ids = _tokenize(args, dependencies, checkpoint)
 
     device = torch.device(args.device)
     if device.type != "cuda":
@@ -977,16 +1340,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(
             f"--start-layer {args.start_layer} != state next_layer {start_layer}"
         )
-    end_layer = (
-        int(config.num_hidden_layers)
-        if args.end_layer is None
-        else args.end_layer
-    )
+    if input_suite is not None:
+        suite_end_layer = int(input_suite.manifest["end_layer"])
+        if args.end_layer is not None and args.end_layer != suite_end_layer:
+            raise ValueError(
+                f"--end-layer {args.end_layer} differs from suite "
+                f"end_layer {suite_end_layer}"
+            )
+        end_layer = suite_end_layer
+    else:
+        end_layer = (
+            int(config.num_hidden_layers)
+            if args.end_layer is None
+            else args.end_layer
+        )
     if not 0 <= start_layer <= end_layer <= int(config.num_hidden_layers):
         raise ValueError(
             f"invalid layer range [{start_layer}, {end_layer}) for "
             f"{config.num_hidden_layers} layers"
         )
+    if args.no_trace:
+        trace_layers: tuple[int, ...] = ()
+    elif args.trace_layers is not None:
+        trace_layers = args.trace_layers
+    elif input_suite is not None:
+        trace_layers = tuple(input_suite.manifest["trace_layers"])
+    else:
+        trace_layers = tuple(range(start_layer, end_layer))
+    if any(layer >= end_layer for layer in trace_layers) or (
+        args.resume is None and any(layer < start_layer for layer in trace_layers)
+    ):
+        raise ValueError(
+            f"trace layers {trace_layers} fall outside [{start_layer}, {end_layer})"
+        )
+    if input_suite is not None:
+        expected_trace_layers = tuple(input_suite.manifest["trace_layers"])
+        if trace_layers != expected_trace_layers:
+            raise ValueError(
+                f"trace layers {trace_layers} differ from suite "
+                f"{expected_trace_layers}"
+            )
+        if args.no_trace:
+            raise ValueError("teacher-proxy input suites require trace output")
 
     raw_quantization = config.quantization_config
     quantization_config = dependencies["QuantizationConfig"].model_validate(
@@ -1000,8 +1395,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     scheme = schemes[0]
     compressor = dependencies["MXFP4PackedCompressor"]
 
-    prompt_text = None if args.input_ids else args.prompt
-    expert_kind = "hybrid_exl3_mxfp4" if mcg_mult is not None else "mxfp4"
+    prompt_text = (
+        None if args.input_ids or input_suite is not None else args.prompt
+    )
+    if materialized_artifact is not None:
+        expert_kind = "mixed_exl3_tp12_materialized"
+    else:
+        expert_kind = "hybrid_exl3_mxfp4" if mcg_mult is not None else "mxfp4"
     nonexpert_kind = (
         "serialized_mxfp8_or_native"
         if not _same_path(nonexpert_checkpoint, checkpoint)
@@ -1011,8 +1411,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": 1,
         "status": "running",
         "checkpoint": str(checkpoint),
-        "expert_checkpoint": str(expert_checkpoint),
+        "expert_checkpoint": str(expert_source_path),
         "nonexpert_checkpoint": str(nonexpert_checkpoint),
+        "mixed_exl3_artifact": (
+            None
+            if materialized_artifact is None
+            else str(materialized_artifact.root)
+        ),
+        "mixed_exl3_manifest": (
+            None
+            if materialized_artifact is None
+            else str(materialized_artifact.manifest_path)
+        ),
+        "mixed_exl3_codebook": (
+            None if materialized_artifact is None else materialized_artifact.codebook
+        ),
         "exl3_manifest": (
             None if exl3_manifest is None else str(exl3_manifest)
         ),
@@ -1028,9 +1441,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "compressed_tensors MXFP4PackedCompressor"
             ),
             "exl3_reconstruction": (
-                None
-                if mcg_mult is None
-                else "exllamav3 LinearEXL3.get_weight_tensor"
+                "kquant mixed-TP12 unpack plus independent PyTorch "
+                f"{materialized_artifact.codebook}/Hadamard decode"
+                if materialized_artifact is not None
+                else (
+                    None
+                    if mcg_mult is None
+                    else "exllamav3 LinearEXL3.get_weight_tensor"
+                )
             ),
             "mxfp8_reconstruction": (
                 None
@@ -1044,10 +1462,40 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "prompt": prompt_text,
         "input_ids": input_ids.view(-1).tolist(),
-        "decoded_input": tokenizer.decode(input_ids.view(-1).tolist()),
+        "input_ids_shape": list(input_ids.shape),
+        "decoded_input": (
+            tokenizer.decode(input_ids[0].tolist())
+            if input_ids.shape[0] == 1
+            else None
+        ),
+        "decoded_inputs": (
+            None
+            if input_suite is not None
+            else [tokenizer.decode(row.tolist()) for row in input_ids]
+        ),
+        "input_suite": (
+            None
+            if input_suite is None
+            else {
+                "path": str(input_suite.path),
+                "file_sha256": input_suite.file_sha256,
+                "kind": input_suite.manifest["kind"],
+                "schema_version": input_suite.manifest["schema_version"],
+                "suite_token_hash_sha256": input_suite.manifest[
+                    "suite_token_hash_sha256"
+                ],
+                "batch_shape": input_suite.manifest["batch_shape"],
+                "document_hashes": [
+                    document["document_hash"]
+                    for document in input_suite.manifest["documents"]
+                ],
+            }
+        ),
         "start_layer": start_layer,
         "end_layer": end_layer,
+        "trace_layers": list(trace_layers),
         "chunk_size": args.chunk_size,
+        "capture_routed_post_situ": args.capture_routed_post_situ,
         "device": str(device),
         "layers": [],
         "compatibility_fixes": [],
@@ -1058,14 +1506,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not args.no_trace:
         write_trace_manifest(
             trace_root,
-            layers=list(range(start_layer, end_layer)),
+            layers=list(trace_layers),
             max_tokens=int(input_ids.numel()),
-            checkpoint=str(expert_checkpoint),
+            checkpoint=str(expert_source_path),
         )
 
-    positions = torch.arange(
+    cache_position = torch.arange(
         state.hidden_states.shape[1], dtype=torch.long, device=device
-    ).unsqueeze(0)
+    )
+    positions = cache_position.unsqueeze(0).expand(
+        state.hidden_states.shape[0], -1
+    )
     causal_mask = dependencies["create_causal_mask"](
         config=config,
         inputs_embeds=state.hidden_states,
@@ -1076,6 +1527,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     prefetcher = None
     if args.expert_prefetch_trace is not None:
+        if expert_store is None:
+            raise ValueError(
+                "--expert-prefetch-trace is unavailable for materialized TP12 slabs"
+            )
         prefetcher = ExpertRawPrefetcher(
             store=expert_store,
             trace_root=args.expert_prefetch_trace,
@@ -1098,22 +1553,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         staged_experts = None
         if hasattr(layer, "block_sparse_moe"):
-            staged_experts = StagedExperts(
-                store=expert_store,
-                layer_idx=layer_idx,
-                scheme=scheme,
-                compressor=compressor,
-                device=device,
-                mcg_mult=mcg_mult,
-                exllamav3_dir=args.exllamav3_dir,
-                prefetcher=prefetcher,
-            )
+            if materialized_artifact is None:
+                assert expert_store is not None
+                staged_experts = StagedExperts(
+                    store=expert_store,
+                    layer_idx=layer_idx,
+                    scheme=scheme,
+                    compressor=compressor,
+                    device=device,
+                    mcg_mult=mcg_mult,
+                    exllamav3_dir=args.exllamav3_dir,
+                    prefetcher=prefetcher,
+                )
+            else:
+                reader = TP12LayerReader(
+                    materialized_artifact.layer_path(layer_idx)
+                )
+                try:
+                    staged_experts = MaterializedTP12StagedExperts(
+                        reader=reader,
+                        layer_idx=layer_idx,
+                        scheme=scheme,
+                        compressor=compressor,
+                        device=device,
+                        codebook=materialized_artifact.codebook,
+                    )
+                except BaseException:
+                    reader.close()
+                    raise
             staged_experts.install(
                 layer.block_sparse_moe.gate,
                 layer.block_sparse_moe.experts,
             )
 
-        captures = LayerCaptures(layer)
+        should_trace = layer_idx in trace_layers
+        captures = (
+            LayerCaptures(
+                layer,
+                capture_routed_post_situ=args.capture_routed_post_situ,
+            )
+            if should_trace
+            else None
+        )
         layer_input = state.hidden_states
         block_input = state.block_residual
         layer_mask = None if layer.is_linear_attn else causal_mask
@@ -1124,14 +1605,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             past_key_values=None,
             use_cache=False,
             block_residual=block_input,
-            cache_position=positions.view(-1),
+            cache_position=cache_position,
         )
         if not torch.isfinite(layer_output).all():
             raise FloatingPointError(
                 f"layer {layer_idx} produced non-finite hidden states"
             )
 
-        if not args.no_trace:
+        if should_trace:
+            assert captures is not None
             _write_layer_trace(
                 trace_root,
                 layer_idx=layer_idx,
@@ -1147,7 +1629,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if staged_experts is not None
             else ExpertLoadStats()
         )
-        captures.close()
+        if captures is not None:
+            captures.close()
         if staged_experts is not None:
             staged_experts.close()
         state = StreamState(
@@ -1161,6 +1644,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "layer": layer_idx,
             "attention": "kda" if layer.is_linear_attn else "mla",
             "moe": hasattr(layer, "block_sparse_moe"),
+            "traced": should_trace,
             "seconds": time.monotonic() - layer_started,
             "nonexpert_serialized_bytes_read": (
                 nonexpert_stats.serialized_bytes
@@ -1257,12 +1741,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint", type=Path, default=DEFAULT_CHECKPOINT
     )
-    parser.add_argument(
+    expert_group = parser.add_mutually_exclusive_group()
+    expert_group.add_argument(
         "--expert-checkpoint",
         type=Path,
         help=(
             "Optional indexed MXFP4 or hybrid EXL3/MXFP4 expert source; "
             "the official --checkpoint remains the model-code source"
+        ),
+    )
+    expert_group.add_argument(
+        "--mixed-exl3-artifact",
+        type=Path,
+        help=(
+            "Completed fixed-slab mixed-EXL TP12 artifact used as the expert "
+            "source; the official --checkpoint remains the model-code source"
         ),
     )
     parser.add_argument(
@@ -1296,9 +1789,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
         "--input-ids",
         help="comma-separated IDs; overrides --prompt for model input",
+    )
+    input_group.add_argument(
+        "--input-ids-file",
+        type=Path,
+        help=(
+            "validated kquant teacher-proxy suite JSON; provides a rectangular "
+            "batch and overrides --prompt"
+        ),
     )
     parser.add_argument("--add-special-tokens", action="store_true")
     parser.add_argument("--device", default="cuda:0")
@@ -1307,6 +1809,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=4)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--no-trace", action="store_true")
+    parser.add_argument(
+        "--trace-layers",
+        type=parse_layer_list,
+        help="comma-separated decoder layers to trace while executing the full range",
+    )
+    parser.add_argument(
+        "--capture-routed-post-situ",
+        action="store_true",
+        help=(
+            "also trace route-aligned [token, top_k, 3072] expert SiTU "
+            "outputs; opt-in because storage grows with tokens * top_k"
+        ),
+    )
     parser.add_argument("--finalize", action="store_true")
     parser.add_argument("--topk", type=int, default=20)
     parser.add_argument("--lm-head-chunk-rows", type=int, default=8192)
@@ -1317,6 +1832,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("--topk must be positive")
     if args.lm_head_chunk_rows <= 0:
         parser.error("--lm-head-chunk-rows must be positive")
+    if args.no_trace and args.capture_routed_post_situ:
+        parser.error("--capture-routed-post-situ requires trace output")
+    if args.mixed_exl3_artifact is not None and args.exl3_manifest is not None:
+        parser.error("--exl3-manifest does not apply to --mixed-exl3-artifact")
+    if (
+        args.mixed_exl3_artifact is not None
+        and args.expert_prefetch_trace is not None
+    ):
+        parser.error(
+            "--expert-prefetch-trace is unavailable for materialized TP12 slabs"
+        )
     return args
 
 

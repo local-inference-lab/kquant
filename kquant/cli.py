@@ -210,6 +210,35 @@ def cmd_report(args):
     print(f"\nwrote {p}")
 
 
+def cmd_merge_dynstats(args):
+    from kquant.capture import build_hessians, merge_stats
+
+    capture = Path(args.capture)
+    if not args.skip_stats:
+        stats_path = merge_stats(capture, args.stats_out)
+        print(f"wrote {stats_path}")
+    if not args.skip_hessians:
+        layers = _parse_layers(args.layers)
+        # CLI layer numbers are decoder-layer numbers (1..92), while raw
+        # capture rows are zero-based.  This matches every other kquant CLI.
+        layer_rows = None if layers is None else {layer - 1 for layer in layers}
+        if layer_rows is not None and any(row < 0 for row in layer_rows):
+            raise SystemExit("Hessian layers must be decoder layers 1..92")
+        hess_path = build_hessians(
+            capture,
+            args.hess_out,
+            layers=layer_rows,
+            device=_device(args.device),
+            chunk_rows=args.chunk_rows,
+            min_rows=args.min_rows,
+            sample_split=args.hessian_split,
+            request_step_min=args.request_step_min,
+            request_step_max=args.request_step_max,
+            request_steps=_parse_layers(args.request_steps),
+        )
+        print(f"wrote {hess_path}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="kquant")
     ap.add_argument("--out", default="out", help="output directory (default ./out)")
@@ -268,6 +297,43 @@ def main(argv=None):
 
     p = sub.add_parser("report")
     p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser(
+        "merge-dynstats",
+        help="merge a TP-sharded vLLM .kqcapture and build dense Hessians",
+    )
+    p.add_argument("--capture", required=True, help="input .kqcapture directory")
+    p.add_argument("--stats-out", default="out/measured", help="output .kqstats")
+    p.add_argument("--hess-out", default="out/measured", help="output .kqhess")
+    p.add_argument("--skip-stats", action="store_true")
+    p.add_argument("--skip-hessians", action="store_true")
+    p.add_argument("--layers", default=None, help="decoder layers, e.g. 1-8 or 1,5")
+    p.add_argument("--device", default=None)
+    p.add_argument("--chunk-rows", type=int, default=1024)
+    p.add_argument("--min-rows", type=int, default=16384)
+    p.add_argument(
+        "--hessian-split",
+        choices=("train", "validation", "all"),
+        default="train",
+    )
+    p.add_argument(
+        "--request-step-min",
+        type=int,
+        default=0,
+        help="minimum capture request epoch to include (observation ID high word)",
+    )
+    p.add_argument(
+        "--request-step-max",
+        type=int,
+        default=None,
+        help="maximum capture request epoch to include, inclusive",
+    )
+    p.add_argument(
+        "--request-steps",
+        default=None,
+        help="optional exact request epochs/ranges, e.g. 1-3,7,9",
+    )
+    p.set_defaults(fn=cmd_merge_dynstats)
 
     args = ap.parse_args(argv)
     args.fn(args)

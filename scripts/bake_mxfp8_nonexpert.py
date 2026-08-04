@@ -27,9 +27,11 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from kquant.mxfp8 import MXFP8_BLOCK_SIZE, mxfp8_quantize_cpu
+
 SRC = "/models/Kimi-K3-NF3R-Uniform-3p25-serve"
 DEST = "/models/Kimi-K3-mxfp8-nonexpert"
-BLOCK = 32
+BLOCK = MXFP8_BLOCK_SIZE
 
 # Mirrors the serving overlay: linear+shared_experts -> mxfp8, minus ignores.
 TARGET = re.compile(
@@ -54,26 +56,12 @@ def is_target(name: str, shape: tuple) -> bool:
     return len(shape) == 2 and shape[-1] % BLOCK == 0
 
 
-def mxfp8_quantize_cpu(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    x = w.to(torch.float32)
-    out, inp = x.shape
-    xb = x.view(out, inp // BLOCK, BLOCK)
-    amax = xb.abs().amax(dim=-1)
-    # e8m0 scale: smallest power of two with amax/2^e <= 448 (e4m3 max)
-    e = torch.ceil(torch.log2(amax.clamp(min=1e-30) / 448.0))
-    e = e.clamp(min=-127, max=128)
-    scale_u8 = (e + 127.0).to(torch.uint8)
-    q = (xb / torch.exp2(e).unsqueeze(-1)).clamp(-448.0, 448.0)
-    q8 = q.view(out, inp).to(torch.float8_e4m3fn)
-    return q8, scale_u8
-
-
 def process_shard(args: tuple) -> str:
     src_file, dest_dir = args
     out: dict[str, torch.Tensor] = {}
     n_baked = 0
     with safe_open(src_file, framework="pt") as sf:
-        for name in sf.keys():
+        for name in sf.keys():  # noqa: SIM118 - safe_open is not iterable
             t = sf.get_tensor(name)
             if is_target(name, tuple(t.shape)):
                 q8, scale = mxfp8_quantize_cpu(t)

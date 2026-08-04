@@ -136,8 +136,14 @@ def comparison_metrics(
     cosine = torch.nn.functional.cosine_similarity(
         reference.reshape(1, -1), actual.reshape(1, -1)
     )
+    # Transfer the three scalar diagnostics together.  Calling ``float`` on
+    # each CUDA tensor separately introduces three device synchronizations in
+    # hot offline-validation loops while producing the same float32 values.
+    values = torch.stack(
+        (delta.norm() / denominator, delta.abs().max(), cosine.reshape(()))
+    ).cpu()
     return {
-        "relative_l2": float(delta.norm() / denominator),
-        "max_abs": float(delta.abs().max()),
-        "cosine": float(cosine),
+        "relative_l2": float(values[0]),
+        "max_abs": float(values[1]),
+        "cosine": float(values[2]),
     }

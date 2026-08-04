@@ -55,6 +55,19 @@ def test_hybrid_audit_requires_exl3_trellis_evidence() -> None:
     assert audit_kernel_path(log, "hybrid-exl3")["pass"] is True
 
 
+def test_mixed_tp12_audit_requires_materialized_slab_reader() -> None:
+    log = "\n".join(
+        (
+            "quantization=nvfp4_nf3_hybrid",
+            "Loaded mixed_exl3_tp12 layer 1 rank 0: 800 compressed, 96 MXFP4",
+            "target=some.module.W4A16FusedMoeKernel",
+            "repeat implementation=w4a16",
+        )
+    )
+
+    assert audit_kernel_path(log, "mixed-exl3-tp12")["pass"] is True
+
+
 def test_kernel_audit_rejects_unknown_path() -> None:
     with pytest.raises(ValueError, match="unknown kernel path"):
         audit_kernel_path("", "other")

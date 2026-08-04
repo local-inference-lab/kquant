@@ -499,8 +499,8 @@ def _run_exl3_rank(
             torch.cat(
                 (
                     raw["w1"]["svh"][value_slice],
-                    raw["w2"]["suh"][value_slice],
                     raw["w3"]["svh"][value_slice],
+                    raw["w2"]["suh"][value_slice],
                 )
             )
             for raw in raws

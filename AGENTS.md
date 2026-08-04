@@ -42,13 +42,19 @@ headline correctness blocker has been resolved.
   sequential TP simulation, streamed official-PyTorch execution, and
   layer/stage trace comparison.
 
-The core quality work is not finished. The current keep set is selected
-globally using the L0 router-bias traffic proxy, so keep counts can vary
-substantially by layer. EXL3 packing still uses an identity Hessian. The next
-quality iterations should replace the proxy with measured routing statistics,
-then collect/use representative per-layer Hessians and evaluate changes with
-fixed prompts or a proper corpus. Do not regenerate the production artifact
-merely to make per-layer keep counts look uniform.
+The current production artifact still uses the L0 router-bias traffic proxy
+and identity Hessian. The next quality pipeline is now implemented: vLLM and
+B12X can capture exact all-expert routing, conditional activation moments, and
+raw Hessian samples from the resident interim EXL3 model while the official
+checkpoint remains the offline encoder weight source; kquant can merge TP
+shards, build dense per-layer Hessians, quantize all 82,432 experts before
+allocation, and reuse that candidate pool for later keep-set changes. It has
+unit and CUDA graph-replay coverage, but a full 10M-token production capture
+and regenerated quality artifact have not yet been run. A tiny all-rates-one
+TP12 preflight against the interim EXL3 teacher passed all 92 MoE layers with
+exact TP joins, route/mid pairing, and zero dropped rows. Follow
+`docs/exl3-calibration.md`; do not regenerate the production artifact merely
+to make per-layer keep counts look uniform.
 
 ## Repository boundaries and hygiene
 
