@@ -34,6 +34,7 @@ from kquant.x4t import (
 
 X4T_TP12_FORMAT = "kquant-x4t-tp12"
 X4T_TP12_VERSION = 1
+X4T_TP12_SAFE_MARKER = f"{X4T_TP12_FORMAT}-v{X4T_TP12_VERSION}"
 X4T_TP12_MANIFEST = "x4t-tp12-manifest.json"
 X4T_TP12_MANIFEST_KIND = "kquant_kimi_k3_qsrt_x4t_tp12_checkpoint"
 X4T_TP12_MANIFEST_SCHEMA_VERSION = 1
@@ -271,8 +272,8 @@ def validate_x4t_tp12_rank_shard(
     with safe_open(path, framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
         expected_metadata = {
-            "format": X4T_TP12_FORMAT,
-            "version": str(X4T_TP12_VERSION),
+            "format": "pt",
+            "kq": X4T_TP12_SAFE_MARKER,
             "layer": str(layer),
             "rank": str(rank),
         }
@@ -443,8 +444,8 @@ def build_x4t_tp12_layer(
             target.tensors(expert_ids),
             str(partial),
             metadata={
-                "format": X4T_TP12_FORMAT,
-                "version": str(X4T_TP12_VERSION),
+                "format": "pt",
+                "kq": X4T_TP12_SAFE_MARKER,
                 "layer": str(layer),
                 "rank": str(rank),
             },
