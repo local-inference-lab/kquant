@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
+from collections.abc import Mapping
 from typing import Literal, Protocol, Sequence
 
 import torch
@@ -11,13 +13,15 @@ import torch.nn.functional as F
 from kquant.capture import LayerSamples
 from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3
 from kquant.qsrt_candidates import (
+    PERMUTATION_POLICIES,
+    PermutationPolicy,
     RatePairSelection,
     RequestPartition,
     RoutedRows,
-    activation_block_contexts,
     build_expert_hessians,
     deterministic_expert_seed,
     functional_sse_by_request,
+    permutation_policy_contexts,
     select_expert_rows,
     select_phase1_rate_pair,
 )
@@ -26,12 +30,15 @@ from kquant.qsrt import (
     ExpertFormatSpec,
     PHASE1_MODE_IDS,
     RATE_TRANSFER_MODES,
+    RECORDS_PER_EXPERT,
 )
 from kquant.pack.qsrt_encoder import (
     Layout,
     MATRICES,
     QSRTExpertEncoding,
+    QSRTMatrixCandidate,
     QSRTMatrixEncoding,
+    QSRTTransformSeeds,
     SearchLayout,
     finalize_qsrt_matrix_candidate,
     quantize_qsrt_matrix_candidates_batched,
@@ -41,10 +48,11 @@ from kquant.tp_simulator import situ
 
 
 CANDIDATE_POOL_KIND = "kquant_kimi_k3_qsrt_candidate_pool"
-CANDIDATE_POOL_SCHEMA_VERSION = 5
+CANDIDATE_POOL_SCHEMA_VERSION = 6
 OFFICIAL_SOURCE_DAMAGE_METRIC = "official_source_excess_sse"
 HessianPolicy = Literal["captured_blend", "identity"]
 HESSIAN_POLICIES: tuple[HessianPolicy, ...] = ("captured_blend", "identity")
+FOLDED_SCALE_GRID: tuple[float, ...] = (0.85, 0.925, 1.0, 1.075, 1.15)
 
 
 class MatrixStore(Protocol):
@@ -69,7 +77,7 @@ class QSRTCandidateEncoding:
     block_contexts: torch.Tensor
     block_scores: torch.Tensor
     context_basis: str
-    covariance: dict[str, float | str | int]
+    covariance: dict[str, object]
     evaluated_modes: tuple[int, ...]
     evaluated_formats: tuple[tuple[int, int], ...]
     fit_sse: dict[tuple[int, int], torch.Tensor]
@@ -97,6 +105,47 @@ def _source_middle(
     gate_projection: torch.Tensor, up_projection: torch.Tensor
 ) -> torch.Tensor:
     return situ(gate_projection, up_projection)
+
+
+def _folded_intermediate_conditioning(
+    block_scores: torch.Tensor,
+    block_contexts: torch.Tensor,
+    *,
+    power: float,
+) -> torch.Tensor | None:
+    """Derive a metadata-free per-record output conditioning profile.
+
+    The source rows are divided by this profile before w1/w3 quantization and
+    the exact inverse is folded into their existing expert-local ``svh``
+    vectors.  Factors are constant over each final 128-channel Hadamard block,
+    so the fold commutes with the transform and requires no new runtime tensor.
+    """
+
+    if not math.isfinite(power):
+        raise ValueError("folded scale power must be finite")
+    if power == 0.0:
+        return None
+    if block_scores.ndim != 1 or block_scores.numel() != 3072 // 4:
+        raise ValueError("folded conditioning requires 768 group scores")
+    if not bool(torch.all(torch.isfinite(block_scores))) or bool(
+        torch.any(block_scores < 0)
+    ):
+        raise ValueError("folded conditioning scores must be finite and nonnegative")
+    contexts = block_contexts.to(device=block_scores.device, dtype=torch.long)
+    group_energy = block_scores.float()
+    record_energy = torch.zeros(
+        RECORDS_PER_EXPERT, device=block_scores.device, dtype=torch.float32
+    ).scatter_add_(0, contexts, group_energy.float())
+    counts = torch.bincount(contexts, minlength=RECORDS_PER_EXPERT).float()
+    record_rms = (record_energy / counts).clamp_min(1e-30).sqrt()
+    geometric_mean = record_rms.log().mean().exp()
+    # A smaller folded scale magnifies important rows inside the trellis
+    # search and shrinks their absolute error again when folded back into svh.
+    # This is an output-metric conditioning heuristic, not a new runtime scale.
+    desired = (record_rms / geometric_mean).pow(-power)
+    grid = torch.tensor(FOLDED_SCALE_GRID, device=desired.device)
+    selected = grid[(desired[:, None] - grid[None, :]).abs().argmin(dim=1)]
+    return selected.index_select(0, contexts).repeat_interleave(4).contiguous()
 
 
 def _load_source_matrix(
@@ -281,6 +330,188 @@ def _candidate_mode_evidence(encodings: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _candidate_middle_by_r13(
+    inputs: torch.Tensor,
+    upstream: dict[str, dict[int, QSRTMatrixCandidate]],
+    evaluated_modes: Sequence[int],
+) -> dict[int, torch.Tensor]:
+    """Replay exact candidate reconstructions through Kimi's SiTU."""
+
+    return {
+        int(r13): _source_middle(
+            F.linear(inputs, upstream["w1"][int(r13)].reconstruction),
+            F.linear(inputs, upstream["w3"][int(r13)].reconstruction),
+        )
+        for r13 in evaluated_modes
+    }
+
+
+def _conditional_h2_by_r13(
+    inputs: torch.Tensor,
+    gates: torch.Tensor,
+    fit_mask_device: torch.Tensor,
+    middle_by_r13: dict[int, torch.Tensor],
+    *,
+    global_h13: torch.Tensor,
+    global_h2: torch.Tensor,
+    device: torch.device,
+    hessian_policy: HessianPolicy,
+    have_local_support: bool,
+) -> tuple[dict[int, torch.Tensor], dict[str, object]]:
+    """Build one support-aware down-projection covariance per upstream mode."""
+
+    h2_by_r13: dict[int, torch.Tensor] = {}
+    evidence_by_r13: dict[str, object] = {}
+    identity_h2 = torch.eye(
+        global_h2.shape[0], dtype=torch.float32, device=device
+    )
+    for r13, middle in middle_by_r13.items():
+        if hessian_policy == "identity" or not have_local_support:
+            h2_by_r13[r13] = identity_h2
+            evidence_by_r13[f"R{r13}"] = {
+                "h2_shrinkage_policy": "identity_fallback",
+                "h2_local_alpha": 0.0,
+                "h2_effective_sample_size": 0.0,
+                "h2_identity_scale": 1.0,
+            }
+            continue
+        _, h2, evidence = build_expert_hessians(
+            inputs[fit_mask_device],
+            gates[fit_mask_device],
+            middle[fit_mask_device],
+            global_h13=global_h13,
+            global_h2=global_h2,
+            device=device,
+        )
+        h2_by_r13[r13] = h2
+        evidence_by_r13[f"R{r13}"] = evidence
+    return h2_by_r13, evidence_by_r13
+
+
+def _quantize_conditional_down_grid(
+    source_w2_by_expert: Sequence[torch.Tensor],
+    block_contexts_by_expert: Sequence[torch.Tensor],
+    mode_specs_by_expert: Sequence[tuple[object, ...]],
+    h2_by_r13_by_expert: Sequence[dict[int, torch.Tensor]],
+    *,
+    layer: int,
+    device: torch.device,
+    shared_scale_scope: object,
+    quantizer_module: object | None,
+    codebook: str,
+    layout: SearchLayout,
+    ldlq_tf32: bool,
+    tailbite_context: int,
+    transform_seeds_by_expert: Sequence[
+        Mapping[str, QSRTTransformSeeds]
+    ] | None = None,
+) -> list[dict[int, dict[int, QSRTMatrixCandidate]]]:
+    """Encode the exhaustive ``w2[r13, r2]`` grid in flattened GPU batches."""
+
+    count = len(source_w2_by_expert)
+    if not (
+        count
+        == len(block_contexts_by_expert)
+        == len(mode_specs_by_expert)
+        == len(h2_by_r13_by_expert)
+    ):
+        raise ValueError("conditional down-grid inputs have inconsistent lengths")
+    if transform_seeds_by_expert is None:
+        transform_seeds_by_expert = [{} for _ in range(count)]
+    elif len(transform_seeds_by_expert) != count:
+        raise ValueError("conditional down-grid transform seeds have the wrong length")
+
+    flat_keys: list[tuple[int, int]] = []
+    flat_sources: list[dict[str, torch.Tensor]] = []
+    flat_contexts: list[torch.Tensor] = []
+    flat_modes: list[tuple[object, ...]] = []
+    flat_hessians: list[dict[str, torch.Tensor]] = []
+    flat_transform_seeds: list[Mapping[str, QSRTTransformSeeds]] = []
+    for expert_index, (source, contexts, modes, h2_by_r13) in enumerate(
+        zip(
+            source_w2_by_expert,
+            block_contexts_by_expert,
+            mode_specs_by_expert,
+            h2_by_r13_by_expert,
+        )
+    ):
+        mode_ids = tuple(int(mode.mode_id) for mode in modes)
+        h2_bases = tuple(h2_by_r13)
+        if h2_bases != mode_ids:
+            raise ValueError("conditional H2 modes differ from upstream modes")
+        for r13 in h2_bases:
+            flat_keys.append((expert_index, r13))
+            flat_sources.append({"w2": source})
+            flat_contexts.append(contexts)
+            flat_modes.append(modes)
+            flat_hessians.append({"w2": h2_by_r13[r13]})
+            flat_transform_seeds.append(transform_seeds_by_expert[expert_index])
+
+    guarded_reuse = layout == "qsrt_guarded_reuse"
+    if guarded_reuse:
+        flat_candidates = quantize_qsrt_matrix_expert_batch(
+            flat_sources,
+            flat_contexts,
+            modes_by_expert=[(modes[0],) for modes in flat_modes],
+            hessians_by_expert=flat_hessians,
+            layer=layer,
+            device=device,
+            shared_scale_scope=shared_scale_scope,
+            quantizer_module=quantizer_module,
+            codebook=codebook,
+            layout="importance_ordered",
+            ldlq_tf32=ldlq_tf32,
+            tailbite_context=tailbite_context,
+            transform_seeds_by_expert=flat_transform_seeds,
+        )
+        shifted_indices = [
+            index for index, modes in enumerate(flat_modes) if len(modes) > 1
+        ]
+        if shifted_indices:
+            shifted = quantize_qsrt_matrix_expert_batch(
+                [flat_sources[index] for index in shifted_indices],
+                [flat_contexts[index] for index in shifted_indices],
+                modes_by_expert=[flat_modes[index][1:] for index in shifted_indices],
+                hessians_by_expert=[flat_hessians[index] for index in shifted_indices],
+                layer=layer,
+                device=device,
+                shared_scale_scope=shared_scale_scope,
+                quantizer_module=quantizer_module,
+                codebook=codebook,
+                layout="qsrt_pair_prefix_reuse",
+                ldlq_tf32=ldlq_tf32,
+                tailbite_context=tailbite_context,
+                transform_seeds_by_expert=[
+                    flat_transform_seeds[index] for index in shifted_indices
+                ],
+            )
+            for index, extra in zip(shifted_indices, shifted):
+                flat_candidates[index]["w2"].update(extra["w2"])
+    else:
+        flat_candidates = quantize_qsrt_matrix_expert_batch(
+            flat_sources,
+            flat_contexts,
+            modes_by_expert=flat_modes,
+            hessians_by_expert=flat_hessians,
+            layer=layer,
+            device=device,
+            shared_scale_scope=shared_scale_scope,
+            quantizer_module=quantizer_module,
+            codebook=codebook,
+            layout=layout,
+            ldlq_tf32=ldlq_tf32,
+            tailbite_context=tailbite_context,
+            transform_seeds_by_expert=flat_transform_seeds,
+        )
+
+    result: list[dict[int, dict[int, QSRTMatrixCandidate]]] = [
+        {} for _ in range(count)
+    ]
+    for (expert_index, r13), candidates in zip(flat_keys, flat_candidates):
+        result[expert_index][r13] = candidates["w2"]
+    return result
+
+
 def encode_phase1_expert(
     store: MatrixStore,
     samples: LayerSamples,
@@ -306,6 +537,9 @@ def encode_phase1_expert(
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
     hessian_policy: HessianPolicy = "captured_blend",
+    permutation_policy: PermutationPolicy = "h2_reverse",
+    folded_scale_power: float = 0.0,
+    transform_seeds: Mapping[str, QSRTTransformSeeds] | None = None,
 ) -> QSRTCandidateEncoding:
     """Encode and conservatively select one official-source expert.
 
@@ -325,6 +559,8 @@ def encode_phase1_expert(
         raise ValueError("mode_ids contain an unsupported transfer count")
     if hessian_policy not in HESSIAN_POLICIES:
         raise ValueError(f"unsupported Hessian policy: {hessian_policy}")
+    if permutation_policy not in PERMUTATION_POLICIES:
+        raise ValueError(f"unsupported permutation policy: {permutation_policy}")
 
     all_rows = select_expert_rows(samples, expert, partition.all)
     fit_mask = _split_rows(all_rows, partition.fit)
@@ -349,56 +585,38 @@ def encode_phase1_expert(
         )
 
     have_local_support = fit_documents >= min_fit_documents
+    fit_mask_device = fit_mask.to(device=device)
     if have_local_support:
-        block_contexts, block_scores = activation_block_contexts(
-            source_middle[fit_mask.to(device=device)],
-            gates[fit_mask.to(device=device)],
+        block_contexts, block_scores = permutation_policy_contexts(
+            source_middle[fit_mask_device],
+            gates[fit_mask_device],
+            policy=permutation_policy,
         )
-        if hessian_policy == "identity":
-            h13, h2 = global_h13, global_h2
-            covariance = {
-                "gate_square_sum": float(
-                    gates[fit_mask.to(device=device)].square().double().sum()
-                ),
-                "h13_local_alpha": 0.0,
-                "h2_local_alpha": 0.0,
-            }
-        else:
-            h13, h2, covariance = build_expert_hessians(
-                inputs[fit_mask.to(device=device)],
-                gates[fit_mask.to(device=device)],
-                source_middle[fit_mask.to(device=device)],
-                global_h13=global_h13,
-                global_h2=global_h2,
-                device=device,
-            )
-        context_basis = "official_source_post_situ_fit_documents"
+        h13 = global_h13
+        covariance: dict[str, object] = {
+            "gate_square_sum": float(
+                gates[fit_mask_device].square().double().sum()
+            ),
+            "h13_local_alpha": 0.0,
+        }
+        context_basis = (
+            f"official_source_post_situ_fit_documents:{permutation_policy}"
+        )
         covariance = {
             **covariance,
-            "basis": (
-                "identity"
-                if hessian_policy == "identity"
-                else "expert_local_fixed_shrinkage"
-            ),
             "fit_rows": int(fit_mask.sum()),
             "fit_documents": fit_documents,
         }
     else:
         block_contexts = fallback_block_contexts.clone()
         block_scores = fallback_block_scores.clone()
-        h13, h2 = global_h13, global_h2
-        context_basis = "layer_global_interim_post_situ_fit_documents"
+        h13 = global_h13
+        context_basis = "fallback_context_order_no_local_support"
         covariance = {
-            "basis": (
-                "identity"
-                if hessian_policy == "identity"
-                else "layer_global_support_fallback"
-            ),
             "fit_rows": int(fit_mask.sum()),
             "fit_documents": fit_documents,
-            "gate_square_sum": float(gates[fit_mask.to(device=device)].square().sum()),
+            "gate_square_sum": float(gates[fit_mask_device].square().sum()),
             "h13_local_alpha": 0.0,
-            "h2_local_alpha": 0.0,
         }
 
     can_confirm = confirmation_documents >= min_confirmation_documents
@@ -407,6 +625,16 @@ def encode_phase1_expert(
         (r13, r2) for r13 in evaluated_modes for r2 in evaluated_modes
     )
     block_contexts_device = block_contexts.to(device=device, dtype=torch.long)
+    intermediate_conditioning = _folded_intermediate_conditioning(
+        block_scores.to(device=device),
+        block_contexts_device,
+        power=folded_scale_power,
+    )
+    if intermediate_conditioning is not None:
+        covariance["folded_scale_power"] = float(folded_scale_power)
+        covariance["folded_scale_min"] = float(intermediate_conditioning.min())
+        covariance["folded_scale_max"] = float(intermediate_conditioning.max())
+        context_basis += "+folded_128_channel_conditioning"
 
     mode_specs = tuple(RATE_TRANSFER_MODES[mode] for mode in evaluated_modes)
     guarded_reuse = layout == "qsrt_guarded_reuse"
@@ -426,8 +654,40 @@ def encode_phase1_expert(
         layout=upstream_layout,
         ldlq_tf32=ldlq_tf32,
         tailbite_context=tailbite_context,
+        transform_seeds=transform_seeds,
+        intermediate_conditioning=intermediate_conditioning,
     )
     del source_w1, source_w3
+
+    middle_by_r13 = _candidate_middle_by_r13(
+        inputs, upstream_candidates, evaluated_modes
+    )
+    h2_by_r13, h2_evidence = _conditional_h2_by_r13(
+        inputs,
+        gates,
+        fit_mask_device,
+        middle_by_r13,
+        global_h13=global_h13,
+        global_h2=global_h2,
+        device=device,
+        hessian_policy=hessian_policy,
+        have_local_support=have_local_support,
+    )
+    covariance.update(
+        {
+            "basis": (
+                "identity"
+                if hessian_policy == "identity"
+                else (
+                    "decoded_candidate_post_situ_adaptive_shrinkage"
+                    if have_local_support
+                    else "identity_support_fallback"
+                )
+            ),
+            "h2_by_r13": h2_evidence,
+        }
+    )
+    context_basis += "+decoded_candidate_post_situ_h2"
 
     source_w2 = _load_source_matrix(store, layer, expert, "w2", device)
     if all_rows.rows:
@@ -436,72 +696,29 @@ def encode_phase1_expert(
         reference_output = torch.empty(
             (0, global_h13.shape[0]), dtype=torch.float32, device=device
         )
-    if guarded_reuse and len(mode_specs) > 1:
-        # Preserve the exact established R0 traversal.  Only the shifted w2
-        # candidates use the reordered traversal needed for prefix/trie reuse;
-        # all reconstructions are restored to canonical coordinates before the
-        # common functional selector compares them.
-        down_candidates = quantize_qsrt_matrix_candidates_batched(
-            {"w2": source_w2},
-            block_contexts_device,
-            modes=(mode_specs[0],),
-            hessians={"w2": h2},
-            layer=layer,
-            device=device,
-            shared_scale_scope=shared_scale_scope,
-            quantizer_module=quantizer_module,
-            codebook=codebook,
-            layout="importance_ordered",
-            ldlq_tf32=ldlq_tf32,
-            tailbite_context=tailbite_context,
-        )
-        shifted = quantize_qsrt_matrix_candidates_batched(
-            {"w2": source_w2},
-            block_contexts_device,
-            modes=mode_specs[1:],
-            hessians={"w2": h2},
-            layer=layer,
-            device=device,
-            shared_scale_scope=shared_scale_scope,
-            quantizer_module=quantizer_module,
-            codebook=codebook,
-            layout="qsrt_pair_prefix_reuse",
-            ldlq_tf32=ldlq_tf32,
-            tailbite_context=tailbite_context,
-        )
-        down_candidates["w2"].update(shifted["w2"])
-    else:
-        down_candidates = quantize_qsrt_matrix_candidates_batched(
-            {"w2": source_w2},
-            block_contexts_device,
-            modes=mode_specs,
-            hessians={"w2": h2},
-            layer=layer,
-            device=device,
-            shared_scale_scope=shared_scale_scope,
-            quantizer_module=quantizer_module,
-            codebook=codebook,
-            layout="importance_ordered" if guarded_reuse else layout,
-            ldlq_tf32=ldlq_tf32,
-            tailbite_context=tailbite_context,
-        )
-    del source_w2
-
+    down_candidates = _quantize_conditional_down_grid(
+        [source_w2],
+        [block_contexts_device],
+        [mode_specs],
+        [h2_by_r13],
+        layer=layer,
+        device=device,
+        shared_scale_scope=shared_scale_scope,
+        quantizer_module=quantizer_module,
+        codebook=codebook,
+        layout=layout,
+        ldlq_tf32=ldlq_tf32,
+        tailbite_context=tailbite_context,
+        transform_seeds_by_expert=[transform_seeds or {}],
+    )[0]
     fit_sse: dict[tuple[int, int], torch.Tensor] = {}
     confirmation_sse: dict[tuple[int, int], torch.Tensor] = {}
     fit_reference = fit_counts = confirmation_reference = confirmation_counts = None
     mode_coding: dict[tuple[int, int], dict[str, object]] = {}
-    middle_by_r13 = {
-        r13: _source_middle(
-            F.linear(inputs, upstream_candidates["w1"][r13].reconstruction),
-            F.linear(inputs, upstream_candidates["w3"][r13].reconstruction),
-        )
-        for r13 in evaluated_modes
-    }
     for rate_pair in evaluated_formats:
         r13, r2 = rate_pair
         candidate_output = F.linear(
-            middle_by_r13[r13], down_candidates["w2"][r2].reconstruction
+            middle_by_r13[r13], down_candidates[r13][r2].reconstruction
         )
         fit_metric = (
             functional_sse_by_request(
@@ -544,10 +761,12 @@ def encode_phase1_expert(
             {
                 "w1": upstream_candidates["w1"][r13],
                 "w3": upstream_candidates["w3"][r13],
-                "w2": down_candidates["w2"][r2],
+                "w2": down_candidates[r13][r2],
             }
         )
         del candidate_output
+
+    del source_w2
 
     assert fit_reference is not None and fit_counts is not None
     assert confirmation_reference is not None and confirmation_counts is not None
@@ -567,7 +786,7 @@ def encode_phase1_expert(
     selected_candidates = {
         "w1": upstream_candidates["w1"][selected_r13],
         "w3": upstream_candidates["w3"][selected_r13],
-        "w2": down_candidates["w2"][selected_r2],
+        "w2": down_candidates[selected_r13][selected_r2],
     }
     selected_encodings = {
         matrix: finalize_qsrt_matrix_candidate(
@@ -645,6 +864,11 @@ def encode_phase1_expert_batch(
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
     hessian_policy: HessianPolicy = "captured_blend",
+    permutation_policy: PermutationPolicy = "h2_reverse",
+    folded_scale_power: float = 0.0,
+    transform_seeds_by_expert: Mapping[
+        int, Mapping[str, QSRTTransformSeeds]
+    ] | None = None,
 ) -> list[QSRTCandidateEncoding]:
     """Encode several experts while batching their independent trellis work.
 
@@ -669,12 +893,18 @@ def encode_phase1_expert_batch(
         raise ValueError("mode_ids contain an unsupported transfer count")
     if hessian_policy not in HESSIAN_POLICIES:
         raise ValueError(f"unsupported Hessian policy: {hessian_policy}")
+    if permutation_policy not in PERMUTATION_POLICIES:
+        raise ValueError(f"unsupported permutation policy: {permutation_policy}")
 
     prepared: list[dict[str, object]] = []
     upstream_sources: list[dict[str, torch.Tensor]] = []
     upstream_contexts: list[torch.Tensor] = []
     upstream_modes: list[tuple[object, ...]] = []
     upstream_hessians: list[dict[str, torch.Tensor]] = []
+    upstream_conditioning: list[torch.Tensor | None] = []
+    seed_maps = [
+        (transform_seeds_by_expert or {}).get(expert, {}) for expert in expert_ids
+    ]
 
     for expert in expert_ids:
         all_rows = select_expert_rows(samples, expert, partition.all)
@@ -700,65 +930,63 @@ def encode_phase1_expert_batch(
             )
 
         have_local_support = fit_documents >= min_fit_documents
-        if have_local_support:
-            fit_mask_device = fit_mask.to(device=device)
-            block_contexts, block_scores = activation_block_contexts(
+        fit_mask_device = fit_mask.to(device=device)
+        if bool(fit_mask.any()):
+            block_contexts, block_scores = permutation_policy_contexts(
                 source_middle[fit_mask_device],
                 gates[fit_mask_device],
+                policy=permutation_policy,
             )
-            if hessian_policy == "identity":
-                h13, h2 = global_h13, global_h2
-                covariance = {
-                    "gate_square_sum": float(
-                        gates[fit_mask_device].square().double().sum()
-                    ),
-                    "h13_local_alpha": 0.0,
-                    "h2_local_alpha": 0.0,
-                }
-            else:
-                h13, h2, covariance = build_expert_hessians(
-                    inputs[fit_mask_device],
-                    gates[fit_mask_device],
-                    source_middle[fit_mask_device],
-                    global_h13=global_h13,
-                    global_h2=global_h2,
-                    device=device,
-                )
-            context_basis = "official_source_post_situ_fit_documents"
+            context_basis = (
+                f"official_source_post_situ_fit_documents:{permutation_policy}"
+            )
+        else:
+            block_contexts = fallback_block_contexts.clone()
+            block_scores = fallback_block_scores.clone()
+            context_basis = "identity_logical_order_no_routed_fit_rows"
+
+        if have_local_support:
+            h13 = global_h13
+            covariance: dict[str, object] = {
+                "gate_square_sum": float(
+                    gates[fit_mask_device].square().double().sum()
+                ),
+                "h13_local_alpha": 0.0,
+            }
             covariance = {
                 **covariance,
-                "basis": (
-                    "identity"
-                    if hessian_policy == "identity"
-                    else "expert_local_fixed_shrinkage"
-                ),
                 "fit_rows": int(fit_mask.sum()),
                 "fit_documents": fit_documents,
             }
         else:
-            block_contexts = fallback_block_contexts.clone()
-            block_scores = fallback_block_scores.clone()
-            h13, h2 = global_h13, global_h2
-            context_basis = "layer_global_interim_post_situ_fit_documents"
+            h13 = global_h13
             covariance = {
-                "basis": (
-                    "identity"
-                    if hessian_policy == "identity"
-                    else "layer_global_support_fallback"
-                ),
                 "fit_rows": int(fit_mask.sum()),
                 "fit_documents": fit_documents,
                 "gate_square_sum": float(
                     gates[fit_mask.to(device=device)].square().sum()
                 ),
                 "h13_local_alpha": 0.0,
-                "h2_local_alpha": 0.0,
             }
 
         can_confirm = confirmation_documents >= min_confirmation_documents
         evaluated_modes = modes if have_local_support and can_confirm else (0,)
         mode_specs = tuple(RATE_TRANSFER_MODES[mode] for mode in evaluated_modes)
         contexts_device = block_contexts.to(device=device, dtype=torch.long)
+        intermediate_conditioning = _folded_intermediate_conditioning(
+            block_scores.to(device=device),
+            contexts_device,
+            power=folded_scale_power,
+        )
+        if intermediate_conditioning is not None:
+            covariance["folded_scale_power"] = float(folded_scale_power)
+            covariance["folded_scale_min"] = float(
+                intermediate_conditioning.min()
+            )
+            covariance["folded_scale_max"] = float(
+                intermediate_conditioning.max()
+            )
+            context_basis += "+folded_128_channel_conditioning"
         prepared.append(
             {
                 "expert": expert,
@@ -778,13 +1006,13 @@ def encode_phase1_expert_batch(
                     for r13 in evaluated_modes
                     for r2 in evaluated_modes
                 ),
-                "h2": h2,
             }
         )
         upstream_sources.append({"w1": source_w1, "w3": source_w3})
         upstream_contexts.append(contexts_device)
         upstream_modes.append(mode_specs)
         upstream_hessians.append({"w1": h13, "w3": h13})
+        upstream_conditioning.append(intermediate_conditioning)
 
     guarded_reuse = layout == "qsrt_guarded_reuse"
     if guarded_reuse and any(mode > 2 for mode in modes):
@@ -803,16 +1031,60 @@ def encode_phase1_expert_batch(
         layout=upstream_layout,
         ldlq_tf32=ldlq_tf32,
         tailbite_context=tailbite_context,
+        transform_seeds_by_expert=seed_maps,
+        intermediate_conditioning_by_expert=upstream_conditioning,
     )
     del upstream_sources, upstream_hessians
 
-    down_sources: list[dict[str, torch.Tensor]] = []
-    down_hessians: list[dict[str, torch.Tensor]] = []
-    for item in prepared:
+    down_sources: list[torch.Tensor] = []
+    conditional_h2s: list[dict[int, torch.Tensor]] = []
+    for item, upstream in zip(prepared, upstream_candidates):
         expert = int(item["expert"])
         source_w2 = _load_source_matrix(store, layer, expert, "w2", device)
         source_middle = item["source_middle"]
+        inputs = item["inputs"]
+        gates = item["gates"]
+        fit_mask = item["fit_mask"]
+        evaluated_modes = item["evaluated_modes"]
         assert isinstance(source_middle, torch.Tensor)
+        assert isinstance(inputs, torch.Tensor)
+        assert isinstance(gates, torch.Tensor)
+        assert isinstance(fit_mask, torch.Tensor)
+        middle_by_r13 = _candidate_middle_by_r13(
+            inputs, upstream, evaluated_modes
+        )
+        h2_by_r13, h2_evidence = _conditional_h2_by_r13(
+            inputs,
+            gates,
+            fit_mask.to(device=device),
+            middle_by_r13,
+            global_h13=global_h13,
+            global_h2=global_h2,
+            device=device,
+            hessian_policy=hessian_policy,
+            have_local_support=(
+                int(item["covariance"]["fit_documents"]) >= min_fit_documents
+            ),
+        )
+        item["middle_by_r13"] = middle_by_r13
+        item["covariance"].update(
+            {
+                "basis": (
+                    "identity"
+                    if hessian_policy == "identity"
+                    else (
+                        "decoded_candidate_post_situ_adaptive_shrinkage"
+                        if int(item["covariance"]["fit_documents"])
+                        >= min_fit_documents
+                        else "identity_support_fallback"
+                    )
+                ),
+                "h2_by_r13": h2_evidence,
+            }
+        )
+        item["context_basis"] = (
+            str(item["context_basis"]) + "+decoded_candidate_post_situ_h2"
+        )
         all_rows = item["all_rows"]
         if all_rows.rows:
             reference_output = F.linear(source_middle, source_w2)
@@ -821,66 +1093,25 @@ def encode_phase1_expert_batch(
                 (0, global_h13.shape[0]), dtype=torch.float32, device=device
             )
         item["reference_output"] = reference_output
-        down_sources.append({"w2": source_w2})
-        down_hessians.append({"w2": item["h2"]})
+        down_sources.append(source_w2)
+        conditional_h2s.append(h2_by_r13)
 
-    if guarded_reuse:
-        r0_modes = [(mode_specs[0],) for mode_specs in upstream_modes]
-        down_candidates = quantize_qsrt_matrix_expert_batch(
-            down_sources,
-            upstream_contexts,
-            modes_by_expert=r0_modes,
-            hessians_by_expert=down_hessians,
-            layer=layer,
-            device=device,
-            shared_scale_scope=shared_scale_scope,
-            quantizer_module=quantizer_module,
-            codebook=codebook,
-            layout="importance_ordered",
-            ldlq_tf32=ldlq_tf32,
-            tailbite_context=tailbite_context,
-        )
-        shifted_indices = [
-            index for index, mode_specs in enumerate(upstream_modes)
-            if len(mode_specs) > 1
-        ]
-        if shifted_indices:
-            shifted_candidates = quantize_qsrt_matrix_expert_batch(
-                [down_sources[index] for index in shifted_indices],
-                [upstream_contexts[index] for index in shifted_indices],
-                modes_by_expert=[
-                    upstream_modes[index][1:] for index in shifted_indices
-                ],
-                hessians_by_expert=[
-                    down_hessians[index] for index in shifted_indices
-                ],
-                layer=layer,
-                device=device,
-                shared_scale_scope=shared_scale_scope,
-                quantizer_module=quantizer_module,
-                codebook=codebook,
-                layout="qsrt_pair_prefix_reuse",
-                ldlq_tf32=ldlq_tf32,
-                tailbite_context=tailbite_context,
-            )
-            for index, shifted in zip(shifted_indices, shifted_candidates):
-                down_candidates[index]["w2"].update(shifted["w2"])
-    else:
-        down_candidates = quantize_qsrt_matrix_expert_batch(
-            down_sources,
-            upstream_contexts,
-            modes_by_expert=upstream_modes,
-            hessians_by_expert=down_hessians,
-            layer=layer,
-            device=device,
-            shared_scale_scope=shared_scale_scope,
-            quantizer_module=quantizer_module,
-            codebook=codebook,
-            layout=layout,
-            ldlq_tf32=ldlq_tf32,
-            tailbite_context=tailbite_context,
-        )
-    del down_sources, down_hessians
+    down_candidates = _quantize_conditional_down_grid(
+        down_sources,
+        upstream_contexts,
+        upstream_modes,
+        conditional_h2s,
+        layer=layer,
+        device=device,
+        shared_scale_scope=shared_scale_scope,
+        quantizer_module=quantizer_module,
+        codebook=codebook,
+        layout=layout,
+        ldlq_tf32=ldlq_tf32,
+        tailbite_context=tailbite_context,
+        transform_seeds_by_expert=seed_maps,
+    )
+    del down_sources, conditional_h2s
 
     results: list[QSRTCandidateEncoding] = []
     for item, upstream, down in zip(
@@ -921,17 +1152,11 @@ def encode_phase1_expert_batch(
         deferred_confirmation_sse: list[torch.Tensor] = []
         format_order: list[tuple[int, int]] = []
         mode_coding: dict[tuple[int, int], dict[str, object]] = {}
-        middle_by_r13 = {
-            r13: _source_middle(
-                F.linear(inputs, upstream["w1"][r13].reconstruction),
-                F.linear(inputs, upstream["w3"][r13].reconstruction),
-            )
-            for r13 in evaluated_modes
-        }
+        middle_by_r13 = item["middle_by_r13"]
         for rate_pair in evaluated_formats:
             r13, r2 = rate_pair
             candidate_output = F.linear(
-                middle_by_r13[r13], down["w2"][r2].reconstruction
+                middle_by_r13[r13], down[r13][r2].reconstruction
             )
             deferred_fit_sse.append(
                 _defer_functional_row_sse(fit_plan, candidate_output)
@@ -944,7 +1169,7 @@ def encode_phase1_expert_batch(
                 {
                     "w1": upstream["w1"][r13],
                     "w3": upstream["w3"][r13],
-                    "w2": down["w2"][r2],
+                    "w2": down[r13][r2],
                 }
             )
             del candidate_output
@@ -975,7 +1200,7 @@ def encode_phase1_expert_batch(
         selected_candidates = {
             "w1": upstream["w1"][selected_r13],
             "w3": upstream["w3"][selected_r13],
-            "w2": down["w2"][selected_r2],
+            "w2": down[selected_r13][selected_r2],
         }
         selected_encodings = {
             matrix: finalize_qsrt_matrix_candidate(

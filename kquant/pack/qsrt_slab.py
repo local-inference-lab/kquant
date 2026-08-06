@@ -56,6 +56,16 @@ QSRT_LAYER_PREFIX = "qsrt-tp12-layer-"
 MXFP4_MATRIX_COMPONENT_ORDER = ("weight_packed", "weight_scale")
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist an atomic layer rename before publishing its closure receipt."""
+
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 @dataclass(frozen=True)
 class LayerMaterializationSpec:
     """Validated, canonical materialization decision for one decoder layer."""

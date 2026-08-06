@@ -11,15 +11,17 @@
 #include "exl3_compat/util.cuh"
 #include "exl3_compat/quant/codebook.cuh"
 
-#define QUANTIZE_TILES_NUM_THREADS 512
 #define QUANTIZE_TILES_K2_NUM_THREADS 1024
+#define QUANTIZE_TILES_K3_NUM_THREADS 768
+#define QUANTIZE_TILES_K4_NUM_THREADS 512
 #ifndef H_INF
 #define H_INF __ushort_as_half(0x7c00)
 #endif
 
 template <int K, int cb>
 __global__ __launch_bounds__(
-    K == 2 ? QUANTIZE_TILES_K2_NUM_THREADS : QUANTIZE_TILES_NUM_THREADS,
+    K == 2 ? QUANTIZE_TILES_K2_NUM_THREADS :
+        (K == 3 ? QUANTIZE_TILES_K3_NUM_THREADS : QUANTIZE_TILES_K4_NUM_THREADS),
     K == 2 ? 1 : 2)
 void quantize_tiles_kernel
 (
@@ -37,11 +39,13 @@ void quantize_tiles_kernel
     constexpr int Kr = 16 - K;
     constexpr int max_q = 1 << K;
     constexpr int edges = 65536 >> K;
-    constexpr int decisions_per_row = K <= 4 ? edges / 2 : edges;
+    constexpr int decisions_per_row =
+        K == 2 ? edges / 4 : (K <= 4 ? edges / 2 : edges);
     constexpr int decision_shift = 16 - 2 * K;
     constexpr int predecessor_step = 1 << decision_shift;
     constexpr int num_threads =
-        K == 2 ? QUANTIZE_TILES_K2_NUM_THREADS : QUANTIZE_TILES_NUM_THREADS;
+        K == 2 ? QUANTIZE_TILES_K2_NUM_THREADS :
+            (K == 3 ? QUANTIZE_TILES_K3_NUM_THREADS : QUANTIZE_TILES_K4_NUM_THREADS);
 
     const int tile_idx = blockIdx.x;
     const int thread = threadIdx.x;
@@ -74,6 +78,10 @@ void quantize_tiles_kernel
             int in_edge_idx = out_edge_idx >> K;
             uint32_t product0 = 0;
             uint32_t product1 = 0;
+            uint2 sqg_k2_labels{};
+            uint4 sqg_k3_labels{};
+            uint4 sqg_k4_labels0{};
+            uint4 sqg_k4_labels1{};
             half2 decoded2;
             if constexpr (cb == 1)
             {
@@ -86,6 +94,27 @@ void quantize_tiles_kernel
                 product0 = out_edge_idx * 0x83DCD12Du;
                 product1 = product0 + 0x83DCD12Du;
                 decoded2 = decode_mul1_product_2(product0, product1);
+            }
+            else if constexpr (cb == 4 && K == 2)
+            {
+                sqg_k2_labels =
+                    reinterpret_cast<const uint2*>(sqg_e4m3_lut)[out_edge_idx >> 1];
+                decoded2 = decode_sqg_k2_pair(sqg_k2_labels, 0);
+            }
+            else if constexpr (cb == 4 && K == 3)
+            {
+                sqg_k3_labels =
+                    reinterpret_cast<const uint4*>(sqg_e4m3_lut)[out_edge_idx >> 1];
+                decoded2 = decode_sqg_k3_pair(sqg_k3_labels, 0);
+            }
+            else if constexpr (cb == 4 && K == 4)
+            {
+                const int packed_index = out_edge_idx;
+                sqg_k4_labels0 =
+                    reinterpret_cast<const uint4*>(sqg_e4m3_lut)[packed_index];
+                sqg_k4_labels1 =
+                    reinterpret_cast<const uint4*>(sqg_e4m3_lut)[packed_index + 1];
+                decoded2 = decode_sqg_k4_pair(sqg_k4_labels0, sqg_k4_labels1, 0);
             }
             else
             {
@@ -117,6 +146,19 @@ void quantize_tiles_kernel
                     product1 += product_step;
                     decoded2 = decode_mul1_product_2(product0, product1);
                 }
+                else if constexpr (cb == 4 && K == 2)
+                {
+                    decoded2 = decode_sqg_k2_pair(sqg_k2_labels, k);
+                }
+                else if constexpr (cb == 4 && K == 3)
+                {
+                    decoded2 = decode_sqg_k3_pair(sqg_k3_labels, k);
+                }
+                else if constexpr (cb == 4 && K == 4)
+                {
+                    decoded2 = decode_sqg_k4_pair(
+                        sqg_k4_labels0, sqg_k4_labels1, k);
+                }
                 else
                 {
                     const int state0 = (k << Kr) | out_edge_idx;
@@ -125,22 +167,24 @@ void quantize_tiles_kernel
                 dh2 = __hsub2(decoded2, w2);
                 half2 err2 = __hmul2(dh2, dh2);
                 if (pre_state >= 0 && in_edge_idx != pre_state) err2 = __half2half2(H_INF);
-                if (__hlt(__low2half(err2), __low2half(min_err2)))
-                {
-                    min_err2 = __halves2half2(__low2half(err2), __high2half(min_err2));
-                    min_k0 = k;
-                }
-                if (__hlt(__high2half(err2), __high2half(min_err2)))
-                {
-                    min_err2 = __halves2half2(__low2half(min_err2), __high2half(err2));
-                    min_k1 = k;
-                }
+                const unsigned less = __hlt2_mask(err2, min_err2);
+                min_err2 = __hmin2(err2, min_err2);
+                if (less & 0xffffu) min_k0 = k;
+                if (less >> 16) min_k1 = k;
             }
 
             reinterpret_cast<half2*>(temp_costs)[out_edge_idx >> 1] = min_err2;
             if (trace_start == 0)
             {
-                if constexpr (K <= 4)
+                if constexpr (K == 2)
+                {
+                    const unsigned pair = min_k0 | (min_k1 << 2);
+                    const unsigned next = __shfl_down_sync(0xffffffff, pair, 1);
+                    if ((thread & 1) == 0)
+                        temp_edges[decisions_per_row * ri + (out_edge_idx >> 2)] =
+                            (uint8_t) (pair | (next << 4));
+                }
+                else if constexpr (K <= 4)
                     temp_edges[decisions_per_row * ri + (out_edge_idx >> 1)] =
                         (uint8_t) (min_k0 | (min_k1 << 4));
                 else
@@ -165,6 +209,10 @@ void quantize_tiles_kernel
                 int in_edge_idx = out_edge_idx >> K;
                 uint32_t product0 = 0;
                 uint32_t product1 = 0;
+                uint2 sqg_k2_labels{};
+                uint4 sqg_k3_labels{};
+                uint4 sqg_k4_labels0{};
+                uint4 sqg_k4_labels1{};
                 half2 decoded2;
                 if constexpr (cb == 1)
                 {
@@ -177,6 +225,28 @@ void quantize_tiles_kernel
                     product0 = out_edge_idx * 0x83DCD12Du;
                     product1 = product0 + 0x83DCD12Du;
                     decoded2 = decode_mul1_product_2(product0, product1);
+                }
+                else if constexpr (cb == 4 && K == 2)
+                {
+                    sqg_k2_labels =
+                        reinterpret_cast<const uint2*>(sqg_e4m3_lut)[out_edge_idx >> 1];
+                    decoded2 = decode_sqg_k2_pair(sqg_k2_labels, 0);
+                }
+                else if constexpr (cb == 4 && K == 3)
+                {
+                    sqg_k3_labels =
+                        reinterpret_cast<const uint4*>(sqg_e4m3_lut)[out_edge_idx >> 1];
+                    decoded2 = decode_sqg_k3_pair(sqg_k3_labels, 0);
+                }
+                else if constexpr (cb == 4 && K == 4)
+                {
+                    const int packed_index = out_edge_idx;
+                    sqg_k4_labels0 =
+                        reinterpret_cast<const uint4*>(sqg_e4m3_lut)[packed_index];
+                    sqg_k4_labels1 =
+                        reinterpret_cast<const uint4*>(sqg_e4m3_lut)[packed_index + 1];
+                    decoded2 = decode_sqg_k4_pair(
+                        sqg_k4_labels0, sqg_k4_labels1, 0);
                 }
                 else
                 {
@@ -207,6 +277,19 @@ void quantize_tiles_kernel
                         product1 += product_step;
                         decoded2 = decode_mul1_product_2(product0, product1);
                     }
+                    else if constexpr (cb == 4 && K == 2)
+                    {
+                        decoded2 = decode_sqg_k2_pair(sqg_k2_labels, k);
+                    }
+                    else if constexpr (cb == 4 && K == 3)
+                    {
+                        decoded2 = decode_sqg_k3_pair(sqg_k3_labels, k);
+                    }
+                    else if constexpr (cb == 4 && K == 4)
+                    {
+                        decoded2 = decode_sqg_k4_pair(
+                            sqg_k4_labels0, sqg_k4_labels1, k);
+                    }
                     else
                     {
                         const int state0 = (k << Kr) | out_edge_idx;
@@ -214,22 +297,24 @@ void quantize_tiles_kernel
                     }
                     dh2 = __hsub2(decoded2, w2);
                     half2 err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
-                    if (__hlt(__low2half(err2), __low2half(min_err2)))
-                    {
-                        min_err2 = __halves2half2(__low2half(err2), __high2half(min_err2));
-                        min_k0 = k;
-                    }
-                    if (__hlt(__high2half(err2), __high2half(min_err2)))
-                    {
-                        min_err2 = __halves2half2(__low2half(min_err2), __high2half(err2));
-                        min_k1 = k;
-                    }
+                    const unsigned less = __hlt2_mask(err2, min_err2);
+                    min_err2 = __hmin2(err2, min_err2);
+                    if (less & 0xffffu) min_k0 = k;
+                    if (less >> 16) min_k1 = k;
                 }
 
                 reinterpret_cast<half2*>(temp_costs)[out_edge_idx >> 1] = min_err2;
                 if (i >= trace_start)
                 {
-                    if constexpr (K <= 4)
+                    if constexpr (K == 2)
+                    {
+                        const unsigned pair = min_k0 | (min_k1 << 2);
+                        const unsigned next = __shfl_down_sync(0xffffffff, pair, 1);
+                        if ((thread & 1) == 0)
+                            temp_edges[decisions_per_row * ri + (out_edge_idx >> 2)] =
+                                (uint8_t) (pair | (next << 4));
+                    }
+                    else if constexpr (K <= 4)
                         temp_edges[decisions_per_row * ri + (out_edge_idx >> 1)] =
                             (uint8_t) (min_k0 | (min_k1 << 4));
                     else
@@ -273,34 +358,40 @@ void quantize_tiles_kernel
         }
         else
         {
-            half local_min0 = H_INF;
-            half local_min1 = H_INF;
-            int local_idx0 = -1;
-            int local_idx1 = -1;
-            for (int e = thread; e < edges; e += 2 * num_threads)
+            // Preserve the established 512-thread reduction tree even when
+            // the forward pass uses a wider block.  This keeps exact-tie
+            // path selection stable across encoder-kernel revisions.
+            if (thread < 512)
             {
-                half v = temp_costs_inc[e];
-                if (__hlt(v, local_min0)) { local_min0 = v; local_idx0 = e; }
+                half local_min0 = H_INF;
+                half local_min1 = H_INF;
+                int local_idx0 = -1;
+                int local_idx1 = -1;
+                for (int e = thread; e < edges; e += 1024)
+                {
+                    half v = temp_costs_inc[e];
+                    if (__hlt(v, local_min0)) { local_min0 = v; local_idx0 = e; }
+                }
+                for (int e = thread + 512; e < edges; e += 1024)
+                {
+                    half v = temp_costs_inc[e];
+                    if (__hlt(v, local_min1)) { local_min1 = v; local_idx1 = e; }
+                }
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1)
+                {
+                    half other_min0 = __shfl_down_sync(0xffffffff, local_min0, offset);
+                    int other_idx0 = __shfl_down_sync(0xffffffff, local_idx0, offset);
+                    if (__hlt(other_min0, local_min0)) { local_min0 = other_min0; local_idx0 = other_idx0; }
+                    half other_min1 = __shfl_down_sync(0xffffffff, local_min1, offset);
+                    int other_idx1 = __shfl_down_sync(0xffffffff, local_idx1, offset);
+                    if (__hlt(other_min1, local_min1)) { local_min1 = other_min1; local_idx1 = other_idx1; }
+                }
+                sh_min[warp_id] = local_min0;
+                sh_idx[warp_id] = local_idx0;
+                sh_min[16 + warp_id] = local_min1;
+                sh_idx[16 + warp_id] = local_idx1;
             }
-            for (int e = thread + num_threads; e < edges; e += 2 * num_threads)
-            {
-                half v = temp_costs_inc[e];
-                if (__hlt(v, local_min1)) { local_min1 = v; local_idx1 = e; }
-            }
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-            {
-                half other_min0 = __shfl_down_sync(0xffffffff, local_min0, offset);
-                int other_idx0 = __shfl_down_sync(0xffffffff, local_idx0, offset);
-                if (__hlt(other_min0, local_min0)) { local_min0 = other_min0; local_idx0 = other_idx0; }
-                half other_min1 = __shfl_down_sync(0xffffffff, local_min1, offset);
-                int other_idx1 = __shfl_down_sync(0xffffffff, local_idx1, offset);
-                if (__hlt(other_min1, local_min1)) { local_min1 = other_min1; local_idx1 = other_idx1; }
-            }
-            sh_min[warp_id] = local_min0;
-            sh_idx[warp_id] = local_idx0;
-            sh_min[16 + warp_id] = local_min1;
-            sh_idx[16 + warp_id] = local_idx1;
         }
         __syncthreads();
 
@@ -328,7 +419,13 @@ void quantize_tiles_kernel
             {
                 const int ri = (i + roll) & 255;
                 int decision;
-                if constexpr (K <= 4)
+                if constexpr (K == 2)
+                {
+                    const uint8_t packed =
+                        temp_edges[decisions_per_row * ri + (edge >> 2)];
+                    decision = (packed >> ((edge & 3) * 2)) & 0x03;
+                }
+                else if constexpr (K <= 4)
                 {
                     const uint8_t packed =
                         temp_edges[decisions_per_row * ri + (edge >> 1)];
@@ -343,7 +440,14 @@ void quantize_tiles_kernel
                 if (write)
                 {
                     output_indices[ri] = (uint16_t) encoded;
-                    output_tile[ri] = __half2float(decode_3inst<cb>(encoded));
+                    if constexpr (cb == 4 && K == 2)
+                        output_tile[ri] = __half2float(decode_sqg_k2_scalar(encoded));
+                    else if constexpr (cb == 4 && K == 3)
+                        output_tile[ri] = __half2float(decode_sqg_k3_scalar(encoded));
+                    else if constexpr (cb == 4 && K == 4)
+                        output_tile[ri] = __half2float(decode_sqg_k4_scalar(encoded));
+                    else
+                        output_tile[ri] = __half2float(decode_3inst<cb>(encoded));
                 }
                 else if (ri == 0) break;
             }

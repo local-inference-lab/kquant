@@ -10,7 +10,7 @@ never materialize the full float32 matrix on CPU.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +38,53 @@ class PackedMXFP4Matrix:
 
     packed: torch.Tensor
     scale: torch.Tensor
+
+
+@dataclass(frozen=True)
+class OfficialMXFP4LayerStore:
+    """Layer-scoped source view backed by already-open shard handles.
+
+    Opening a large safetensors shard reparses its header.  All-expert passes
+    would otherwise pay that cost for every packed tensor and scale plane.
+    This view keeps only the owning shard handles open; ``get_tensor`` still
+    materializes one compact source matrix at a time.
+    """
+
+    parent: "OfficialMXFP4Store"
+    layer: int
+    handles: dict[Path, object]
+    experts: frozenset[int]
+    matrices: frozenset[str]
+
+    def load_packed_matrix(
+        self, layer: int, expert: int, matrix: str
+    ) -> PackedMXFP4Matrix:
+        if layer != self.layer:
+            raise ValueError(f"layer view is pinned to decoder layer {self.layer}")
+        if expert not in self.experts or matrix not in self.matrices:
+            raise ValueError("matrix is outside this layer view")
+        packed_name = weight_name(layer, expert, matrix, "weight_packed")
+        scale_name = weight_name(layer, expert, matrix, "weight_scale")
+        packed_path = self.parent.cache.tensor_path(packed_name)
+        scale_path = self.parent.cache.tensor_path(scale_name)
+        if packed_path is None or scale_path is None:
+            raise FileNotFoundError("official source matrix is incomplete")
+        packed = self.handles[Path(packed_path)].get_tensor(packed_name)
+        scale = self.handles[Path(scale_path)].get_tensor(scale_name)
+        return self.parent._validated_packed_matrix(
+            packed, scale, packed_name=packed_name, scale_name=scale_name, matrix=matrix
+        )
+
+    def load_matrix(
+        self,
+        layer: int,
+        expert: int,
+        matrix: str,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        raw = self.load_packed_matrix(layer, expert, matrix)
+        return self.parent._dequant_packed_matrix(raw, device=device)
 
 
 class OfficialMXFP4Store:
@@ -87,6 +134,14 @@ class OfficialMXFP4Store:
         """
 
         raw = self.load_packed_matrix(layer, expert, matrix)
+        return self._dequant_packed_matrix(raw, device=device)
+
+    @staticmethod
+    def _dequant_packed_matrix(
+        raw: PackedMXFP4Matrix,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
         target = torch.device("cpu") if device is None else torch.device(device)
         if target.type == "cpu":
             return dequant(raw.packed, raw.scale)
@@ -109,6 +164,23 @@ class OfficialMXFP4Store:
         scale_name = weight_name(layer, expert, matrix, "weight_scale")
         packed = load_tensor(self.cache, packed_name)
         scale = load_tensor(self.cache, scale_name)
+        return self._validated_packed_matrix(
+            packed,
+            scale,
+            packed_name=packed_name,
+            scale_name=scale_name,
+            matrix=matrix,
+        )
+
+    @staticmethod
+    def _validated_packed_matrix(
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        packed_name: str,
+        scale_name: str,
+        matrix: str,
+    ) -> PackedMXFP4Matrix:
         out_features, in_features = C.EXPERT_SHAPES[matrix]
         expected_packed = (out_features, in_features // 2)
         expected_scale = (out_features, in_features // C.MXFP4_BLOCK)
@@ -128,6 +200,56 @@ class OfficialMXFP4Store:
             packed=packed.contiguous(),
             scale=scale.contiguous(),
         )
+
+    @contextmanager
+    def open_layer(
+        self,
+        layer: int,
+        *,
+        experts: tuple[int, ...] | None = None,
+        matrices: tuple[str, ...] = C.EXPERT_MATRICES,
+    ) -> Iterator[OfficialMXFP4LayerStore]:
+        """Open every shard needed by a bounded all-expert layer pass once."""
+
+        if layer not in C.MOE_LAYERS:
+            raise ValueError(f"decoder layer {layer} is not a K3 MoE layer")
+        selected_experts = (
+            tuple(range(C.NUM_EXPERTS)) if experts is None else tuple(experts)
+        )
+        if (
+            not selected_experts
+            or len(set(selected_experts)) != len(selected_experts)
+            or any(not 0 <= expert < C.NUM_EXPERTS for expert in selected_experts)
+        ):
+            raise ValueError("layer-view experts must be unique IDs in 0..895")
+        if (
+            not matrices
+            or len(set(matrices)) != len(matrices)
+            or any(matrix not in C.EXPERT_MATRICES for matrix in matrices)
+        ):
+            raise ValueError(f"matrices must be drawn from {C.EXPERT_MATRICES}")
+
+        paths: set[Path] = set()
+        for expert in selected_experts:
+            for matrix in matrices:
+                for part in ("weight_packed", "weight_scale"):
+                    name = weight_name(layer, expert, matrix, part)
+                    path = self.cache.tensor_path(name)
+                    if path is None:
+                        raise FileNotFoundError(f"shard for {name} not downloaded yet")
+                    paths.add(Path(path))
+        with ExitStack() as stack:
+            handles = {
+                path: stack.enter_context(safe_open(str(path), framework="pt"))
+                for path in paths
+            }
+            yield OfficialMXFP4LayerStore(
+                parent=self,
+                layer=layer,
+                handles=handles,
+                experts=frozenset(selected_experts),
+                matrices=frozenset(matrices),
+            )
 
     def load_scale_plane(
         self, layer: int, expert: int, matrix: str

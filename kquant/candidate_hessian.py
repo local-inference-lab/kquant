@@ -73,8 +73,9 @@ def weighted_covariance(
     *,
     device: torch.device,
     chunk_rows: int = 256,
+    return_cpu: bool = True,
 ) -> tuple[torch.Tensor, float]:
-    """Return ``sum(w * x xT) / sum(w)`` as symmetric CPU FP32."""
+    """Return ``sum(w * x xT) / sum(w)`` as symmetric FP32."""
 
     if rows.ndim != 2 or weights.ndim != 1 or rows.shape[0] != weights.shape[0]:
         raise ValueError("invalid covariance sample shapes")
@@ -103,7 +104,9 @@ def weighted_covariance(
         )
         accumulator.addmm_(values.T, values * local_weights[:, None])
     covariance = accumulator.div_(denominator)
-    covariance = ((covariance + covariance.T) * 0.5).cpu().contiguous()
+    covariance = ((covariance + covariance.T) * 0.5).contiguous()
+    if return_cpu:
+        covariance = covariance.cpu()
     if not torch.all(torch.isfinite(covariance)):
         raise ValueError("weighted covariance is non-finite")
     return covariance, denominator
@@ -133,6 +136,84 @@ def shrink_covariance(
         global_covariance.float(), local_covariance.float(), alpha
     )
     return ((blended + blended.T) * 0.5).contiguous()
+
+
+def weighted_effective_sample_size(weights: torch.Tensor) -> float:
+    """Return Kish effective sample size for nonnegative row weights."""
+
+    if weights.ndim != 1 or not weights.numel():
+        raise ValueError("weights must be a nonempty vector")
+    if not torch.all(torch.isfinite(weights)) or torch.any(weights < 0):
+        raise ValueError("weights must be finite and nonnegative")
+    weights64 = weights.double()
+    total = weights64.sum()
+    squared_total = weights64.square().sum()
+    if total <= 0 or squared_total <= 0:
+        raise ValueError("weights must have positive effective support")
+    return float(total.square() / squared_total)
+
+
+def adaptive_identity_shrinkage(
+    local_covariance: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    max_local_alpha: float = 0.75,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Shrink a weighted local covariance toward its scaled identity.
+
+    The Oracle Approximating Shrinkage expression is evaluated with Kish
+    effective sample size in place of an unweighted row count.  The target is
+    always ``trace(local) / dimension * I``.  This is important for expert
+    ``H2`` matrices: intermediate coordinates have no common meaning across
+    experts, so a pooled post-SiTU covariance is not a valid prior.
+    ``max_local_alpha`` preserves a nonzero identity contribution even for
+    very well-supported experts.
+    """
+
+    max_local_alpha = float(max_local_alpha)
+    if not math.isfinite(max_local_alpha) or not 0.0 <= max_local_alpha <= 1.0:
+        raise ValueError("max_local_alpha must be finite and in [0, 1]")
+    if local_covariance.ndim != 2 or (
+        local_covariance.shape[0] != local_covariance.shape[1]
+    ):
+        raise ValueError("local covariance must be square")
+    if not torch.all(torch.isfinite(local_covariance)):
+        raise ValueError("local covariance must be finite")
+
+    effective_rows = weighted_effective_sample_size(weights)
+    dimension = int(local_covariance.shape[0])
+    local64 = local_covariance.double()
+    local_trace = torch.trace(local64)
+    if local_trace <= 0:
+        raise ValueError("local covariance trace must be positive")
+
+    mu = local_trace / dimension
+    mean_square = local64.square().mean()
+    denominator = (effective_rows + 1.0) * (
+        mean_square - mu.square() / dimension
+    )
+    if denominator <= 0:
+        oas_shrinkage = 1.0
+    else:
+        oas_shrinkage = min(
+            1.0,
+            max(0.0, float((mean_square + mu.square()) / denominator)),
+        )
+    local_alpha = min(max_local_alpha, 1.0 - oas_shrinkage)
+    identity_scale = float(mu)
+    scaled_identity = torch.eye(
+        dimension,
+        dtype=torch.float32,
+        device=local_covariance.device,
+    ).mul_(identity_scale)
+    blended = shrink_covariance(scaled_identity, local_covariance, local_alpha)
+    return blended, {
+        "effective_sample_size": effective_rows,
+        "oas_shrinkage": oas_shrinkage,
+        "local_alpha": local_alpha,
+        "max_local_alpha": max_local_alpha,
+        "identity_scale": identity_scale,
+    }
 
 
 def covariance_comparison(

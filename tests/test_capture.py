@@ -8,7 +8,14 @@ import torch
 from safetensors.torch import load_file, save_file
 
 import kquant.capture as capture_module
-from kquant.capture import build_hessians, index_layer_samples, load_layer_samples
+from kquant.capture import (
+    build_layer_sample_cache,
+    build_hessians,
+    index_cached_layer_samples,
+    index_layer_samples,
+    load_layer_hessians,
+    load_layer_samples,
+)
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -122,6 +129,7 @@ def test_build_hessians_joins_tp_channel_shards(tmp_path: Path) -> None:
         layers=[0],
         min_rows=2,
         sample_split="all",
+        h2_policy="diagnostic_captured_global",
     )
     tensors = load_file(output / "layer-00001.safetensors")
 
@@ -152,6 +160,7 @@ def test_build_hessians_filters_capture_request_epochs(tmp_path: Path) -> None:
         sample_split="all",
         request_step_min=1,
         request_step_max=1,
+        h2_policy="diagnostic_captured_global",
     )
     tensors = load_file(output / "layer-00001.safetensors")
 
@@ -184,6 +193,7 @@ def test_build_hessians_filters_an_exact_request_epoch_set(tmp_path: Path) -> No
         min_rows=1,
         sample_split="all",
         request_steps=[0],
+        h2_policy="diagnostic_captured_global",
     )
     tensors = load_file(output / "layer-00001.safetensors")
 
@@ -205,7 +215,12 @@ def test_build_hessians_filters_an_exact_request_epoch_set(tmp_path: Path) -> No
 def test_build_hessians_rejects_unaligned_tp_samples(tmp_path: Path) -> None:
     capture = _make_capture(tmp_path / "bad.kqcapture", mismatch_mid=True)
     with pytest.raises(ValueError, match="observation IDs do not align"):
-        build_hessians(capture, tmp_path / "bad", layers=[0])
+        build_hessians(
+            capture,
+            tmp_path / "bad",
+            layers=[0],
+            h2_policy="diagnostic_captured_global",
+        )
 
 
 def test_build_hessians_rejects_mismatched_tp_experts(tmp_path: Path) -> None:
@@ -213,7 +228,12 @@ def test_build_hessians_rejects_mismatched_tp_experts(tmp_path: Path) -> None:
         tmp_path / "bad-expert.kqcapture", mismatch_mid_expert=True
     )
     with pytest.raises(ValueError, match="mid expert IDs differ"):
-        build_hessians(capture, tmp_path / "bad-expert", layers=[0])
+        build_hessians(
+            capture,
+            tmp_path / "bad-expert",
+            layers=[0],
+            h2_policy="diagnostic_captured_global",
+        )
 
 
 def test_build_hessians_reads_each_sample_part_once(
@@ -235,6 +255,7 @@ def test_build_hessians_reads_each_sample_part_once(
         layers=[0, 1],
         min_rows=2,
         sample_split="all",
+        h2_policy="diagnostic_captured_global",
     )
 
     assert len(sample_loads) == 2
@@ -244,7 +265,12 @@ def test_build_hessians_reads_each_sample_part_once(
 
 def test_build_hessians_keeps_validation_rows_held_out(tmp_path: Path) -> None:
     capture = _make_capture(tmp_path / "split.kqcapture")
-    output = build_hessians(capture, tmp_path / "split", layers=[0])
+    output = build_hessians(
+        capture,
+        tmp_path / "split",
+        layers=[0],
+        h2_policy="diagnostic_captured_global",
+    )
     tensors = load_file(output / "layer-00001.safetensors")
 
     x13 = torch.tensor([[1, 2]], dtype=torch.float32)
@@ -255,6 +281,31 @@ def test_build_hessians_keeps_validation_rows_held_out(tmp_path: Path) -> None:
     assert manifest["sample_split"] == "train"
     assert manifest["layers"]["1"]["w13_total_rows"] == 2
     assert manifest["layers"]["1"]["w13_validation_rows"] == 1
+
+
+def test_streaming_h13_uses_identity_h2_prior(tmp_path: Path) -> None:
+    capture = _make_capture(tmp_path / "identity-prior.kqcapture", num_layers=2)
+    output = build_hessians(
+        capture,
+        tmp_path / "identity-prior",
+        layers=[0, 1],
+        min_rows=2,
+        sample_split="all",
+        h2_policy="identity_prior",
+    )
+
+    raw = load_file(output / "layer-00001.safetensors")
+    assert set(raw) == {"w13"}
+    h13, h2 = load_layer_hessians(output, 1)
+    x13 = torch.tensor([[1, 2], [3, 4]], dtype=torch.float32)
+    w13 = torch.tensor([0.5, 1.25], dtype=torch.float32)
+    torch.testing.assert_close(h13, (x13.T @ (x13 * w13[:, None])) / w13.sum())
+    torch.testing.assert_close(h2, torch.eye(4))
+
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["schema_version"] == 2
+    assert manifest["h2_policy"] == "identity_prior_expert_local_jit"
+    assert manifest["layers"]["1"]["w2_prior"] == "identity"
 
 
 def test_load_layer_samples_preserves_route_and_expert_identity(tmp_path: Path) -> None:
@@ -300,6 +351,27 @@ def test_reusable_layer_index_reads_capture_once_and_skips_stats(
     assert index.remaining == set()
     with pytest.raises(ValueError, match="absent or already consumed"):
         index.pop(0)
+
+
+def test_layer_sample_cache_preserves_inputs_without_teacher_middle(
+    tmp_path: Path,
+) -> None:
+    capture = _make_capture(tmp_path / "cache-source.kqcapture", num_layers=2)
+    cache = build_layer_sample_cache(capture, tmp_path / "cache")
+    index = index_cached_layer_samples(cache, [0, 1])
+
+    first = index.pop(0)
+    second = index.pop(1)
+    assert first.input_observations.tolist() == [10, 20]
+    assert second.input_observations.tolist() == [110, 120]
+    assert first.input_experts.tolist() == [[0, 1], [1, 0]]
+    assert first.routed_latent.tolist() == [[5, 6], [7, 8]]
+    assert first.mid_values.shape == (0, 4)
+    assert index.remaining == set()
+
+    manifest = json.loads((cache / "manifest.json").read_text())
+    assert manifest["contents"] == "rank0_route_input_rows_no_teacher_middle"
+    assert len(manifest["layers"]) == 2
 
 
 def test_grouped_layer_samples_do_not_retain_complete_part_storage(

@@ -24,7 +24,99 @@ __device__ inline half decode_3inst<4>(uint32_t state)
 template <>
 __device__ inline half2 decode_3inst_2<4>(uint32_t state0, uint32_t state1)
 {
-    return __halves2half2(decode_3inst<4>(state0), decode_3inst<4>(state1));
+    // The trellis kernel always asks for an aligned consecutive pair.  Load
+    // both E4M3 labels together so a warp consumes every byte in each cache
+    // sector instead of issuing separate even- and odd-byte gathers.
+    const __nv_fp8x2_storage_t fp8x2 =
+        reinterpret_cast<const __nv_fp8x2_storage_t*>(sqg_e4m3_lut)[state0 >> 1];
+    const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(fp8x2, __NV_E4M3);
+    return __halves2half2(__ushort_as_half(raw.x), __ushort_as_half(raw.y));
+}
+
+__device__ inline half2 decode_sqg_fp8x2(__nv_fp8x2_storage_t fp8x2)
+{
+    const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(fp8x2, __NV_E4M3);
+    return __halves2half2(__ushort_as_half(raw.x), __ushort_as_half(raw.y));
+}
+
+__device__ inline half2 decode_sqg_k2_pair(const uint2& packed, int predecessor)
+{
+    const uint32_t word = predecessor < 2 ? packed.x : packed.y;
+    return decode_sqg_fp8x2(
+        static_cast<__nv_fp8x2_storage_t>(word >> (16 * (predecessor & 1))));
+}
+
+__device__ inline half decode_sqg_k2_scalar(uint32_t state)
+{
+    constexpr int edges = 65536 >> 2;
+    const int predecessor = state >> 14;
+    const int out_edge = state & (edges - 1);
+    const __nv_fp8x2_storage_t pair =
+        reinterpret_cast<const __nv_fp8x2_storage_t*>(sqg_e4m3_lut)[
+            (out_edge >> 1) * 4 + predecessor];
+    const __nv_fp8_storage_t fp8 =
+        static_cast<__nv_fp8_storage_t>(pair >> (8 * (out_edge & 1)));
+    const __half_raw raw = __nv_cvt_fp8_to_halfraw(fp8, __NV_E4M3);
+    return __ushort_as_half(raw.x);
+}
+
+__device__ inline half2 decode_sqg_k3_pair(const uint4& packed, int predecessor)
+{
+    uint32_t word;
+    switch (predecessor >> 1)
+    {
+        case 0: word = packed.x; break;
+        case 1: word = packed.y; break;
+        case 2: word = packed.z; break;
+        default: word = packed.w; break;
+    }
+    return decode_sqg_fp8x2(
+        static_cast<__nv_fp8x2_storage_t>(word >> (16 * (predecessor & 1))));
+}
+
+__device__ inline half2 decode_sqg_k4_pair(
+    const uint4& packed0, const uint4& packed1, int predecessor)
+{
+    const uint4& packed = predecessor < 8 ? packed0 : packed1;
+    const int local = predecessor & 7;
+    uint32_t word;
+    switch (local >> 1)
+    {
+        case 0: word = packed.x; break;
+        case 1: word = packed.y; break;
+        case 2: word = packed.z; break;
+        default: word = packed.w; break;
+    }
+    return decode_sqg_fp8x2(
+        static_cast<__nv_fp8x2_storage_t>(word >> (16 * (local & 1))));
+}
+
+__device__ inline half decode_sqg_k4_scalar(uint32_t state)
+{
+    constexpr int edges = 65536 >> 4;
+    const int predecessor = state >> 12;
+    const int out_edge = state & (edges - 1);
+    const __nv_fp8x2_storage_t pair =
+        reinterpret_cast<const __nv_fp8x2_storage_t*>(sqg_e4m3_lut)[
+            (out_edge >> 1) * 16 + predecessor];
+    const __nv_fp8_storage_t fp8 =
+        static_cast<__nv_fp8_storage_t>(pair >> (8 * (out_edge & 1)));
+    const __half_raw raw = __nv_cvt_fp8_to_halfraw(fp8, __NV_E4M3);
+    return __ushort_as_half(raw.x);
+}
+
+__device__ inline half decode_sqg_k3_scalar(uint32_t state)
+{
+    constexpr int edges = 65536 >> 3;
+    const int predecessor = state >> 13;
+    const int out_edge = state & (edges - 1);
+    const __nv_fp8x2_storage_t pair =
+        reinterpret_cast<const __nv_fp8x2_storage_t*>(sqg_e4m3_lut)[
+            (out_edge >> 1) * 8 + predecessor];
+    const __nv_fp8_storage_t fp8 =
+        static_cast<__nv_fp8_storage_t>(pair >> (8 * (out_edge & 1)));
+    const __half_raw raw = __nv_cvt_fp8_to_halfraw(fp8, __NV_E4M3);
+    return __ushort_as_half(raw.x);
 }
 
 #include "qsrt_quantize_tiles_kernel.cuh"
@@ -45,7 +137,7 @@ void launch_trellis(
     int tailbite_context,
     cudaStream_t stream)
 {
-    const int threads = K == 2 ? 1024 : 512;
+    const int threads = K == 2 ? 1024 : (K == 3 ? 768 : 512);
     cudaFuncSetAttribute(
         quantize_tiles_kernel<K, codebook>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -53,7 +145,7 @@ void launch_trellis(
     cudaFuncSetAttribute(
         quantize_tiles_kernel<K, codebook>,
         cudaFuncAttributePreferredSharedMemoryCarveout,
-        cudaSharedmemCarveoutMaxShared);
+        K == 4 ? cudaSharedmemCarveoutMaxL1 : cudaSharedmemCarveoutMaxShared);
     for (int start = 0; start < tiles; start += max_batch)
     {
         const int batch = min(max_batch, tiles - start);
@@ -105,7 +197,8 @@ void quantize_tiles_sqg_cuda(
     TORCH_CHECK(codebook.is_contiguous(), "codebook must be contiguous");
 
     const int edges_per_state = 65536 >> K;
-    const int decision_entries = K <= 4 ? edges_per_state / 2 : edges_per_state;
+    const int decision_entries =
+        K == 2 ? edges_per_state / 4 : (K <= 4 ? edges_per_state / 2 : edges_per_state);
     TORCH_CHECK(temp_costs.scalar_type() == at::kHalf && temp_costs.dim() == 3,
                 "temp_costs must be rank-3 FP16");
     TORCH_CHECK(temp_costs.size(1) == 2 && temp_costs.size(2) == edges_per_state,
@@ -197,7 +290,7 @@ void quantize_tiles_procedural_cuda(
                 "tailbite_context must be in 1..128");
 
     const int edges_per_state = 65536 >> K;
-    const int decision_entries = edges_per_state / 2;
+    const int decision_entries = K == 2 ? edges_per_state / 4 : edges_per_state / 2;
     TORCH_CHECK(temp_costs.scalar_type() == at::kHalf && temp_costs.dim() == 3,
                 "temp_costs must be rank-3 FP16");
     TORCH_CHECK(temp_costs.size(1) == 2 && temp_costs.size(2) == edges_per_state,

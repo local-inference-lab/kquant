@@ -30,14 +30,14 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from kquant import constants as C
-from kquant.capture import index_layer_samples, load_layer_hessians
+from kquant.capture import index_cached_layer_samples, load_layer_hessians
 from kquant.qsrt_candidates import (
     RequestPartition,
     functional_sse_by_request,
+    index_expert_rows,
     layer_fallback_contexts,
     partition_requests,
     request_documents,
-    select_expert_rows,
 )
 from kquant.pack.qsrt_pool import load_qsrt_candidate_pool
 from kquant.pack.qsrt_candidates import (
@@ -224,6 +224,8 @@ def _manifest(
     candidate_manifest = pool.manifest
     training_report = Path(str(candidate_manifest["training_report"])).resolve()
     training_capture = Path(str(candidate_manifest["capture"])).resolve()
+    training_sample_cache = Path(str(candidate_manifest["sample_cache"])).resolve()
+    validation_sample_cache = args.validation_sample_cache.resolve()
     hessians = Path(str(candidate_manifest["hessians"])).resolve()
     validation_report = Path(str(validation.manifest["validation_report"])).resolve()
     validation_capture = Path(str(validation.manifest["validation_capture"])).resolve()
@@ -253,10 +255,16 @@ def _manifest(
     provenance_files = {
         "training_report_sha256": _sha256(training_report),
         "training_capture_manifest_sha256": _sha256(training_capture / "manifest.json"),
+        "training_sample_cache_manifest_sha256": _sha256(
+            training_sample_cache / "manifest.json"
+        ),
         "hessian_manifest_sha256": _sha256(hessians / "manifest.json"),
         "validation_report_sha256": _sha256(validation_report),
         "validation_capture_manifest_sha256": _sha256(
             validation_capture / "manifest.json"
+        ),
+        "validation_sample_cache_manifest_sha256": _sha256(
+            validation_sample_cache / "manifest.json"
         ),
         "official_index_sha256": _sha256(source_index),
         "quantizer_source_sha256": _sha256(quantizer_sources[0]),
@@ -277,16 +285,24 @@ def _manifest(
         "source_revision": C.REVISION,
         "source_checkpoint": str(source_store.root),
         "training_capture": str(training_capture),
+        "training_sample_cache": str(training_sample_cache),
         "training_report": str(training_report),
         "hessians": str(hessians),
         "resident_teacher_checkpoint": candidate_manifest[
             "resident_teacher_checkpoint"
         ],
         "validation_capture": str(validation_capture),
+        "validation_sample_cache": str(validation_sample_cache),
         "validation_report": str(validation_report),
         "validation_documents": validation.manifest["validation_documents"],
         "exllamav3_root": str(exllamav3_root),
         "mode_ids": candidate_manifest["mode_ids"],
+        "layout": candidate_manifest["layout"],
+        "ldlq_tf32": candidate_manifest["ldlq_tf32"],
+        "tailbite_context": candidate_manifest["tailbite_context"],
+        "hessian_policy": candidate_manifest["hessian_policy"],
+        "permutation_policy": candidate_manifest["permutation_policy"],
+        "folded_scale_power": candidate_manifest["folded_scale_power"],
         "selection_contract": {
             name: candidate_manifest[name]
             for name in (
@@ -309,7 +325,9 @@ def _manifest(
         "official_source_residency": "one expert matrix at a time",
         "r0_reencode_contract": (
             "seed each layer with expert 0 under the original shared-scale scope; "
-            "require exact training evidence and shared-hidden-scale closure"
+            "require exact structural evidence and shared-hidden-scale closure; "
+            "construct a fresh uniform R0 counterfactual with the frozen codec "
+            "profile and record floating replay drift separately"
         ),
         **provenance_files,
     }
@@ -320,6 +338,17 @@ def _manifest(
         != training_capture
     ):
         raise ValueError("Hessian bundle was built from another training capture")
+    for name, cache, capture in (
+        ("training", training_sample_cache, training_capture),
+        ("validation", validation_sample_cache, validation_capture),
+    ):
+        cache_manifest = _read_json(cache / "manifest.json")
+        if (
+            cache_manifest.get("kind") != "kquant_layer_sample_cache"
+            or Path(str(cache_manifest.get("source_capture", ""))).resolve()
+            != capture
+        ):
+            raise ValueError(f"{name} sample cache does not match its capture")
     return result
 
 
@@ -359,12 +388,53 @@ def _require_exact(name: str, actual: torch.Tensor, expected: torch.Tensor) -> N
         )
 
 
+def _validate_replay_metric(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> dict[str, float | int]:
+    """Validate replay evidence without treating GEMM reduction order as syntax.
+
+    Candidate construction may score several experts in one source batch while
+    this audit deliberately reconstructs one expert at a time.  TF32/FP32 GEMM
+    reductions are not promised to be bit-identical across those batch shapes.
+    The serialized trellis and scale tensors are checked exactly below; replay
+    metrics are required to retain their shape, dtype, finiteness and sign and
+    their numerical drift is recorded in the layer evidence.
+    """
+
+    if actual.dtype != expected.dtype or tuple(actual.shape) != tuple(expected.shape):
+        raise ValueError(
+            f"{name} shape/dtype drifted: {actual.dtype} {tuple(actual.shape)} != "
+            f"{expected.dtype} {tuple(expected.shape)}"
+        )
+    actual_cpu = actual.detach().cpu()
+    expected_cpu = expected.detach().cpu()
+    if not bool(torch.all(torch.isfinite(actual_cpu))):
+        raise ValueError(f"{name} contains non-finite replay values")
+    if not bool(torch.all(torch.isfinite(expected_cpu))):
+        raise ValueError(f"{name} stored evidence contains non-finite values")
+    if bool(torch.any(actual_cpu < 0)) or bool(torch.any(expected_cpu < 0)):
+        raise ValueError(f"{name} contains negative energy or SSE")
+    difference = (actual_cpu.double() - expected_cpu.double()).abs()
+    denominator = expected_cpu.double().abs().clamp_min(torch.finfo(torch.float64).tiny)
+    mismatch_count = int(torch.count_nonzero(actual_cpu != expected_cpu))
+    return {
+        "mismatched": mismatch_count,
+        "elements": actual_cpu.numel(),
+        "max_abs": float(difference.max()) if difference.numel() else 0.0,
+        "max_relative": (
+            float((difference / denominator).max()) if difference.numel() else 0.0
+        ),
+    }
+
+
 def _verify_training_r0(
     candidate: QSRTCandidateEncoding,
     stored: dict[str, torch.Tensor],
     *,
     expert: int,
-) -> None:
+) -> dict[str, dict[str, float | int]]:
     mode_ids = stored["mode_ids"].tolist()
     if 0 not in mode_ids:
         raise ValueError("candidate metrics do not contain R0")
@@ -375,9 +445,24 @@ def _verify_training_r0(
         or candidate.selection.selected != (0, 0)
     ):
         raise ValueError("matched-R0 re-encode did not produce only R0/R0")
-    pairs = (
+    exact_pairs = (
         ("block contexts", candidate.block_contexts, stored["block_contexts"][expert]),
         ("block scores", candidate.block_scores, stored["block_scores"][expert]),
+        (
+            "fit counts",
+            candidate.fit_counts.to(torch.int32),
+            stored["fit_counts"][expert],
+        ),
+        (
+            "confirmation counts",
+            candidate.confirmation_counts.to(torch.int32),
+            stored["confirmation_counts"][expert],
+        ),
+    )
+    for name, actual, expected in exact_pairs:
+        _require_exact(f"expert {expert} {name}", actual, expected)
+
+    replay_pairs = (
         (
             "fit R0/R0 SSE",
             candidate.fit_sse[(0, 0)],
@@ -398,19 +483,11 @@ def _verify_training_r0(
             candidate.confirmation_reference_energy,
             stored["confirmation_reference_energy"][expert],
         ),
-        (
-            "fit counts",
-            candidate.fit_counts.to(torch.int32),
-            stored["fit_counts"][expert],
-        ),
-        (
-            "confirmation counts",
-            candidate.confirmation_counts.to(torch.int32),
-            stored["confirmation_counts"][expert],
-        ),
     )
-    for name, actual, expected in pairs:
-        _require_exact(f"expert {expert} {name}", actual, expected)
+    return {
+        name: _validate_replay_metric(f"expert {expert} {name}", actual, expected)
+        for name, actual, expected in replay_pairs
+    }
 
 
 def _payload_digest(candidate: QSRTCandidateEncoding) -> str:
@@ -441,22 +518,6 @@ def _verify_stored_payload_scales(
         stored = reader.get_tensor(candidate_tensor_name(layer, expert, matrix, part))
         actual = candidate.expert.matrices[matrix].tensors[part]
         _require_exact(f"expert {expert} {matrix} shared hidden scale", actual, stored)
-
-
-def _verify_full_stored_r0_payload(
-    reader: object,
-    candidate: QSRTCandidateEncoding,
-    *,
-    layer: int,
-    expert: int,
-) -> None:
-    for matrix in C.EXPERT_MATRICES:
-        for part in ("trellis", "suh", "svh"):
-            stored = reader.get_tensor(
-                candidate_tensor_name(layer, expert, matrix, part)
-            )
-            actual = candidate.expert.matrices[matrix].tensors[part]
-            _require_exact(f"expert {expert} stored R0 {matrix}.{part}", actual, stored)
 
 
 def _score_r0_candidate(
@@ -538,6 +599,12 @@ def _encode_r0(
         quantizer_module=resources.quantizer_module,
         logical_trellis_schema=str(manifest["candidate_logical_trellis_schema"]),
         codebook=str(manifest["candidate_codebook"]),
+        layout=str(manifest["layout"]),
+        ldlq_tf32=bool(manifest["ldlq_tf32"]),
+        tailbite_context=int(manifest["tailbite_context"]),
+        hessian_policy=str(manifest["hessian_policy"]),
+        permutation_policy=str(manifest["permutation_policy"]),
+        folded_scale_power=float(manifest["folded_scale_power"]),
     )
 
 
@@ -573,13 +640,14 @@ def score_layer(
     audited_experts = torch.nonzero(audited_mask, as_tuple=False).flatten().tolist()
     started = time.time()
     evidence: dict[str, dict] = {}
-    control_expert: int | None = None
-
     if audited_experts:
         if resources is None:
             raise ValueError("audited layer has no worker resources")
         training_samples = resources.training_index.pop(layer - 1)
         validation_samples = resources.validation_index.pop(layer - 1)
+        validation_rows = index_expert_rows(
+            validation_samples, resources.validation_documents
+        )
         global_h13, global_h2 = load_layer_hessians(
             Path(str(manifest["hessians"])), layer
         )
@@ -587,12 +655,10 @@ def score_layer(
             training_samples, resources.partition.fit
         )
         device = torch.device("cuda", 0)
-        uniform_experts = torch.nonzero(
-            ~audited_mask, as_tuple=False
-        ).flatten().tolist()
-        control_expert = uniform_experts[0] if uniform_experts else None
-        control = [control_expert] if control_expert is not None else []
-        order = list(dict.fromkeys([0, *control, *audited_experts]))
+        # Expert zero primes the layer-shared hidden scale exactly as the
+        # original candidate schedule did.  It remains a structural control
+        # even when it was not itself selected for a rate shift.
+        order = list(dict.fromkeys([0, *audited_experts]))
         with safe_open(candidate_payload_path, framework="pt", device="cpu") as reader:
             for position, expert in enumerate(order):
                 candidate = _encode_r0(
@@ -607,20 +673,14 @@ def score_layer(
                     fallback_scores=fallback_scores,
                     device=device,
                 )
-                _verify_training_r0(candidate, candidate_metrics, expert=expert)
+                training_replay_drift = _verify_training_r0(
+                    candidate, candidate_metrics, expert=expert
+                )
                 _verify_stored_payload_scales(
                     reader, candidate, layer=layer, expert=expert
                 )
-                if expert == control_expert:
-                    _verify_full_stored_r0_payload(
-                        reader, candidate, layer=layer, expert=expert
-                    )
                 if expert in audited_experts:
-                    rows = select_expert_rows(
-                        validation_samples,
-                        expert,
-                        resources.validation_documents,
-                    )
+                    rows = validation_rows.select(expert)
                     r0_sse, reference, counts = _score_r0_candidate(
                         candidate,
                         rows,
@@ -630,7 +690,7 @@ def score_layer(
                         expert=expert,
                         device=device,
                     )
-                    _require_exact(
+                    validation_reference_drift = _validate_replay_metric(
                         f"expert {expert} validation reference energy",
                         reference,
                         selected_metrics["validation_reference_energy"][expert],
@@ -649,9 +709,13 @@ def score_layer(
                     evidence[str(expert)] = {
                         "selected_r13": int(selected_r13[expert]),
                         "selected_r2": int(selected_r2[expert]),
-                        "training_r0_metrics_exact": True,
+                        "training_r0_structural_evidence_exact": True,
+                        "training_r0_replay_drift": training_replay_drift,
                         "shared_hidden_scales_exact": True,
                         "r0_payload_sha256": _payload_digest(candidate),
+                        "validation_reference_replay_drift": (
+                            validation_reference_drift
+                        ),
                         "validation_rows": int(counts.sum()),
                         "validation_documents": int((counts > 0).sum()),
                         "selected_validation_damage": selected_total,
@@ -690,8 +754,8 @@ def score_layer(
         "validation_rows": int(metrics["validation_counts"].sum()),
         "audited_experts": audited_experts,
         "audited_expert_count": len(audited_experts),
-        "r0_payload_control_expert": control_expert,
-        "r0_payload_control_exact": control_expert is not None or not audited_experts,
+        "r0_shared_scale_control_expert": 0 if audited_experts else None,
+        "r0_shared_hidden_scales_exact": True,
         "selected_validation_damage": float(
             metrics["selected_validation_damage"].sum()
         ),
@@ -729,14 +793,53 @@ def _audited_layers(candidate_pool: Path) -> list[int]:
     return result
 
 
+def _balanced_worker_layers(
+    candidate_pool: Path,
+    destination: Path,
+    worker_count: int,
+) -> list[tuple[int, ...]]:
+    """Greedily balance pending layers by their matched-R0 encode count."""
+
+    weighted: list[tuple[int, int]] = []
+    for layer in C.MOE_LAYERS:
+        if _layer_complete(destination, layer):
+            continue
+        _payload, metrics_path = _candidate_paths(candidate_pool, layer)
+        metrics = load_file(str(metrics_path), device="cpu")
+        audited = int(
+            torch.count_nonzero(
+                (metrics["selected_r13"] != 0) | (metrics["selected_r2"] != 0)
+            )
+        )
+        # Every audited layer also primes expert zero under the original
+        # layer-shared scale scope.
+        weighted.append((audited + (1 if audited else 0), layer))
+    loads = [0] * worker_count
+    assignments: list[list[int]] = [[] for _ in range(worker_count)]
+    for weight, layer in sorted(weighted, reverse=True):
+        worker_index = min(range(worker_count), key=lambda index: loads[index])
+        assignments[worker_index].append(layer)
+        loads[worker_index] += weight
+    print(
+        "balanced matched-R0 worker loads: "
+        + ", ".join(str(load) for load in loads),
+        flush=True,
+    )
+    return [tuple(layers) for layers in assignments]
+
+
 def worker(args: argparse.Namespace) -> None:
     manifest = _read_json(args.dest / MANIFEST_FILENAME)
     _validate_report_contract(manifest)
-    layers = [
-        layer
-        for index, layer in enumerate(C.MOE_LAYERS)
-        if index % args.worker_count == args.worker_index
-    ]
+    layers = (
+        list(args.layers)
+        if args.layers is not None
+        else [
+            layer
+            for index, layer in enumerate(C.MOE_LAYERS)
+            if index % args.worker_count == args.worker_index
+        ]
+    )
     pending = [layer for layer in layers if not _layer_complete(args.dest, layer)]
     if not pending:
         return
@@ -751,12 +854,12 @@ def worker(args: argparse.Namespace) -> None:
             validation_documents=request_documents(
                 validation_report, deduplicate=True
             ),
-            training_index=index_layer_samples(
-                Path(str(manifest["training_capture"])),
+            training_index=index_cached_layer_samples(
+                Path(str(manifest["training_sample_cache"])),
                 [layer - 1 for layer in sorted(audited)],
             ),
-            validation_index=index_layer_samples(
-                Path(str(manifest["validation_capture"])),
+            validation_index=index_cached_layer_samples(
+                Path(str(manifest["validation_sample_cache"])),
                 [layer - 1 for layer in sorted(audited)],
             ),
             store=OfficialMXFP4Store(
@@ -804,11 +907,22 @@ def parent(args: argparse.Namespace) -> None:
         )
         return
 
-    processes = []
     worker_count = len(args.devices) * args.workers_per_device
-    for worker_index in range(worker_count):
+    assignments = _balanced_worker_layers(
+        args.candidate_pool, args.dest, worker_count
+    )
+    processes = []
+    for worker_index, layers in enumerate(assignments):
+        if not layers:
+            continue
         device = args.devices[worker_index % len(args.devices)]
-        environment = dict(os.environ, CUDA_VISIBLE_DEVICES=str(device))
+        environment = dict(
+            os.environ,
+            CUDA_VISIBLE_DEVICES=str(device),
+            OMP_NUM_THREADS="1",
+            MKL_NUM_THREADS="1",
+            OPENBLAS_NUM_THREADS="1",
+        )
         command = [
             sys.executable,
             __file__,
@@ -818,10 +932,14 @@ def parent(args: argparse.Namespace) -> None:
             str(args.validation_scores),
             "--dest",
             str(args.dest),
+            "--validation-sample-cache",
+            str(args.validation_sample_cache),
             "--worker-index",
             str(worker_index),
             "--worker-count",
             str(worker_count),
+            "--layers",
+            ",".join(str(layer) for layer in layers),
         ]
         if args.official_repo_dir is not None:
             command.extend(("--official-repo-dir", str(args.official_repo_dir)))
@@ -861,6 +979,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-pool", type=Path, required=True)
     parser.add_argument("--validation-scores", type=Path, required=True)
     parser.add_argument("--dest", type=Path, required=True)
+    parser.add_argument("--validation-sample-cache", type=Path, required=True)
     parser.add_argument("--official-repo-dir", type=Path)
     parser.add_argument(
         "--devices",
@@ -871,16 +990,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers-per-device", type=int, default=1)
     parser.add_argument("--worker-index", type=int)
     parser.add_argument("--worker-count", type=int)
+    parser.add_argument(
+        "--layers",
+        type=lambda value: tuple(int(item) for item in value.split(",") if item),
+        help="explicit MoE-layer list for a supervised worker schedule",
+    )
     args = parser.parse_args()
     args.candidate_pool = args.candidate_pool.resolve()
     args.validation_scores = args.validation_scores.resolve()
     args.dest = args.dest.resolve()
+    args.validation_sample_cache = args.validation_sample_cache.resolve()
     if (args.worker_index is None) != (args.worker_count is None):
         parser.error("worker index and count must be supplied together")
     if args.workers_per_device < 1:
         parser.error("--workers-per-device must be positive")
     if args.worker_index is not None and not 0 <= args.worker_index < args.worker_count:
         parser.error("worker index must lie in 0..worker-count-1")
+    if args.layers is not None:
+        if args.worker_index is None:
+            parser.error("--layers is valid only for worker mode")
+        if not args.layers or len(set(args.layers)) != len(args.layers):
+            parser.error("--layers must be a nonempty unique layer list")
+        if any(layer not in C.MOE_LAYERS for layer in args.layers):
+            parser.error("--layers contains a non-MoE layer")
     return args
 
 

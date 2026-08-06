@@ -30,12 +30,11 @@ from kquant.capture import LayerSamples, load_layer_hessians, load_layer_samples
 from kquant.exl3_loader import load_qsrt_encoder
 from kquant.exl3_reference import decode_exl3_weight
 from kquant.sqg_e4m3 import (
-    SQG_E4M3_CODEBOOKS,
+    SQG_CHEB_NORMAL_E4M3,
     SQG_NORMAL_E4M3,
     sqg_e4m3_bytes,
     sqg_e4m3_bytes_from_rank_lut,
     sqg_e4m3_codebook,
-    sqg_mode_from_codebook,
 )
 from kquant.sqg_quantizer import install_sqg_quantizer
 from kquant.qsrt_candidates import (
@@ -56,10 +55,7 @@ from kquant.tp_simulator import comparison_metrics, situ
 MATRICES = C.EXPERT_MATRICES
 
 
-SQG_CHEB_NORMAL_E4M3 = "sqg-cheb-normal-e4m3"
-STUDY_CODEBOOKS = tuple(
-    dict.fromkeys(SQG_E4M3_CODEBOOKS + (SQG_CHEB_NORMAL_E4M3,))
-)
+STUDY_CODEBOOKS = (SQG_NORMAL_E4M3, SQG_CHEB_NORMAL_E4M3)
 
 
 def _read_json(path: Path) -> dict:
@@ -401,8 +397,8 @@ def _quantize_uniform_matrix(
             .to(dtype=torch.float16)
             .contiguous()
         )
-    elif codebook in SQG_E4M3_CODEBOOKS:
-        mode = sqg_mode_from_codebook(codebook)
+    elif codebook == SQG_NORMAL_E4M3:
+        mode = "normal"
         quant_args["sqg_e4m3_lut"] = sqg_e4m3_bytes(
             bits, mode, device=device
         )
@@ -631,15 +627,31 @@ def _validate_corpus_contract(
     ):
         raise TypeError("corpus fold metadata must be mappings")
     common_fold = ("modulus", "index", "unit")
-    if any(
-        training_fold.get(key) != validation_fold.get(key)
-        for key in common_fold
-    ):
-        raise ValueError("training and validation reports use different folds")
     if training_fold.get("mode") != "exclude":
         raise ValueError("training report must exclude the validation fold")
     if validation_fold.get("mode") != "include":
         raise ValueError("validation report must contain only the validation fold")
+    if training_fold.get("unit") != validation_fold.get("unit"):
+        raise ValueError("training and validation reports use different fold units")
+    training_modulus = int(training_fold.get("modulus", 0))
+    validation_modulus = int(validation_fold.get("modulus", 0))
+    training_index = int(training_fold.get("index", -1))
+    validation_index = int(validation_fold.get("index", -1))
+    # A finer included fold is also disjoint when it is wholly contained in
+    # the coarser fold excluded from training.  For example, validation hash
+    # remainder 0 modulo 8 is a subset of training's excluded remainder 0
+    # modulo 4.  Retain the explicit document-hash overlap check below as the
+    # independent evidence gate.
+    nested_validation_fold = (
+        training_modulus > 0
+        and validation_modulus > 0
+        and validation_modulus % training_modulus == 0
+        and validation_index % training_modulus == training_index
+    )
+    if not nested_validation_fold:
+        raise ValueError(
+            "validation fold is not contained in the fold excluded from training"
+        )
 
     training_requests = request_documents(training_report)
     validation_requests = request_documents(validation_report, deduplicate=True)
@@ -659,7 +671,8 @@ def _validate_corpus_contract(
             len(raw_validation_documents) - len(validation_requests)
         ),
         "document_overlap": 0,
-        "fold": {key: training_fold.get(key) for key in common_fold},
+        "training_fold": {key: training_fold.get(key) for key in common_fold},
+        "validation_fold": {key: validation_fold.get(key) for key in common_fold},
     }
     return provenance, training_requests, validation_requests
 
@@ -758,7 +771,7 @@ def run(args: argparse.Namespace) -> dict:
 
     quantizer_module = load_qsrt_encoder(args.exllamav3_root)
     if any(
-        codebook in SQG_E4M3_CODEBOOKS or codebook == SQG_CHEB_NORMAL_E4M3
+        codebook in STUDY_CODEBOOKS
         for codebook in args.codebooks
     ):
         install_sqg_quantizer(quantizer_module)

@@ -26,6 +26,9 @@ def test_official_store_streams_one_packed_matrix(tmp_path):
 
     store = OfficialMXFP4Store(cache)
     raw = store.load_packed_matrix(1, 7, "w2")
+    with store.open_layer(1, experts=(7,), matrices=("w2",)) as layer_store:
+        layer_raw = layer_store.load_packed_matrix(1, 7, "w2")
+        layer_matrix = layer_store.load_matrix(1, 7, "w2")
     scale_only = store.load_scale_plane(1, 7, "w2")
     streamed_scales = list(
         store.iter_layer_scale_planes(1, experts=(7,), matrices=("w2",))
@@ -34,6 +37,9 @@ def test_official_store_streams_one_packed_matrix(tmp_path):
 
     assert torch.equal(raw.packed, packed)
     assert torch.equal(raw.scale, scales)
+    assert torch.equal(layer_raw.packed, raw.packed)
+    assert torch.equal(layer_raw.scale, raw.scale)
+    assert torch.equal(layer_matrix, matrix)
     assert torch.equal(scale_only, scales)
     assert len(streamed_scales) == 1
     assert streamed_scales[0][:2] == (7, "w2")

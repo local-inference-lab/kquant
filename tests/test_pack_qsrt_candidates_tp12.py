@@ -19,7 +19,9 @@ from scripts.pack_qsrt_candidates_tp12 import (
     _balanced_layer_schedule,
     _bind_candidate_manifest,
     _manifest,
+    _allocate_metrics,
     _merge_scheduled_layer,
+    _layer_rotation_plan,
     _schedule_from_report,
     _schedule_report,
 )
@@ -56,8 +58,53 @@ def test_new_candidate_manifest_freezes_explicit_logical_schema(tmp_path) -> Non
     assert actual["logical_trellis_schema"] == SCHEMA
     assert actual["codebook"] == CODEBOOK_SQG_NORMAL_E4M3
     assert actual["layout"] == "qsrt_guarded_reuse"
+    assert actual["permutation_policy"] == "h2_reverse"
     assert actual["hessian_policy"] == "captured_blend"
+    assert actual["h2_contract"]["indexed_by"] == "expert_r13"
+    assert actual["h2_contract"]["down_candidate_grid"] == "w2_r13_r2"
+    assert actual["h2_contract"]["prior"] == "expert_local_trace_scaled_identity"
+    assert actual["h2_contract"]["unsupported_expert_fallback"] == "identity"
+    assert actual["rotation_draws"] == {
+        "source": "fixed_cli_draws",
+        "fixed": {
+            "residual_draw": 0,
+            "intermediate_default": 0,
+            "intermediate_overrides": {},
+        },
+    }
     assert json.loads(path.read_text()) == actual
+
+
+def test_candidate_manifest_embeds_rotation_plan_contents(tmp_path) -> None:
+    args = _args(tmp_path)
+    args.rotation_plan = tmp_path / "rotations.json"
+    args.rotation_plan.write_text(
+        json.dumps(
+            {
+                "kind": "kquant_qsrt_rotation_plan",
+                "schema_version": 1,
+                "layers": {
+                    "12": {
+                        "residual_draw": 6,
+                        "intermediate_overrides": {"102": 7},
+                    }
+                },
+            }
+        )
+    )
+
+    manifest = _manifest(args)
+    layer_plan = _layer_rotation_plan(args, 12)
+
+    assert manifest["rotation_draws"]["source"] == "model_rotation_plan"
+    assert manifest["rotation_draws"]["plan"]["layers"]["12"] == {
+        "residual_draw": 6,
+        "intermediate_default": 0,
+        "intermediate_overrides": {"102": 7},
+    }
+    assert layer_plan.residual_draw == 6
+    assert layer_plan.intermediate_draw(102) == 7
+    assert layer_plan.intermediate_draw(103) == 0
 
 
 def test_candidate_manifest_rejects_non_schema_drift(tmp_path) -> None:

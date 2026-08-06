@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from kquant.exl3_reference import (
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
+    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
     reconstruct_trellis_states,
 )
@@ -30,6 +31,7 @@ from kquant.qsrt import (
     PHASE1_H13_EXPERT_LOCAL_ALPHA,
     PHASE1_H2_EXPERT_LOCAL_ALPHA,
     PHASE1_H2_LOCAL_BASIS,
+    PHASE1_H2_SHRINKAGE_POLICY,
     PHASE1_MODE_CANDIDATES,
     PHASE1_MODE_IDS,
     PHASE1_SHARED_RATE_MODE,
@@ -128,9 +130,10 @@ def test_qsrt_encoder_policy_is_frozen_to_r012() -> None:
     assert PHASE1_MODE_IDS == (0, 1, 2)
     assert tuple(mode.mode_id for mode in PHASE1_MODE_CANDIDATES) == PHASE1_MODE_IDS
     assert not PHASE1_SHARED_RATE_MODE
-    assert PHASE1_H13_EXPERT_LOCAL_ALPHA == 0.25
+    assert PHASE1_H13_EXPERT_LOCAL_ALPHA == 0.0
     assert PHASE1_H2_EXPERT_LOCAL_ALPHA == 0.75
-    assert PHASE1_H2_LOCAL_BASIS == "official_source_post_situ"
+    assert PHASE1_H2_LOCAL_BASIS == "decoded_candidate_post_situ"
+    assert PHASE1_H2_SHRINKAGE_POLICY == "weighted_oas_scaled_identity"
     assert len(RATE_TRANSFER_MODES) == 3
 
 
@@ -361,6 +364,20 @@ def test_tp12_layer_header_self_identifies_sqg_cheb_e4m3() -> None:
 
     assert decoded == header
     assert decoded.to_manifest()["codebook_id"] == 4
+    assert decoded.to_manifest()["codebook_multiplier"] == 0
+
+
+def test_tp12_layer_header_self_identifies_sqg_cheb_k2_q8h4_w2() -> None:
+    header = TP12LayerHeader(
+        24,
+        TP12LayerLayout(800, 96),
+        codebook=CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
+    )
+
+    decoded = TP12LayerHeader.from_bytes(header.to_bytes())
+
+    assert decoded == header
+    assert decoded.to_manifest()["codebook_id"] == 5
     assert decoded.to_manifest()["codebook_multiplier"] == 0
 
 

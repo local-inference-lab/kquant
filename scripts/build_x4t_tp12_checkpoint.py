@@ -49,6 +49,25 @@ def _receipt_name(layer: int) -> str:
     return f"x4t-tp12-layer-{layer:05d}.json"
 
 
+def _x4t_expert_ids(allocation: dict, layer: int) -> tuple[int, ...]:
+    """Return whole-expert X4T IDs from the frozen allocation schema."""
+
+    qsrt_hybrid_bit_map(allocation)
+    key = "x4t"
+    layers = allocation.get("layers")
+    if not isinstance(layers, dict):
+        raise ValueError("QSRT allocation has no layer inventory")
+    entry = layers.get(str(layer))
+    if not isinstance(entry, dict) or not isinstance(entry.get(key), list):
+        raise ValueError(f"QSRT allocation layer {layer} has no {key} population")
+    result = tuple(int(value) for value in entry[key])
+    if result != tuple(sorted(set(result))):
+        raise ValueError(f"QSRT allocation layer {layer} {key} is noncanonical")
+    if any(value < 0 or value >= C.NUM_EXPERTS for value in result):
+        raise ValueError(f"QSRT allocation layer {layer} {key} is out of range")
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
@@ -70,11 +89,13 @@ def main() -> None:
         return
 
     allocation = _read_json(artifact / QSRT_ALLOCATION_COPY_FILENAME)
-    qsrt_hybrid_bit_map(allocation)
+    # Validate the allocation before touching the destination.  The helper is
+    # also used below so the exact same tier interpretation closes receipts.
+    _x4t_expert_ids(allocation, C.MOE_LAYERS[0])
     selected = C.MOE_LAYERS if args.layers is None else args.layers
     started = time.perf_counter()
     for index, layer in enumerate(selected, start=1):
-        expert_ids = tuple(int(value) for value in allocation["layers"][str(layer)]["x4t"])
+        expert_ids = _x4t_expert_ids(allocation, layer)
         rank_reports = build_x4t_tp12_layer(
             artifact,
             destination,
@@ -108,7 +129,7 @@ def main() -> None:
             )
             return
         receipt = _read_json(path)
-        expected_ids = allocation["layers"][str(layer)]["x4t"]
+        expected_ids = list(_x4t_expert_ids(allocation, layer))
         if receipt.get("layer") != layer or receipt.get("expert_ids") != expected_ids:
             raise ValueError(f"X4T TP12 layer {layer} receipt disagrees with allocation")
         layers[str(layer)] = receipt

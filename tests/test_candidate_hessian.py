@@ -2,12 +2,14 @@ import pytest
 import torch
 
 from kquant.candidate_hessian import (
+    adaptive_identity_shrinkage,
     covariance_comparison,
     partition_documents,
     request_mask,
     shrink_covariance,
     subset_request_documents,
     weighted_covariance,
+    weighted_effective_sample_size,
 )
 
 
@@ -58,6 +60,54 @@ def test_weighted_covariance_rejects_bad_samples(rows, weights, error):
 def test_shrink_covariance_rejects_invalid_alpha():
     with pytest.raises(ValueError, match="alpha"):
         shrink_covariance(torch.eye(2), torch.eye(2), 1.1)
+
+
+def test_weighted_effective_sample_size_tracks_weight_concentration():
+    assert weighted_effective_sample_size(torch.ones(8)) == pytest.approx(8.0)
+    concentrated = weighted_effective_sample_size(
+        torch.tensor([10.0, 1.0, 1.0, 1.0])
+    )
+    assert 1.0 < concentrated < 4.0
+
+
+def test_adaptive_identity_shrinkage_trace_matches_and_respects_cap():
+    rows = torch.tensor(
+        [[1.0, 0.0], [0.0, 2.0], [1.0, 2.0], [-1.0, 1.0]]
+    )
+    weights = torch.ones(4)
+    local, _ = weighted_covariance(
+        rows, weights, device=torch.device("cpu"), return_cpu=False
+    )
+    actual, evidence = adaptive_identity_shrinkage(
+        local, weights, max_local_alpha=0.6
+    )
+
+    assert evidence["effective_sample_size"] == pytest.approx(4.0)
+    assert 0.0 <= evidence["local_alpha"] <= 0.6
+    assert evidence["identity_scale"] == pytest.approx(
+        float(torch.trace(local) / 2)
+    )
+    torch.testing.assert_close(torch.trace(actual), torch.trace(local))
+    torch.testing.assert_close(actual, actual.T)
+
+
+def test_adaptive_identity_shrinkage_has_no_external_covariance_prior():
+    rows = torch.tensor(
+        [[3.0, 0.0], [0.0, 1.0], [2.0, -1.0], [-2.0, 1.0]]
+    )
+    weights = torch.tensor([1.0, 2.0, 1.0, 0.5])
+    local, _ = weighted_covariance(
+        rows, weights, device=torch.device("cpu"), return_cpu=False
+    )
+
+    actual, evidence = adaptive_identity_shrinkage(local, weights)
+    identity_scale = float(torch.trace(local) / local.shape[0])
+    expected = torch.lerp(
+        torch.eye(2) * identity_scale,
+        local,
+        evidence["local_alpha"],
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_document_partition_and_request_mask_are_exact():

@@ -27,7 +27,7 @@ from safetensors.torch import load_file, save_file
 from kquant import constants as C
 from kquant.capture import index_layer_samples, load_capture
 from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3, QSRT_CODEBOOKS
-from kquant.qsrt_candidates import request_documents, select_expert_rows
+from kquant.qsrt_candidates import index_expert_rows, request_documents
 from kquant.pack.qsrt_pool import (
     load_qsrt_candidate_pool,
     validate_candidate_pool_completion,
@@ -133,18 +133,35 @@ def _validate_corpus_contract(
     ):
         raise ValueError("validation report and capture disagree")
 
-    common_fold = ("modulus", "index", "unit")
     training_fold = training_report.get("fold", {})
     validation_fold = validation_report.get("fold", {})
-    if any(
-        training_fold.get(key) != validation_fold.get(key)
-        for key in common_fold
-    ):
-        raise ValueError("training and validation reports use different fold rules")
+    if not isinstance(training_fold, dict) or not isinstance(validation_fold, dict):
+        raise TypeError("corpus fold metadata must be mappings")
+    common_fold = ("modulus", "index", "unit")
     if training_fold.get("mode") != "exclude":
         raise ValueError("training report must exclude the validation fold")
     if validation_fold.get("mode") != "include":
         raise ValueError("validation report must contain only the validation fold")
+    if training_fold.get("unit") != validation_fold.get("unit"):
+        raise ValueError("training and validation reports use different fold units")
+    training_modulus = int(training_fold.get("modulus", 0))
+    validation_modulus = int(validation_fold.get("modulus", 0))
+    training_index = int(training_fold.get("index", -1))
+    validation_index = int(validation_fold.get("index", -1))
+    # An included validation remainder at a finer modulus is a strict subset
+    # of the coarser remainder excluded from training when these congruences
+    # hold.  Keep the explicit document-hash overlap check below as a second,
+    # independent evidence gate.
+    nested_validation_fold = (
+        training_modulus > 0
+        and validation_modulus > 0
+        and validation_modulus % training_modulus == 0
+        and validation_index % training_modulus == training_index
+    )
+    if not nested_validation_fold:
+        raise ValueError(
+            "validation fold is not contained in the fold excluded from training"
+        )
 
     training_documents = request_documents(training_report)
     validation_documents = request_documents(validation_report, deduplicate=True)
@@ -172,7 +189,8 @@ def _validate_corpus_contract(
             validation_requests - len(validation_documents)
         ),
         "document_overlap": 0,
-        "fold": {key: training_fold.get(key) for key in common_fold},
+        "training_fold": {key: training_fold.get(key) for key in common_fold},
+        "validation_fold": {key: validation_fold.get(key) for key in common_fold},
     }
     return provenance, validation_documents
 
@@ -307,46 +325,45 @@ def score_layer(
         C.NUM_EXPERTS,
     ):
         raise ValueError(f"layer {layer} has invalid selection-corpus damage")
-
     samples = resources.sample_index.pop(layer - 1)
+    routed_rows = index_expert_rows(samples, resources.documents)
     metrics = _allocate_metrics(len(resources.documents))
     metrics["selected_r13"].copy_(selected_r13)
     metrics["selected_r2"].copy_(selected_r2)
     metrics["selection_corpus_damage"].copy_(selection_damage)
     started = time.time()
-    with safe_open(candidate_payload, framework="pt", device="cpu") as reader:
-        with torch.inference_mode():
-            for expert in range(C.NUM_EXPERTS):
-                rows = select_expert_rows(
-                    samples, expert, resources.documents
-                )
-                sse, reference, counts = score_selected_expert(
-                    resources.store,
-                    reader,
-                    rows,
-                    resources.documents,
-                    layer=layer,
-                    expert=expert,
-                    r13_mode_id=int(selected_r13[expert]),
-                    r2_mode_id=int(selected_r2[expert]),
-                    device=torch.device("cuda", 0),
-                    logical_trellis_schema=resources.logical_trellis_schema,
-                    codebook=resources.codebook,
-                )
-                metrics["validation_sse"][expert].copy_(sse)
-                metrics["validation_reference_energy"][expert].copy_(reference)
-                metrics["validation_counts"][expert].copy_(counts.to(torch.int32))
-                metrics["validation_gate_square_sum"][expert] = float(
-                    rows.gates.double().square().sum()
-                )
-                metrics[VALIDATION_DAMAGE_METRIC][expert] = sse.sum()
-                del rows, sse, reference, counts
-                elapsed = time.time() - started
-                print(
-                    f"layer {layer} expert {expert}: {expert + 1}/{C.NUM_EXPERTS} "
-                    f"({elapsed / (expert + 1):.1f}s/expert)",
-                    flush=True,
-                )
+    with resources.store.open_layer(layer) as source_store:
+        with safe_open(candidate_payload, framework="pt", device="cpu") as reader:
+            with torch.inference_mode():
+                for expert in range(C.NUM_EXPERTS):
+                    rows = routed_rows.select(expert)
+                    sse, reference, counts = score_selected_expert(
+                        source_store,
+                        reader,
+                        rows,
+                        resources.documents,
+                        layer=layer,
+                        expert=expert,
+                        r13_mode_id=int(selected_r13[expert]),
+                        r2_mode_id=int(selected_r2[expert]),
+                        device=torch.device("cuda", 0),
+                        logical_trellis_schema=resources.logical_trellis_schema,
+                        codebook=resources.codebook,
+                    )
+                    metrics["validation_sse"][expert].copy_(sse)
+                    metrics["validation_reference_energy"][expert].copy_(reference)
+                    metrics["validation_counts"][expert].copy_(counts.to(torch.int32))
+                    metrics["validation_gate_square_sum"][expert] = float(
+                        rows.gates.double().square().sum()
+                    )
+                    metrics[VALIDATION_DAMAGE_METRIC][expert] = sse.sum()
+                    del rows, sse, reference, counts
+                    elapsed = time.time() - started
+                    print(
+                        f"layer {layer} expert {expert}: {expert + 1}/{C.NUM_EXPERTS} "
+                        f"({elapsed / (expert + 1):.1f}s/expert)",
+                        flush=True,
+                    )
     torch.cuda.empty_cache()
 
     _atomic_safetensors(output_metrics, metrics)
@@ -451,7 +468,17 @@ def parent(args: argparse.Namespace) -> None:
     worker_count = NUM_GPUS * args.workers_per_gpu
     for worker_id in range(worker_count):
         device = worker_id % NUM_GPUS
-        environment = dict(os.environ, CUDA_VISIBLE_DEVICES=str(device))
+        # Each worker owns a GPU and only needs host threads for small tensor
+        # bookkeeping.  Letting every process create a full 24-thread OpenMP
+        # team oversubscribes this host by 12x and starves the CUDA submission
+        # threads, turning a ~20 ms expert replay into several seconds.
+        environment = dict(
+            os.environ,
+            CUDA_VISIBLE_DEVICES=str(device),
+            OMP_NUM_THREADS="1",
+            MKL_NUM_THREADS="1",
+            OPENBLAS_NUM_THREADS="1",
+        )
         command = [
             sys.executable,
             __file__,

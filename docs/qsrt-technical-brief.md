@@ -36,9 +36,8 @@ calibration teacher            resident interim EXL3 checkpoint
 encoder objective              expert-stratified dense-H BlockLDLQ + routed replay
 ```
 
-TP4, TP16, SQG tail/zero companders, K5, wider rate ladders, learned
-per-layer tables, and entropy-coded hot streams are deferred.  They are not
-allowed to expand the first checkpoint's search or runtime surface.
+TP4, TP16, alternate companders, wider rate ladders, learned per-layer
+tables, and entropy-coded hot streams are outside the supported v1 surface.
 
 ## Encoder ownership
 
@@ -267,14 +266,11 @@ global allocator minimizes
 sum_e D_e(choice_e) + lambda * sum_e bytes_e(choice_e)
 ```
 
-and sweeps `lambda` to meet the checkpoint budget.  Since X4T sizes vary by
-expert, the old fixed-count top-damage rule is not the final QSRT allocator.
-Candidate generation and X4T cost indexing are reusable, so changing the target
-budget does not require another trellis encode.
-
-An additive solution supplies the initial frontier.  A later layerwise routed-
-mixture replay may refine borderline choices to account for error cancellation
-or reinforcement among co-routed experts.
+and sweeps `lambda` to meet the checkpoint budget. Its endpoint alphabet is
+`qsrt_all` and `x4t_all`; exact trellis, X4T-record, and alignment bytes are
+charged by the same optimizer. Since X4T sizes vary by expert, candidate
+generation and X4T cost indexing remain reusable when the target budget
+changes.
 
 ## Evidence and current quality blocker
 
@@ -345,64 +341,122 @@ dynamic separate-`r13`/`r2` route test and CUDA graph replay pass.  These
 measurements close the synthetic kernel gate; checkpoint-derived route
 fixtures and end-to-end model latency remain pending.
 
-## SQG-Cheb refinement branch
+## Supported reconstruction paths
 
-An investigator-proposed refinement replaces the clipped `R44` normal
-compander with a dyadically range-reduced Chebyshev evaluator synthesized
-against the rounding intervals of the final finite-E4M3 labels.  This is a
-sound implementation technique: the polynomial only has to land inside the
-Voronoi interval that rounds to the intended E4M3 byte, rather than minimize
-real-valued inverse-CDF error.  Exhaustive evaluation of the supplied Q24/Q31
-implementation reproduced every intended L16 normal label.
+QSRT v1 keeps only three named reconstruction profiles:
 
-The coding experiment freezes a stricter contract than the investigator's
-full proposal:
+| Profile | Role | Contract |
+| --- | --- | --- |
+| `sqg-normal-e4m3` | legacy R44 control | clipped R44 normal staircase with native SQG reachability |
+| `sqg-cheb-normal-e4m3` | exact normal control | one full-tail finite-E4M3 normal staircase shared by K2/K3/K4 |
+| `sqg-cheb-normal-k2-q8h4-w2-e4m3` | production profile, ID 5 | the same SQG-Cheb staircase, with Q8H4 K2 reachability only for `w2` |
 
-```text
-rates                         K2, K3, K4 only
-history and syndrome mixers   original SQG constants
-branch permutation            original SQG rule
-phase rule                    original baseline phase for every rate
-rank reconstruction law       one shared normal staircase for every rate
-rate-specific phase edits     prohibited
-K5                            out of scope
-```
+SQG-Cheb uses a dyadically range-reduced Chebyshev evaluator synthesized
+against the rounding intervals of the final finite-E4M3 labels. The evaluator
+only has to land inside the interval that rounds to the intended byte;
+exhaustive validation reproduces all 65,536 L16 labels. The history mixer,
+syndrome mixer, branch permutation, baseline phase rule, and scalar staircase
+are otherwise common across K2, K3, and K4.
 
-The supplied K3 and K4 normal banks produce the same rank-indexed 65,536-byte
-E4M3 staircase.  Applying that one staircase after the existing rank
-permutation therefore defines K2 without inventing K2-specific graph or phase
-semantics.  Relative to clipped R44, 597 of 65,536 rank labels change; the
-important difference is restored tail resolution.  The Chebyshev polynomial
-is a compact way to compute that staircase, while the numerical gain comes
-from the changed full-tail reconstruction law rather than from polynomial
-evaluation by itself.
+Q8H4 changes reachability, not reconstruction values. At physical K2, two
+branch bits still select four outgoing edges. For `w2` only, retained
+codeword bit 4 supplies a virtual third stratum bit, so each state exposes four
+of eight SQG octiles and paired history classes expose all eight. Gate/up K2
+and every K3/K4 path retain native SQG reachability. This remains one
+codebook, with no K2-specific value table and no per-expert codebook selector.
 
-A controlled production-path study compared the two staircases on the same
-24 official-source experts across layers 1, 24, and 40.  It retained the same
-Hadamard transforms, expert-specific scales, captured dense Hessians,
-BlockLDLQ traversal, Viterbi graph, and document-disjoint routed replay:
+The production decision is supported by a confirmation study on 384 unseen,
+support-stratified experts from layers 1, 24, and 40. It used production
+Hadamard ordering, TF32 dense-H BlockLDLQ, decoded-upstream conditional `H2`,
+the complete `R0/R1/R2` grid, and document-disjoint confirmation and external
+validation:
 
-| Rate | Dense-H SSE change | Validation routed SSE change | Validation wins |
+| Complete mode | Validation SSE improvement | Wins | Layer-stratified expert 95% interval |
 | --- | ---: | ---: | ---: |
-| K2 | +0.013% | -0.197% | 9 / 24 |
-| K3 | -0.193% | -0.276% | 17 / 24 |
-| K4 | -0.685% | -0.811% | 22 / 24 |
+| fixed `R0/R1` | +0.04249% | 236 / 384 | crosses zero |
+| fixed `R0/R2` | **+0.13345%** | **269 / 384** | **+0.07707% to +0.19738%** |
+| fixed `R2/R2` | +0.06896% | 260 / 384 | +0.01682% to +0.12203% |
 
-The K4 result is robust enough to remain the leading refinement.  K3 is
-promising.  K2 is not a safe universal replacement: its traffic-weighted
-validation aggregate improves, but its median expert regresses by 0.147% and
-only 9 of 24 experts improve.  The K2/K3/K4 donor-to-recipient curvature is
-essentially unchanged, so the normal Chebyshev law does not by itself create
-a stronger rate-transfer frontier.
+The document-cluster bootstrap for fixed `R0/R2` used 223 active documents
+and produced a +0.07074% to +0.20312% interval. Every fit-support quartile
+improved. The native K2 profile's aggregate fixed `R0/R2` exchange was
+slightly harmful relative to its own `R0/R0`; Q8H4 made it beneficial.
 
-Accordingly, the sealed all-expert v1 pool remains immutable and continues
-using `sqg-l16-normal-r44-v1`.  A later candidate pool may test clipped-R44 at
-K2 with SQG-Cheb at K3/K4, or a small shared source-shape law family, but only
-after full rate-shift counterfactual validation.  The provisional
-normal/mild/spike/zero bank is not frozen: it was tuned on synthetic sources,
-has no supplied K2 design, and adds a mode-selection problem vulnerable to
-winner's curse.  Any such family must use the same graph and phase rule at all
-rates.
+The production encoder contract is therefore profile ID 5, rotation draw
+zero, `h2_reverse`, folded-scale power zero, decoded-upstream conditional
+expert-local `H2`, and TF32 dense-H LDLQ. R44 and base SQG-Cheb remain useful
+controls. Alternate per-rate staircases, companders, and graph variants are
+not supported code paths.
+
+### Offline trellis-encoder optimization
+
+The SM120 offline tile encoder keeps the authoritative 128-symbol context on
+both sides of each 256-value tile.  Its optimized implementation transposes
+each state-indexed SQG byte table into predecessor-major groups so one thread
+loads all K2 or K3 predecessor labels in one vector transaction and all K4
+labels in two.  K2 traceback stores four two-bit decisions per byte, K3 uses a
+768-thread forward pass while preserving the established 512-thread final
+reduction tree, K4 uses a 512-thread/maximum-L1 configuration, and paired
+half-precision comparisons update both paths together.
+
+On 512 production-codebook tiles at C128, median kernel time changed as
+follows on SM120:
+
+| Rate | Previous encoder | Optimized encoder | Reduction |
+| --- | ---: | ---: | ---: |
+| K2 | 7.270 ms | 4.825 ms | 33.64% |
+| K3 | 6.378 ms | 4.015 ms | 37.04% |
+| K4 | 6.054 ms | 3.345 ms | 44.75% |
+
+Safety was checked directly against the preceding CUDA extension in 63 cases
+covering K2/K3/K4, C1/C32/C128, Gaussian/heavy/structured inputs, and the
+production and control E4M3 tables.  Reconstructed values and trellis indices
+were bit-identical in every case.  A complete 20-expert layer-24 endpoint
+study also produced the identical serialized candidate-payload SHA-256 and
+the same selected modes, while wall time fell from about 136 to 89 seconds.
+
+A shorter C32 primer is not part of this optimization.  The initial
+20-expert screening study put every C128 confirmation winner in C32's top
+three, but that is not sufficient evidence for the all-expert pool or a future
+arbitrary-record search.  The current production build remains C128 end to
+end; C32 may be revisited only as a shortlist generator followed by exact C128
+re-encoding after a substantially broader audit.
+
+### Interim all-expert mode-selection evidence
+
+The fresh profile-ID-5 production pool is being built at
+`/models/Kimi-K3-QSRT-CHEB-Q8H4-CANDIDATES-v1`.  At the 2026-08-05 04:59 PDT
+snapshot, 44 complete atomic selection sidecars contained 27,176 unique
+experts across 33 partly or fully represented layers.  A nonzero mode was
+retained only when its paired, document-clustered confirmation lower bound
+cleared the zero-improvement margin.
+
+| Selected `(r13,r2)` | Experts | Share |
+| --- | ---: | ---: |
+| `R0/R0` | 20,485 | 75.379% |
+| `R0/R1` | 266 | 0.979% |
+| `R0/R2` | 894 | 3.290% |
+| `R1/R0` | 125 | 0.460% |
+| `R1/R1` | 974 | 3.584% |
+| `R1/R2` | 2,763 | 10.167% |
+| `R2/R0` | 9 | 0.033% |
+| `R2/R1` | 18 | 0.066% |
+| `R2/R2` | 1,642 | 6.042% |
+
+In aggregate, 6,691 experts, or 24.621%, selected a confirmed nonzero shift.
+The down projection selected R1+ in 6,557 experts (24.128%), while the coupled
+gate/up pair selected R1+ in 5,531 (20.353%).  R2 appeared on at least one
+axis in 5,326 experts (19.598%).  The large `R1/R2` and `R2/R2` populations
+show that the recovered effect is not confined to a few marginal R1 choices:
+the down axis remains the more frequent shifter, and joint `w13`/`w2` shifts
+are also common.
+
+This snapshot is confirmation-stage incidence, not a final model-wide mode
+distribution or a quality result.  The work-balanced schedule makes the set
+of completed layers nonuniform, incomplete sidecars are excluded, untouched
+validation must still verify generalization, and X4T endpoint allocation is a
+separate exact-byte optimization.  Freeze and cite final frequencies only
+after all 82,432 expert selections are sealed.
 
 ## Execution checklist
 
@@ -423,15 +477,11 @@ rates.
 - [x] Close native SQG W4A8 dense/routed execution and measure its full-path
       activation-quantization error and latency against matched W4A16.
 - [x] Seal the 223-document, 128K-token document-disjoint validation capture.
-- [x] Validate the fixed-graph SQG-Cheb normal staircase at K2/K3/K4 on the
-      24-expert production panel; retain it as a refinement branch rather than
-      mutating the sealed all-expert pool.
-- [x] Complete the synthetic unified K2/K3/K4 reconstruction-law study defined in
-      [`sqg-unified-k234-investigator-brief.md`](sqg-unified-k234-investigator-brief.md),
-      with K2 included during fitting and selection rather than extrapolated
-      from K3/K4.
-- [ ] Validate the shared cubic reconstruction law on the frozen production
-      K2/K3/K4 path after this R44/X4T checkpoint closes.
+- [x] Validate R44 and the shared SQG-Cheb normal staircase at K2/K3/K4 on the
+      production path.
+- [x] Confirm and freeze the `w2`-only bit-4 K2 graph on 384 unseen,
+      support-stratified experts with both expert- and document-clustered
+      positive confidence intervals for fixed `R0/R2`.
 - [ ] Score selected candidates on the untouched validation capture and run
       the matched-R0 rate-shift policy audit.
 - [ ] Freeze the global QSRT allocation at the target checkpoint budget.

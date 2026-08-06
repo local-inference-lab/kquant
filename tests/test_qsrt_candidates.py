@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+
+import kquant.pack.qsrt_candidates as packed_candidates
 
 from kquant.capture import LayerSamples
 from kquant.qsrt_candidates import (
     activation_block_contexts,
     functional_sse_by_request,
+    index_expert_rows,
+    layer_fallback_contexts,
     partition_requests,
+    permutation_policy_contexts,
     request_documents,
     select_expert_rows,
     select_phase1_mode,
@@ -15,9 +22,13 @@ from kquant.qsrt_candidates import (
 )
 from kquant.qsrt import INTERMEDIATE_CHANNELS, RECORDS_PER_EXPERT
 from kquant.pack.qsrt_candidates import (
+    _candidate_middle_by_r13,
+    _conditional_h2_by_r13,
     _defer_functional_row_sse,
     _finish_deferred_functional_sse,
+    _folded_intermediate_conditioning,
     _prepare_deferred_functional_rows,
+    _quantize_conditional_down_grid,
 )
 
 
@@ -39,6 +50,27 @@ def _samples() -> LayerSamples:
         mid_experts=torch.tensor([7], dtype=torch.int32),
         mid_split=torch.zeros(1, dtype=torch.int8),
     )
+
+
+def test_input_only_fallback_contexts_cover_all_neuron_groups() -> None:
+    samples = _samples()
+    samples = LayerSamples(
+        **{
+            **samples.__dict__,
+            "mid_values": torch.empty((0, INTERMEDIATE_CHANNELS)),
+            "mid_weights": torch.empty(0),
+            "mid_observations": torch.empty(0, dtype=torch.int64),
+            "mid_experts": torch.empty(0, dtype=torch.int32),
+            "mid_split": torch.empty(0, dtype=torch.int8),
+        }
+    )
+
+    contexts, scores = layer_fallback_contexts(samples, {1: "document"})
+
+    assert contexts.shape == (INTERMEDIATE_CHANNELS // 4,)
+    assert scores.shape == contexts.shape
+    assert torch.equal(torch.unique(contexts), torch.arange(RECORDS_PER_EXPERT))
+    assert torch.bincount(contexts).unique().item() == 32
 
 
 def test_partition_requests_is_disjoint_and_complete() -> None:
@@ -86,6 +118,39 @@ def test_select_expert_rows_preserves_gate_and_request_pairing() -> None:
     assert rows.documents == 2
 
 
+def test_index_expert_rows_matches_individual_selection() -> None:
+    samples = _samples()
+    requests = {1: "first", 3: "third"}
+    index = index_expert_rows(samples, requests, num_experts=10)
+
+    for expert in range(10):
+        expected = select_expert_rows(samples, expert, requests)
+        actual = index.select(expert)
+        torch.testing.assert_close(actual.inputs, expected.inputs)
+        torch.testing.assert_close(actual.gates, expected.gates)
+        torch.testing.assert_close(actual.request_steps, expected.request_steps)
+
+
+def test_index_expert_rows_sums_duplicate_route_gates() -> None:
+    samples = _samples()
+    samples = LayerSamples(
+        **{
+            **samples.__dict__,
+            "input_experts": torch.tensor(
+                [[7, 7], [2, 3], [7, 9]], dtype=torch.int32
+            ),
+        }
+    )
+    requests = {1: "first", 3: "third"}
+
+    expected = select_expert_rows(samples, 7, requests)
+    actual = index_expert_rows(samples, requests, num_experts=10).select(7)
+
+    torch.testing.assert_close(actual.inputs, expected.inputs)
+    torch.testing.assert_close(actual.gates, expected.gates)
+    torch.testing.assert_close(actual.request_steps, expected.request_steps)
+
+
 def test_activation_contexts_rank_complete_four_channel_groups() -> None:
     groups = INTERMEDIATE_CHANNELS // 4
     group_energy = torch.arange(1, groups + 1, dtype=torch.float32)
@@ -101,6 +166,60 @@ def test_activation_contexts_rank_complete_four_channel_groups() -> None:
     assert assignments[:32].tolist() == [0] * 32
     assert assignments[-32:].tolist() == [RECORDS_PER_EXPERT - 1] * 32
     torch.testing.assert_close(scores, group_energy)
+
+
+def test_identity_permutation_policy_keeps_logical_records() -> None:
+    groups = INTERMEDIATE_CHANNELS // 4
+    middle = torch.arange(1, groups + 1, dtype=torch.float32).sqrt().repeat_interleave(4)
+
+    assignments, _scores = permutation_policy_contexts(
+        middle.reshape(1, -1), torch.ones(1), policy="identity"
+    )
+
+    assert assignments[:32].tolist() == [0] * 32
+    assert assignments[-32:].tolist() == [23] * 32
+    assert torch.equal(torch.bincount(assignments), torch.full((24,), 32))
+
+
+@pytest.mark.parametrize(
+    "policy", ("energy_balanced", "stratified_energy_balanced")
+)
+def test_balanced_permutation_policies_are_complete_and_deterministic(policy) -> None:
+    groups = INTERMEDIATE_CHANNELS // 4
+    energy = torch.linspace(0.25, 9.0, groups)
+    middle = energy.sqrt().repeat_interleave(4).reshape(1, -1)
+
+    first, scores = permutation_policy_contexts(
+        middle, torch.ones(1), policy=policy
+    )
+    second, _ = permutation_policy_contexts(middle, torch.ones(1), policy=policy)
+
+    assert torch.equal(first, second)
+    assert torch.equal(torch.bincount(first), torch.full((24,), 32))
+    record_energy = torch.zeros(24).scatter_add_(0, first, scores)
+    if policy == "energy_balanced":
+        assert float(record_energy.max() - record_energy.min()) < 9.0
+    else:
+        assert float(record_energy[-4:].min()) > float(record_energy[:4].max())
+
+
+def test_folded_conditioning_is_grid_aligned_and_constant_per_context() -> None:
+    groups = INTERMEDIATE_CHANNELS // 4
+    contexts = torch.div(torch.arange(groups), 32, rounding_mode="floor")
+    scores = torch.linspace(0.25, 4.0, groups)
+
+    profile = _folded_intermediate_conditioning(
+        scores, contexts, power=0.5
+    )
+
+    assert profile is not None
+    grouped = profile.reshape(-1, 4)
+    assert torch.all(grouped == grouped[:, :1])
+    for context in range(24):
+        values = grouped[contexts == context]
+        assert torch.all(values == values.flatten()[0])
+    grid = torch.tensor([0.85, 0.925, 1.0, 1.075, 1.15])
+    assert torch.all((profile[:, None] - grid[None, :]).abs().min(dim=1).values < 1e-6)
 
 
 def test_functional_sse_is_clustered_by_request() -> None:
@@ -160,6 +279,160 @@ def test_deferred_functional_sse_matches_reference(mask: torch.Tensor) -> None:
         torch.testing.assert_close(actual[key], expected_sse, rtol=0, atol=0)
         torch.testing.assert_close(plan.reference_energy, expected_energy, rtol=0, atol=0)
         assert torch.equal(plan.counts, expected_counts)
+
+
+def test_conditional_h2_uses_each_decoded_upstream_candidate() -> None:
+    inputs = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 0.5]]
+    )
+    gates = torch.tensor([1.0, 0.75, 0.5, 0.25])
+    identity = torch.eye(2)
+    upstream = {
+        "w1": {
+            0: SimpleNamespace(reconstruction=torch.eye(2)),
+            1: SimpleNamespace(reconstruction=2.0 * torch.eye(2)),
+        },
+        "w3": {
+            0: SimpleNamespace(reconstruction=torch.eye(2)),
+            1: SimpleNamespace(reconstruction=torch.tensor([[1.0, 1.0], [0.0, 1.0]])),
+        },
+    }
+    middle = _candidate_middle_by_r13(inputs, upstream, (0, 1))
+    h2_by_r13, evidence = _conditional_h2_by_r13(
+        inputs,
+        gates,
+        torch.ones(4, dtype=torch.bool),
+        middle,
+        global_h13=identity,
+        global_h2=identity,
+        device=torch.device("cpu"),
+        hessian_policy="captured_blend",
+        have_local_support=True,
+    )
+
+    assert set(h2_by_r13) == {0, 1}
+    assert not torch.allclose(h2_by_r13[0], h2_by_r13[1])
+    assert evidence["R0"]["h2_shrinkage_policy"] == (
+        "weighted_oas_scaled_identity"
+    )
+    assert evidence["R1"]["h2_effective_sample_size"] == pytest.approx(
+        evidence["R0"]["h2_effective_sample_size"]
+    )
+
+
+def test_conditional_h2_ignores_pooled_global_h2_values() -> None:
+    inputs = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 0.5]]
+    )
+    gates = torch.tensor([1.0, 0.75, 0.5, 0.25])
+    identity = torch.eye(2)
+    upstream = {
+        "w1": {0: SimpleNamespace(reconstruction=torch.eye(2))},
+        "w3": {0: SimpleNamespace(reconstruction=torch.eye(2))},
+    }
+    middle = _candidate_middle_by_r13(inputs, upstream, (0,))
+
+    baseline, _ = _conditional_h2_by_r13(
+        inputs,
+        gates,
+        torch.ones(4, dtype=torch.bool),
+        middle,
+        global_h13=identity,
+        global_h2=identity,
+        device=torch.device("cpu"),
+        hessian_policy="captured_blend",
+        have_local_support=True,
+    )
+    pooled = torch.tensor([[100.0, 80.0], [80.0, 100.0]])
+    adversarial, _ = _conditional_h2_by_r13(
+        inputs,
+        gates,
+        torch.ones(4, dtype=torch.bool),
+        middle,
+        global_h13=identity,
+        global_h2=pooled,
+        device=torch.device("cpu"),
+        hessian_policy="captured_blend",
+        have_local_support=True,
+    )
+    torch.testing.assert_close(adversarial[0], baseline[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("hessian_policy", ["identity", "captured_blend"])
+def test_conditional_h2_fallback_is_plain_identity(hessian_policy: str) -> None:
+    inputs = torch.tensor([[1.0, 0.0]])
+    gates = torch.ones(1)
+    upstream = {
+        "w1": {0: SimpleNamespace(reconstruction=torch.eye(2))},
+        "w3": {0: SimpleNamespace(reconstruction=torch.eye(2))},
+    }
+    middle = _candidate_middle_by_r13(inputs, upstream, (0,))
+    pooled = torch.tensor([[100.0, 80.0], [80.0, 100.0]])
+
+    actual, evidence = _conditional_h2_by_r13(
+        inputs,
+        gates,
+        torch.ones(1, dtype=torch.bool),
+        middle,
+        global_h13=torch.eye(2),
+        global_h2=pooled,
+        device=torch.device("cpu"),
+        hessian_policy=hessian_policy,
+        have_local_support=hessian_policy == "identity",
+    )
+    torch.testing.assert_close(actual[0], torch.eye(2), rtol=0, atol=0)
+    assert evidence["R0"]["h2_shrinkage_policy"] == "identity_fallback"
+
+
+def test_conditional_down_grid_flattens_r13_times_r2(monkeypatch) -> None:
+    calls = []
+
+    def fake_batch(
+        sources,
+        contexts,
+        *,
+        modes_by_expert,
+        hessians_by_expert,
+        **kwargs,
+    ):
+        calls.append((sources, contexts, modes_by_expert, hessians_by_expert, kwargs))
+        return [
+            {
+                "w2": {
+                    mode.mode_id: (index, mode.mode_id)
+                    for mode in modes
+                }
+            }
+            for index, modes in enumerate(modes_by_expert)
+        ]
+
+    monkeypatch.setattr(
+        packed_candidates, "quantize_qsrt_matrix_expert_batch", fake_batch
+    )
+    modes = (SimpleNamespace(mode_id=0), SimpleNamespace(mode_id=1))
+    hessians = [{0: torch.eye(2), 1: 2.0 * torch.eye(2)}]
+    result = _quantize_conditional_down_grid(
+        [torch.ones(2, 2)],
+        [torch.arange(2)],
+        [modes],
+        hessians,
+        layer=1,
+        device=torch.device("cpu"),
+        shared_scale_scope=object(),
+        quantizer_module=object(),
+        codebook="test",
+        layout="importance_ordered",
+        ldlq_tf32=False,
+        tailbite_context=8,
+    )
+
+    assert len(calls) == 1
+    assert len(calls[0][0]) == 2  # one flattened encode group per r13
+    assert calls[0][3][0]["w2"] is hessians[0][0]
+    assert calls[0][3][1]["w2"] is hessians[0][1]
+    assert set(result[0]) == {0, 1}
+    assert set(result[0][0]) == {0, 1}
+    assert set(result[0][1]) == {0, 1}
 
 
 def test_phase1_mode_requires_independent_confirmation_evidence() -> None:

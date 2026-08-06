@@ -27,6 +27,8 @@ from safetensors.torch import load_file, save_file
 from kquant import constants as C
 from kquant.capture import (
     LayerSampleIndex,
+    LayerSampleCacheIndex,
+    index_cached_layer_samples,
     index_layer_samples,
     load_capture,
     load_layer_hessians,
@@ -39,6 +41,7 @@ from kquant.exl3_reference import (
 )
 from kquant.sqg_quantizer import install_sqg_quantizer
 from kquant.qsrt_candidates import (
+    PERMUTATION_POLICIES,
     PHASE1_BOOTSTRAP_REPLICATES,
     PHASE1_MIN_CONFIRMATION_DOCUMENTS,
     PHASE1_MIN_FIT_DOCUMENTS,
@@ -47,11 +50,19 @@ from kquant.qsrt_candidates import (
     partition_requests,
     request_documents,
 )
+from kquant.qsrt_rotations import (
+    QSRTRotationPlan,
+    QSRTLayerRotationPlan,
+    load_qsrt_rotation_plan,
+)
 from kquant.qsrt import (
     INTERMEDIATE_CHANNELS,
     LATENT_CHANNELS,
     LOGICAL_CANDIDATE_SCHEMAS,
     MATRIX_TRELLIS_BYTES,
+    PHASE1_H2_EXPERT_LOCAL_ALPHA,
+    PHASE1_H2_LOCAL_BASIS,
+    PHASE1_H2_SHRINKAGE_POLICY,
     PHASE1_MODE_IDS,
     SCHEMA as QSRT_SCHEMA,
 )
@@ -64,7 +75,11 @@ from kquant.pack.qsrt_candidates import (
     encode_phase1_expert_batch,
     selected_candidate_tensors,
 )
-from kquant.pack.qsrt_encoder import MIXED_SEARCH_LAYOUTS
+from kquant.pack.qsrt_encoder import (
+    MATRICES,
+    MIXED_SEARCH_LAYOUTS,
+    qsrt_transform_seed_draw,
+)
 from kquant.source_weights import OfficialMXFP4Store
 
 
@@ -77,7 +92,7 @@ KIND = CANDIDATE_POOL_KIND
 class _WorkerResources:
     report: dict
     partition: RequestPartition
-    sample_index: LayerSampleIndex
+    sample_index: LayerSampleIndex | LayerSampleCacheIndex
     store: OfficialMXFP4Store
     quantizer_module: object
 
@@ -135,6 +150,41 @@ def _read_json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise TypeError(f"expected a JSON object in {path}")
     return value
+
+
+def _configured_rotation_plan(args: argparse.Namespace) -> QSRTRotationPlan:
+    cached = getattr(args, "_rotation_plan_data", None)
+    if cached is not None:
+        return cached
+    path = getattr(args, "rotation_plan", None)
+    plan = QSRTRotationPlan() if path is None else load_qsrt_rotation_plan(path)
+    setattr(args, "_rotation_plan_data", plan)
+    return plan
+
+
+def _layer_rotation_plan(
+    args: argparse.Namespace, layer: int
+) -> QSRTLayerRotationPlan:
+    if getattr(args, "rotation_plan", None) is not None:
+        return _configured_rotation_plan(args).for_layer(layer)
+    return QSRTLayerRotationPlan(
+        residual_draw=int(getattr(args, "residual_rotation_draw", 0)),
+        intermediate_default=int(
+            getattr(args, "intermediate_rotation_draw", 0)
+        ),
+    )
+
+
+def _rotation_manifest_contract(args: argparse.Namespace) -> dict[str, object]:
+    if getattr(args, "rotation_plan", None) is None:
+        return {
+            "source": "fixed_cli_draws",
+            "fixed": _layer_rotation_plan(args, C.MOE_LAYERS[0]).to_json(),
+        }
+    return {
+        "source": "model_rotation_plan",
+        "plan": _configured_rotation_plan(args).to_json(),
+    }
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -658,6 +708,15 @@ def _validate_training_contract(
     return report, partition
 
 
+def _validate_sample_cache_contract(sample_cache: Path, capture: Path) -> None:
+    manifest = _read_json(sample_cache / "manifest.json")
+    if manifest.get("kind") != "kquant_layer_sample_cache":
+        raise ValueError(f"{sample_cache} is not a layer sample cache")
+    source = Path(str(manifest.get("source_capture", ""))).resolve()
+    if source != capture.resolve():
+        raise ValueError(f"sample cache capture {source} != {capture.resolve()}")
+
+
 def _load_quantizer_module(root: Path, codebook: str = CODEBOOK_SQG_NORMAL_E4M3):
     # Import only the encoder namespace.  The full exllamav3 package pulls in
     # serving/tokenizer dependencies that are intentionally absent here.
@@ -677,7 +736,7 @@ def _allocate_metrics(
 ) -> dict[str, torch.Tensor]:
     count = len(experts)
     mode_count = len(modes)
-    return {
+    metrics = {
         "expert_ids": torch.tensor(experts, dtype=torch.int16),
         "mode_ids": torch.tensor(modes, dtype=torch.uint8),
         "selected_r13": torch.zeros(count, dtype=torch.uint8),
@@ -712,6 +771,7 @@ def _allocate_metrics(
         # multiply it by route or gate mass a second time.
         OFFICIAL_SOURCE_DAMAGE_METRIC: torch.zeros(count, dtype=torch.float64),
     }
+    return metrics
 
 
 def _store_metrics(
@@ -821,6 +881,8 @@ def encode_layer(
         samples, partition.fit
     )
     device = torch.device("cuda", 0)
+    global_h13 = global_h13.to(device=device, dtype=torch.float32)
+    global_h2 = global_h2.to(device=device, dtype=torch.float32)
     metrics = _allocate_metrics(
         experts,
         args.mode_ids,
@@ -831,6 +893,7 @@ def encode_layer(
     shared_hidden: dict[str, torch.Tensor] = {}
     shared_scale_primer = experts[0] != 0
     primer_candidates = 0
+    rotation_plan = _layer_rotation_plan(args, layer)
     started = time.time()
     with AtomicSafetensorsWriter(
         payload_path,
@@ -856,6 +919,10 @@ def encode_layer(
                 batch_experts = (
                     [0, *actual_experts] if primer_pending else actual_experts
                 )
+            intermediate_draws = {
+                expert: rotation_plan.intermediate_draw(expert)
+                for expert in batch_experts
+            }
             candidates = encode_phase1_expert_batch(
                 store,
                 samples,
@@ -884,6 +951,28 @@ def encode_layer(
                 ldlq_tf32=args.ldlq_tf32,
                 tailbite_context=args.tailbite_context,
                 hessian_policy=args.hessian_policy,
+                permutation_policy=args.permutation_policy,
+                folded_scale_power=args.folded_scale_power,
+                transform_seeds_by_expert=(
+                    None
+                    if not (
+                        rotation_plan.residual_draw
+                        or any(intermediate_draws.values())
+                    )
+                    else {
+                        expert: {
+                            matrix: qsrt_transform_seed_draw(
+                                layer,
+                                matrix,
+                                residual_draw=rotation_plan.residual_draw,
+                                intermediate_draw=intermediate_draws[expert],
+                                expert=expert,
+                            )
+                            for matrix in MATRICES
+                        }
+                        for expert in batch_experts
+                    }
+                ),
             )
             if len(candidates) != len(batch_experts):
                 raise ValueError("expert batch returned the wrong candidate count")
@@ -970,6 +1059,18 @@ def encode_layer(
         "training_report": str(args.training_report.resolve()),
         "hessians": str(args.hessians.resolve()),
         "hessian_policy": args.hessian_policy,
+        "permutation_policy": getattr(args, "permutation_policy", "h2_reverse"),
+        "folded_scale_power": float(getattr(args, "folded_scale_power", 0.0)),
+        "h2_contract": {
+            "basis": PHASE1_H2_LOCAL_BASIS,
+            "indexed_by": "expert_r13",
+            "shrinkage_policy": PHASE1_H2_SHRINKAGE_POLICY,
+            "maximum_local_alpha": PHASE1_H2_EXPERT_LOCAL_ALPHA,
+            "prior": "expert_local_trace_scaled_identity",
+            "unsupported_expert_fallback": "identity",
+            "router_weighting": "applied_gate_squared",
+            "down_candidate_grid": "w2_r13_r2",
+        },
         "selection_contract": {
             "mode_ids": list(args.mode_ids),
             "format_grid": "cartesian_r13_r2",
@@ -994,13 +1095,25 @@ def encode_layer(
             "router_weighting": "applied gate squared inside functional SSE",
             "keep_benefit": "equal to this value; do not apply traffic weighting again",
         },
-        "source_residency": "w1_w3_together_then_w2",
+        "source_residency": "w1_w3_once_then_w2_reused_across_conditional_r13_grid",
         "payload_write": "atomic_bounded_memory_safetensors_stream",
         "logical_trellis_schema": args.logical_trellis_schema,
         "codebook": args.codebook,
         "layout": args.layout,
         "ldlq_tf32": args.ldlq_tf32,
         "tailbite_context": args.tailbite_context,
+        "permutation_policy": args.permutation_policy,
+        "folded_scale_power": args.folded_scale_power,
+        "rotation_draws": {
+            "residual_layer_shared": rotation_plan.residual_draw,
+            "intermediate_expert_private_default": (
+                rotation_plan.intermediate_default
+            ),
+            "intermediate_expert_private_overrides": {
+                str(expert): draw_id
+                for expert, draw_id in rotation_plan.intermediate_overrides
+            },
+        },
         "selected_format_histogram": selected_histogram,
         "shared_hidden_scale_closure": sorted(shared_hidden),
         "shared_scale_primer_expert": 0 if shared_scale_primer else None,
@@ -1187,6 +1300,7 @@ def _merge_scheduled_layer(
             "training_report",
             "hessians",
             "hessian_policy",
+            "h2_contract",
             "selection_contract",
             "damage_contract",
             "source_residency",
@@ -1195,6 +1309,7 @@ def _merge_scheduled_layer(
             "layout",
             "ldlq_tf32",
             "tailbite_context",
+            "rotation_draws",
             "shared_hidden_scale_closure",
             "training_corpus_documents",
         )
@@ -1333,8 +1448,11 @@ def worker(args: argparse.Namespace) -> None:
         capture=args.capture,
         teacher_checkpoint=args.teacher_checkpoint,
     )
-    sample_index = index_layer_samples(
-        args.capture, [layer - 1 for layer in pending_layers]
+    sample_layers = [layer - 1 for layer in pending_layers]
+    sample_index = (
+        index_layer_samples(args.capture, sample_layers)
+        if args.sample_cache is None
+        else index_cached_layer_samples(args.sample_cache, sample_layers)
     )
     resources = _WorkerResources(
         report=report,
@@ -1366,9 +1484,26 @@ def _manifest(args: argparse.Namespace) -> dict:
         "exllamav3_root": str(args.exllamav3_root.resolve()),
         "resident_teacher_checkpoint": str(args.teacher_checkpoint.resolve()),
         "capture": str(args.capture.resolve()),
+        "sample_cache": (
+            None
+            if getattr(args, "sample_cache", None) is None
+            else str(args.sample_cache.resolve())
+        ),
         "training_report": str(args.training_report.resolve()),
         "hessians": str(args.hessians.resolve()),
         "hessian_policy": args.hessian_policy,
+        "permutation_policy": getattr(args, "permutation_policy", "h2_reverse"),
+        "folded_scale_power": float(getattr(args, "folded_scale_power", 0.0)),
+        "h2_contract": {
+            "basis": PHASE1_H2_LOCAL_BASIS,
+            "indexed_by": "expert_r13",
+            "shrinkage_policy": PHASE1_H2_SHRINKAGE_POLICY,
+            "maximum_local_alpha": PHASE1_H2_EXPERT_LOCAL_ALPHA,
+            "prior": "expert_local_trace_scaled_identity",
+            "unsupported_expert_fallback": "identity",
+            "router_weighting": "applied_gate_squared",
+            "down_candidate_grid": "w2_r13_r2",
+        },
         "tp_size": 12,
         "mode_ids": list(args.mode_ids),
         "format_grid": "cartesian_r13_r2",
@@ -1384,7 +1519,10 @@ def _manifest(args: argparse.Namespace) -> dict:
         "external_validation_used": False,
         "damage_metric": OFFICIAL_SOURCE_DAMAGE_METRIC,
         "damage_already_natural_route_and_gate_weighted": True,
-        "random_transform_contract": "layer_matrix_fixed_independent_su_sv_streams",
+        "random_transform_contract": (
+            "layer_shared_residual_draw_expert_private_intermediate_draw"
+        ),
+        "rotation_draws": _rotation_manifest_contract(args),
         "logical_trellis_schema": args.logical_trellis_schema,
         "codebook": args.codebook,
         "layout": getattr(args, "layout", "qsrt_guarded_reuse"),
@@ -1514,6 +1652,10 @@ def parent(args: argparse.Namespace) -> None:
             str(args.hessians),
             "--hessian-policy",
             args.hessian_policy,
+            "--permutation-policy",
+            args.permutation_policy,
+            "--folded-scale-power",
+            str(args.folded_scale_power),
             "--teacher-checkpoint",
             str(args.teacher_checkpoint),
             "--official-revision",
@@ -1528,6 +1670,10 @@ def parent(args: argparse.Namespace) -> None:
             args.layout,
             "--tailbite-context",
             str(args.tailbite_context),
+            "--residual-rotation-draw",
+            str(args.residual_rotation_draw),
+            "--intermediate-rotation-draw",
+            str(args.intermediate_rotation_draw),
             "--min-fit-documents",
             str(args.min_fit_documents),
             "--min-confirmation-documents",
@@ -1547,6 +1693,10 @@ def parent(args: argparse.Namespace) -> None:
             "--work-plan",
             str(schedule_path),
         ]
+        if args.sample_cache is not None:
+            command.extend(("--sample-cache", str(args.sample_cache)))
+        if args.rotation_plan is not None:
+            command.extend(("--rotation-plan", str(args.rotation_plan)))
         if args.official_repo_dir is not None:
             command.extend(("--official-repo-dir", str(args.official_repo_dir)))
         if args.resume:
@@ -1576,6 +1726,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dest", type=Path, required=True)
     parser.add_argument("--capture", type=Path, required=True)
+    parser.add_argument(
+        "--sample-cache",
+        type=Path,
+        help="layer-indexed rank-0 input cache built from the same capture",
+    )
     parser.add_argument("--training-report", type=Path, required=True)
     parser.add_argument("--hessians", type=Path, required=True)
     parser.add_argument(
@@ -1583,8 +1738,26 @@ def parse_args() -> argparse.Namespace:
         choices=HESSIAN_POLICIES,
         default="captured_blend",
         help=(
-            "encoder geometry: captured_blend reproduces the original dense-H "
-            "study; identity is the robust SQG baseline"
+            "encoder geometry: captured_blend uses candidate-specific decoded-"
+            "upstream H2 with adaptive expert-local identity shrinkage; identity "
+            "is the robust SQG baseline"
+        ),
+    )
+    parser.add_argument(
+        "--permutation-policy",
+        choices=PERMUTATION_POLICIES,
+        default="h2_reverse",
+        help=(
+            "common intermediate-neuron record assignment; h2_reverse is "
+            "the established post-SiTU importance ordering"
+        ),
+    )
+    parser.add_argument(
+        "--folded-scale-power",
+        type=float,
+        default=0.0,
+        help=(
+            "metadata-free w1/w3 per-128 conditioning strength; zero disables"
         ),
     )
     parser.add_argument(
@@ -1624,6 +1797,32 @@ def parse_args() -> argparse.Namespace:
         help=(
             "symmetric Viterbi primer symbols on each side of the cyclic "
             "tile boundary (1..128; 128 is the full cyclic search)"
+        ),
+    )
+    parser.add_argument(
+        "--residual-rotation-draw",
+        type=int,
+        default=0,
+        help=(
+            "layer-shared residual-side sign draw; zero reproduces the "
+            "established production transform"
+        ),
+    )
+    parser.add_argument(
+        "--intermediate-rotation-draw",
+        type=int,
+        default=0,
+        help=(
+            "expert-private intermediate-side sign draw; zero reproduces "
+            "the established production transform"
+        ),
+    )
+    parser.add_argument(
+        "--rotation-plan",
+        type=Path,
+        help=(
+            "validated model-wide JSON plan with one residual draw per layer "
+            "and optional expert-private intermediate draw overrides"
         ),
     )
     parser.add_argument("--min-fit-documents", type=int, default=PHASE1_MIN_FIT_DOCUMENTS)
@@ -1678,6 +1877,16 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.cpu_threads < 1:
         parser.error("--cpu-threads must be positive")
+    if not math.isfinite(args.folded_scale_power):
+        parser.error("--folded-scale-power must be finite")
+    if min(args.residual_rotation_draw, args.intermediate_rotation_draw) < 0:
+        parser.error("rotation draw indices must be nonnegative")
+    if args.rotation_plan is not None and (
+        args.residual_rotation_draw or args.intermediate_rotation_draw
+    ):
+        parser.error(
+            "--rotation-plan cannot be combined with nonzero fixed rotation draws"
+        )
     if args.worker is not None and not 0 <= args.worker < NUM_GPUS:
         parser.error("--worker must be in 0..11")
     if args.work_plan is not None and args.worker is None:
@@ -1701,6 +1910,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.sample_cache is not None:
+        _validate_sample_cache_contract(args.sample_cache, args.capture)
     if args.worker is None:
         parent(args)
     else:

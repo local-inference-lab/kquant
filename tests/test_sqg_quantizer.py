@@ -46,3 +46,45 @@ def test_rate_specific_none_dispatches_to_kquant_mcg(monkeypatch) -> None:
     assert not calls
     assert len(procedural_calls) == 1
     assert procedural_calls[0][5:] == (2, 1, 128)
+
+
+def test_sqg_luts_are_transposed_by_predecessor_for_vector_loads(
+    monkeypatch,
+) -> None:
+    calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        sqg_quantizer,
+        "_sqg_temp_buffers",
+        lambda _device, _bits: (torch.empty(0), torch.empty(0)),
+    )
+    monkeypatch.setattr(
+        sqg_quantizer,
+        "_extension",
+        lambda: SimpleNamespace(quantize_tiles_sqg=lambda *args: calls.append(args)),
+    )
+
+    module = SimpleNamespace(quantize_tiles=lambda *_args: "upstream")
+    install_sqg_quantizer(module)
+    tiles = torch.zeros((1, 256), dtype=torch.float32)
+    for bits in (2, 3, 4):
+        raw = torch.arange(65536, dtype=torch.int64).to(torch.uint8)
+        module.quantize_tiles(
+            tiles,
+            {
+                "K": bits,
+                "devices": ["cuda:0"],
+                "sqg_e4m3_lut": raw,
+            },
+        )
+        actual = calls[-1][5]
+        predecessors = 1 << bits
+        out_edge_pairs = (65536 >> bits) // 2
+        expected = (
+            raw.reshape(predecessors, out_edge_pairs, 2)
+            .permute(1, 0, 2)
+            .contiguous()
+            .reshape(-1)
+        )
+        assert torch.equal(actual, expected)
+        assert calls[-1][6:] == (bits, 128)

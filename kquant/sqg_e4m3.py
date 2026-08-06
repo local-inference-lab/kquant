@@ -13,35 +13,14 @@ for reference reconstruction and closure checks.
 from __future__ import annotations
 
 from functools import lru_cache
-import math
 
 import torch
 
 
 SQG_NORMAL_E4M3 = "sqg-normal-e4m3"
 SQG_CHEB_NORMAL_E4M3 = "sqg-cheb-normal-e4m3"
-SQG_TAIL_E4M3 = "sqg-tail-e4m3"
-SQG_E4M3_CODEBOOKS = (
-    SQG_NORMAL_E4M3,
-    SQG_CHEB_NORMAL_E4M3,
-    SQG_TAIL_E4M3,
-)
-
-SQG_K2_LAW_NORMAL = "normal"
-SQG_K2_LAW_ASINH = "asinh"
-SQG_K2_LAW_RATIONAL = "rational"
-SQG_K2_LAW_OUTER_SLOPE = "outer-slope"
-SQG_K2_LAW_NORMAL_CLIPPED = "normal-clipped"
-SQG_K2_LAW_R44_FULL = "r44-full"
-SQG_K2_LAW_R44_CLIPPED = "r44-clipped"
-SQG_K2_LAWS = (
-    SQG_K2_LAW_NORMAL,
-    SQG_K2_LAW_ASINH,
-    SQG_K2_LAW_RATIONAL,
-    SQG_K2_LAW_OUTER_SLOPE,
-    SQG_K2_LAW_NORMAL_CLIPPED,
-    SQG_K2_LAW_R44_FULL,
-    SQG_K2_LAW_R44_CLIPPED,
+SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3 = (
+    "sqg-cheb-normal-k2-q8h4-w2-e4m3"
 )
 
 _TRANSITIONS = 1 << 16
@@ -51,10 +30,10 @@ _Q = (1.0, 2.07630930, -8.08332684, 6.32135736, -1.31208298)
 
 
 def _validate(bits: int, mode: str) -> None:
-    if isinstance(bits, bool) or not isinstance(bits, int) or bits not in (2, 3, 4, 5):
-        raise ValueError("SQG supports integer K2, K3, K4, or K5")
-    if mode not in ("normal", "tail"):
-        raise ValueError("SQG mode must be 'normal' or 'tail'")
+    if isinstance(bits, bool) or not isinstance(bits, int) or bits not in (2, 3, 4):
+        raise ValueError("SQG supports integer K2, K3, or K4")
+    if mode != "normal":
+        raise ValueError("the supported R44 mode is 'normal'")
 
 
 def _mix_width(
@@ -136,12 +115,6 @@ def _sqg_cpu_bytes(bits: int, mode: str) -> torch.Tensor:
         _CLIP, 1.0 - _CLIP
     )
     gaussian = _r44_inverse_normal(probability)
-    if mode == "tail":
-        # The supplied construction uses 5/32 for K3/K4.  K2 is needed by
-        # QSRT's donor arm; retaining the same compander is the least
-        # assumptive extrapolation and is reported separately in validation.
-        beta = 9.0 / 32.0 if bits == 5 else 5.0 / 32.0
-        gaussian = gaussian * (1.0 + beta * gaussian.square())
     values = (1.5 * gaussian).float()
     if not bool(torch.isfinite(values).all()):
         raise RuntimeError("SQG compander produced a non-finite value")
@@ -269,6 +242,7 @@ def sqg_codebook_bytes(
     bits: int,
     codebook: str,
     *,
+    rate_axis: str | None = None,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
     """Return exact state-indexed E4M3 labels for a named SQG codebook."""
@@ -277,8 +251,19 @@ def sqg_codebook_bytes(
         return sqg_e4m3_bytes(bits, "normal", device=device)
     if codebook == SQG_CHEB_NORMAL_E4M3:
         return sqg_cheb_normal_e4m3_bytes(bits).to(device=device).contiguous()
-    if codebook == SQG_TAIL_E4M3:
-        return sqg_e4m3_bytes(bits, "tail", device=device)
+    if codebook == SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3:
+        if rate_axis not in ("k", "n"):
+            raise ValueError(
+                "the w2-only K2-Q8H4 profile requires rate_axis 'k' or 'n'"
+            )
+        rank_lut = sqg_cheb_normal_rank_e4m3_bytes()
+        if bits == 2 and rate_axis == "k":
+            return sqg_k2_eight_stratum_e4m3_bytes_from_rank_lut(
+                rank_lut, history_bit=4, device=device
+            )
+        return sqg_e4m3_bytes_from_rank_lut(
+            bits, rank_lut, device=device
+        ).contiguous()
     raise ValueError(f"unsupported SQG codebook: {codebook!r}")
 
 
@@ -286,6 +271,7 @@ def sqg_codebook(
     bits: int,
     codebook: str,
     *,
+    rate_axis: str | None = None,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
@@ -294,7 +280,7 @@ def sqg_codebook(
     if not dtype.is_floating_point:
         raise TypeError("SQG codebook dtype must be floating point")
     return (
-        sqg_codebook_bytes(bits, codebook, device=device)
+        sqg_codebook_bytes(bits, codebook, rate_axis=rate_axis, device=device)
         .view(torch.float8_e4m3fn)
         .to(dtype=dtype)
         .contiguous()
@@ -302,100 +288,45 @@ def sqg_codebook(
 
 
 @lru_cache(maxsize=None)
-def sqg_k2_tail_compressed_rank_e4m3_bytes(
-    law: str,
-    parameter: float | None = None,
+def sqg_k2_eight_stratum_rank_permutation(
+    history_bit: int = 2,
 ) -> torch.Tensor:
-    """Return a K2 candidate staircase derived from SQG-Cheb normal.
+    """Return a state-conditioned eight-stratum labelling for a K2 trellis.
 
-    ``asinh`` uses ``a * asinh(z / a)``.  ``rational`` uses the globally
-    monotone ``z / sqrt(1 + lambda * z**2)``; the tempting alternative
-    ``z / (1 + lambda * z**2)`` is deliberately excluded because its
-    derivative becomes negative in the tails.  Both candidates preserve unit
-    slope at zero and modify only the scalar rank-to-value law, never SQG's
-    state graph, phase, syndrome, or branch permutation. ``outer-slope`` is
-    the investigator's Q33 family: it leaves the central two K2 quartiles
-    unchanged and multiplies distance beyond ``normal_ppf(0.75)`` by the
-    supplied slope.  The remaining fixed laws isolate endpoint clipping from
-    the R44-versus-exact-normal approximation.
+    The physical graph still appends two branch bits and retains fourteen
+    state bits.  Numerical labelling reinterprets the newest retained history
+    bit plus the two new branch bits as a virtual three-bit stratum selector;
+    the remaining thirteen bits select phase.  A K2 state therefore exposes
+    four of eight strata, while its retained history chooses which four.
+    Globally this is the same bijective rank law used by K3.  ``history_bit``
+    selects which retained physical codeword bit becomes the most-significant
+    virtual stratum bit.  Bit 2 is the newest retained bit and reproduces the
+    exact K3 transition-label function over the unmodified codeword.
     """
 
-    if law not in SQG_K2_LAWS:
-        raise ValueError(f"unsupported SQG K2 law {law!r}; expected {SQG_K2_LAWS}")
-    fixed_laws = {
-        SQG_K2_LAW_NORMAL,
-        SQG_K2_LAW_NORMAL_CLIPPED,
-        SQG_K2_LAW_R44_FULL,
-        SQG_K2_LAW_R44_CLIPPED,
-    }
-    if law in fixed_laws:
-        if parameter is not None:
-            raise ValueError(f"the {law} SQG K2 law has no parameter")
-        if law == SQG_K2_LAW_NORMAL:
-            return sqg_cheb_normal_rank_e4m3_bytes()
-        ranks = torch.arange(_TRANSITIONS, dtype=torch.float64)
-        probability = (ranks + 0.5) / _TRANSITIONS
-        if law in (SQG_K2_LAW_NORMAL_CLIPPED, SQG_K2_LAW_R44_CLIPPED):
-            probability = probability.clamp(_CLIP, 1.0 - _CLIP)
-        if law in (SQG_K2_LAW_R44_FULL, SQG_K2_LAW_R44_CLIPPED):
-            values = 1.5 * _r44_inverse_normal(probability)
-        else:
-            values = 1.5 * torch.special.ndtri(probability)
-        return _finite_e4m3_rank_lut(values)
-    if (
-        parameter is None
-        or isinstance(parameter, bool)
-        or not isinstance(parameter, (int, float))
-        or not math.isfinite(float(parameter))
-        or float(parameter) <= 0.0
-    ):
-        raise ValueError(f"the {law} SQG K2 law requires a positive parameter")
+    if isinstance(history_bit, bool) or not isinstance(history_bit, int):
+        raise TypeError("K2 eight-stratum history bit must be an integer")
+    if not 2 <= history_bit < 16:
+        raise ValueError("K2 eight-stratum history bit must be in [2, 15]")
+    k3_ranks = sqg_rank_permutation(3)
+    if history_bit == 2:
+        return k3_ranks
 
-    ranks = torch.arange(_TRANSITIONS, dtype=torch.float64)
-    probability = (ranks + 0.5) / _TRANSITIONS
-    gaussian = torch.special.ndtri(probability)
-    value = float(parameter)
-    if law == SQG_K2_LAW_ASINH:
-        values = 1.5 * gaussian
-        values = value * torch.asinh(values / value)
-    elif law == SQG_K2_LAW_RATIONAL:
-        values = 1.5 * gaussian
-        values = values / torch.sqrt(1.0 + value * values.square())
-    else:
-        # Q33 is ``outer-slope:1.03125``.  Parameterizing the slope directly
-        # keeps the exact searched E4 staircase reproducible.
-        quartile = float(torch.special.ndtri(torch.tensor(0.75, dtype=torch.float64)))
-        magnitude = gaussian.abs()
-        adjusted = magnitude + (value - 1.0) * torch.clamp(
-            magnitude - quartile, min=0.0
-        )
-        values = 1.5 * gaussian.sign() * adjusted
-    return _finite_e4m3_rank_lut(values)
+    transitions = torch.arange(_TRANSITIONS, dtype=torch.int64)
+    bit_2 = (transitions >> 2) & 1
+    bit_h = (transitions >> history_bit) & 1
+    swap = bit_2 ^ bit_h
+    permuted = transitions ^ (swap << 2) ^ (swap << history_bit)
+    return k3_ranks.index_select(0, permuted).contiguous()
 
 
-def sqg_k4_eight_stratum_rank_permutation() -> torch.Tensor:
-    """Return the K3-aligned eight-stratum labelling for a K4 trellis.
-
-    The physical trellis still consumes four new branch bits and therefore
-    retains K4 path rate and state transitions.  For numerical labelling, the
-    most-significant new bit extends a virtual K3 history and the remaining
-    three bits select one of eight K3 strata.  Each K4 state consequently
-    exposes two history-conditioned choices in every octile.
-
-    Transition codewords are already laid out as ``history12 | branch4``;
-    reinterpreting them as ``history13 | branch3`` is therefore exactly the
-    existing K3 SQG rank permutation over the same 16-bit index space.
-    """
-
-    return sqg_rank_permutation(3)
-
-
-def sqg_k4_eight_stratum_e4m3_bytes_from_rank_lut(
+def sqg_k2_eight_stratum_e4m3_bytes_from_rank_lut(
     rank_lut: torch.Tensor,
     *,
+    history_bit: int = 2,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    """Map a rank staircase onto the K3-aligned eight-stratum K4 labels."""
+    """Map one shared rank staircase onto state-conditioned K2 octiles."""
 
     if rank_lut.dtype != torch.uint8:
         raise TypeError("SQG rank LUT must contain raw uint8 E4M3 labels")
@@ -406,7 +337,7 @@ def sqg_k4_eight_stratum_e4m3_bytes_from_rank_lut(
     if not bool(torch.isfinite(values).all()):
         raise ValueError("SQG rank LUT must contain only finite E4M3 labels")
     return rank_lut.index_select(
-        0, sqg_k4_eight_stratum_rank_permutation()
+        0, sqg_k2_eight_stratum_rank_permutation(history_bit)
     ).to(device=device).contiguous()
 
 
@@ -439,11 +370,3 @@ def sqg_rank_permutation(bits: int) -> torch.Tensor:
     ) & (branches - 1)
     stratum = (7 * (_reverse_low_bits(branch, bits) ^ syndrome)) & (branches - 1)
     return ((stratum << width) | phase).contiguous()
-
-
-def sqg_mode_from_codebook(codebook: str) -> str:
-    if codebook == SQG_NORMAL_E4M3:
-        return "normal"
-    if codebook == SQG_TAIL_E4M3:
-        return "tail"
-    raise ValueError(f"not an SQG codebook: {codebook!r}")

@@ -40,11 +40,33 @@ numerically correct.
 The production rule is:
 
 - build or retain one layer-global `H13`;
-- build `H2[e]` from rows routed to expert `e`;
-- shrink each expert estimate explicitly toward identity according to support;
+- encode each supported `r13` candidate, replay its decoded `w1/w3`, and build
+  `H2[e,r13]` from rows routed to expert `e`;
+- shrink each expert estimate toward its own trace-scaled identity according
+  to support,
+
+  \[
+  \widehat H_{2,e,r13}
+  =\alpha_e H^{sample}_{2,e,r13}
+  +(1-\alpha_e)\frac{\operatorname{tr}(H^{sample}_{2,e,r13})}{d}I;
+  \]
+
 - materialize/factor one expert covariance at a time and discard it after
   encoding; and
 - use identity H for an unsupported expert, never another expert's `H2` basis.
+
+`alpha_e` is estimated from gate-square Kish effective sample size through a
+weighted OAS-style reliability estimate and capped conservatively. A
+layer-global post-SiTU matrix is neither a shrinkage target nor a fallback;
+changing or corrupting one must not change any QSRT candidate.
+
+The reusable offline reduction is deliberately asymmetric. Build all 92
+layer-global `H13` matrices in one tensor-selective pass over rank-zero input
+rows. Store the `H2` identity fallback symbolically, and repack the rank-zero
+inputs/routes/gates into one file per layer. Candidate workers encode and
+decode each `r13` candidate, recompute its post-SiTU rows, and construct only
+the current `(expert,r13)` `H2` on the GPU. They must not rescan or pool the
+TP-sharded teacher-middle capture.
 
 The candidate encoder must report row count, distinct documents, gate-square
 effective sample size, shrinkage, and fallback basis for every assignment.
@@ -174,6 +196,60 @@ Selection must use paired per-document evidence. Coefficient count is not a
 statistical sample size. Report traffic-weighted aggregate error, median,
 upper-tail regressions, high-traffic worst cases, mode frequencies, and
 support-conditioned confidence intervals.
+
+## Interim production-pool confirmation frequencies
+
+The profile-ID-5 pool provides the first broad production-shaped check that
+the conservative selector still finds useful rate shifts after replacing R44
+with SQG-Cheb, adding the `w2` K2 virtual-octile reachability, and making `H2`
+conditional on decoded `r13` candidates.  At the 2026-08-05 04:59 PDT
+snapshot, 44 complete atomic sidecars covered 27,176 unique experts in 33
+partly or fully represented layers:
+
+- 6,691 experts (24.621%) selected a confirmed nonzero `(r13,r2)` mode;
+- 6,557 (24.128%) selected R1+ on `w2`;
+- 5,531 (20.353%) selected R1+ on coupled `w13`; and
+- 5,326 (19.598%) selected R2 on at least one axis.
+
+The exact mode histogram was `R0/R0` 20,485; `R0/R1` 266; `R0/R2` 894;
+`R1/R0` 125; `R1/R1` 974; `R1/R2` 2,763; `R2/R0` 9; `R2/R1` 18; and
+`R2/R2` 1,642.  Every selected nonzero mode in this snapshot cleared the
+paired document-bootstrap confirmation lower-bound gate; rejected proposals
+fell back to `R0/R0`.
+
+Treat this as an interim selector diagnostic, not an estimate with a random
+layer-sampling design.  The pack schedule is work-balanced, split-layer
+sidecars finish at different times, and the represented 33 layers are not a
+uniform sample of the 92 MoE layers.  Any progress report must therefore:
+
+1. count only sidecars marked `complete`;
+2. deduplicate `(layer,expert)` keys across split subsets;
+3. report `w13` and `w2` rates separately as well as the joint histogram; and
+4. avoid extrapolating the 24.621% incidence to the final pool.
+
+Untouched validation remains a verification and damage-estimation stage.  It
+must not be used to retune the modes represented by this confirmation
+snapshot, and the later X4T endpoint allocation must not be conflated with an
+R0/R1/R2 rate-shift decision.
+
+## Permutation and folded-scale screens
+
+The five-policy proposal from the GLM work was reduced to the four distinct
+policies implemented by the Kimi encoder and tested on the 24-expert
+production panel with the frozen `w2` K2-octile profile.  `h2_reverse` had the
+lowest external routed SSE for every fixed `(r13,r2)` mode and for the
+conservatively selected result.  Identity was 0.40% worse at `R0/R0` and
+10.60% worse at `R0/R2`; energy-balanced was 0.92% and 13.10% worse;
+stratified-energy-balanced was 0.15% and 0.52% worse.  The next pool therefore
+keeps `h2_reverse`.
+
+The metadata-free per-128 conditioning grid was then tested at folded-scale
+powers `0`, `0.25`, `0.5`, and `1.0` with all other choices fixed.  Every
+nonzero strength regressed every complete mode.  At `R0/R2`, powers `0.25`,
+`0.5`, and `1.0` increased routed SSE by 0.71%, 1.19%, and 1.77%; their
+conservatively selected results were 0.88%, 1.47%, and 2.02% worse.  The next
+pool uses folded-scale power zero.  This rejects the tested conditioning
+family; it does not prohibit a future differently parameterized scale study.
 
 ## Acceptance gates
 

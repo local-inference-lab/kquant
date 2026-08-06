@@ -180,9 +180,12 @@ sequence is therefore:
 3. Capture canonical post-SiTU `h_e` rows with expert ID, gate, document ID,
    source lane, and observation ID. Keep the natural sampling probability so
    expected-damage estimates can be reweighted correctly.
-4. Build `H2[e]` one expert at a time from its reservoir, apply explicit
-   identity shrinkage, encode the official source weights, and discard the
-   dense factor. Do not persist 82,432 dense 3072-by-3072 matrices.
+4. Encode each supported `r13` candidate, decode its actual stored `w1/w3`,
+   replay the expert reservoir through SiTU, and build `H2[e,r13]` one
+   candidate at a time. Shrink it toward
+   `trace(H2[e,r13]) / 3072 * I`, encode the corresponding `w2` candidates,
+   and discard the dense factor. Do not persist 82,432 dense
+   3072-by-3072 matrices (or three times that many conditional matrices).
 5. Use identity H whenever support, document diversity, effective rank, or
    held-out covariance prediction is inadequate.
 

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from argparse import Namespace
+
 import pytest
 import torch
 
 from scripts.validate_qsrt_codebooks import (
     _compact_functional_evidence,
     _load_sqg_rank_lut,
+    _validate_corpus_contract,
 )
 
 
@@ -61,3 +64,55 @@ def test_load_sqg_rank_lut_rejects_wrong_size(tmp_path) -> None:
     path.write_bytes(b"\0" * 8)
     with pytest.raises(ValueError, match="65,536 bytes"):
         _load_sqg_rank_lut(path)
+
+
+def test_corpus_contract_accepts_validation_fold_nested_in_training_exclusion(
+    tmp_path,
+) -> None:
+    checkpoint = tmp_path / "teacher"
+    training_capture = tmp_path / "training.kqcapture"
+    validation_capture = tmp_path / "validation.kqcapture"
+    args = Namespace(
+        checkpoint=checkpoint,
+        capture=training_capture,
+        validation_capture=validation_capture,
+        training_report=tmp_path / "training.json",
+        validation_report=tmp_path / "validation.json",
+    )
+    common = {
+        "kind": "kquant_interim_calibration_corpus_run",
+        "finalized": True,
+        "model_dir": str(checkpoint),
+    }
+    training = {
+        **common,
+        "capture_dir": str(training_capture),
+        "fold": {
+            "modulus": 4,
+            "index": 0,
+            "mode": "exclude",
+            "unit": "document hash",
+        },
+        "documents": [{"document_hash": "train-document"}],
+    }
+    validation = {
+        **common,
+        "capture_dir": str(validation_capture),
+        "fold": {
+            "modulus": 8,
+            "index": 0,
+            "mode": "include",
+            "unit": "document hash",
+        },
+        "documents": [{"document_hash": "validation-document"}],
+    }
+
+    provenance, training_requests, validation_requests = _validate_corpus_contract(
+        args, training, validation
+    )
+
+    assert provenance["document_overlap"] == 0
+    assert provenance["training_fold"]["modulus"] == 4
+    assert provenance["validation_fold"]["modulus"] == 8
+    assert training_requests == {1: "train-document"}
+    assert validation_requests == {1: "validation-document"}

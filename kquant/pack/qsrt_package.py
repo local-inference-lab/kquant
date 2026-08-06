@@ -8,6 +8,7 @@ from pathlib import Path
 from kquant import constants as C
 from kquant.exl3_reference import (
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
+    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
     QSRT_CODEBOOKS,
 )
@@ -155,6 +156,9 @@ def qsrt_tp12_quantization_config(allocation: dict) -> dict:
     labelling = {
         CODEBOOK_SQG_NORMAL_E4M3: "sqg-l16-normal-r44-v1",
         CODEBOOK_SQG_CHEB_NORMAL_E4M3: "sqg-l16-normal-cheb-v1",
+        CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3: (
+            "sqg-l16-normal-cheb-k2-q8h4-w2-v1"
+        ),
     }[codebook]
 
     return {
@@ -260,6 +264,7 @@ def validate_qsrt_tp12_serve_directory(root: str | Path) -> dict:
             _require_exact_link(root / name, artifact / name)
 
     allocation = _read_json(root / QSRT_ALLOCATION_COPY_FILENAME)
+    allocation_bits = qsrt_hybrid_bit_map(allocation)
     x4t_tp12_manifest = load_x4t_tp12_manifest(x4t_tp12_source)
     if (
         Path(str(x4t_tp12_manifest.get("source_artifact", ""))).resolve()
@@ -278,7 +283,11 @@ def validate_qsrt_tp12_serve_directory(root: str | Path) -> dict:
     for name in shard_names:
         _require_exact_link(root / name, x4t_tp12_source / name)
     for layer in C.MOE_LAYERS:
-        expected_ids = allocation["layers"][str(layer)]["x4t"]
+        expected_ids = [
+            expert
+            for expert, bit in enumerate(allocation_bits[str(layer)])
+            if bit == 4
+        ]
         if x4t_tp12_manifest["layers"][str(layer)].get("expert_ids") != expected_ids:
             raise ValueError(
                 f"X4T TP12 checkpoint layer {layer} disagrees with allocation"

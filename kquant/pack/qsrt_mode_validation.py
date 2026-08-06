@@ -380,7 +380,7 @@ def load_qsrt_mode_validation_scores(
                 not isinstance(item, dict)
                 or item.get("selected_r13") != int(candidate_r13[row, expert])
                 or item.get("selected_r2") != int(candidate_r2[row, expert])
-                or item.get("training_r0_metrics_exact") is not True
+                or item.get("training_r0_structural_evidence_exact") is not True
                 or item.get("shared_hidden_scales_exact") is not True
                 or not isinstance(payload_sha256, str)
                 or len(payload_digest) != 32

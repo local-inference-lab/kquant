@@ -24,11 +24,16 @@ import torch
 
 from kquant.exl3_reference import (
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
+    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
     QSRT_CODEBOOKS,
     decode_qsrt_weight,
 )
-from kquant.sqg_e4m3 import sqg_cheb_normal_e4m3_bytes
+from kquant.sqg_e4m3 import (
+    sqg_cheb_normal_e4m3_bytes,
+    sqg_cheb_normal_rank_e4m3_bytes,
+    sqg_k2_eight_stratum_e4m3_bytes_from_rank_lut,
+)
 
 from kquant.qsrt import (
     CONTEXT_GROUP_CHANNELS,
@@ -142,6 +147,83 @@ class QSRTMatrixPlan:
     physical_tp12_rank_bpw: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class QSRTTransformSeeds:
+    """Independent deterministic sign streams for one matrix transform.
+
+    ``input_sign`` produces ``su`` and ``output_sign`` produces ``sv`` in the
+    local EXL encoder.  The TP12 slab requires the residual-side stream to be
+    layer-shared (w1/w3 input, w2 output), while the opposite intermediate-side
+    stream may be selected per expert.
+    """
+
+    input_sign: int
+    output_sign: int
+
+    def __post_init__(self) -> None:
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (self.input_sign, self.output_sign)
+        ):
+            raise ValueError("QSRT transform seeds must be nonnegative integers")
+
+
+def default_qsrt_transform_seeds(layer: int, matrix: str) -> QSRTTransformSeeds:
+    """Return the established production transform streams unchanged."""
+
+    if not 1 <= layer <= 92:
+        raise ValueError("Kimi-K3 MoE layer must be in 1..92")
+    if matrix not in MATRICES:
+        raise ValueError(f"unknown expert matrix: {matrix}")
+    input_sign = layer * 1_000_000 + MATRICES.index(matrix)
+    return QSRTTransformSeeds(input_sign, input_sign + 499_979)
+
+
+def qsrt_transform_seed_draw(
+    layer: int,
+    matrix: str,
+    *,
+    residual_draw: int = 0,
+    intermediate_draw: int = 0,
+    expert: int | None = None,
+) -> QSRTTransformSeeds:
+    """Derive a reproducible layer-shared/private transform candidate.
+
+    Draw zero is bit-for-bit the established production seed.  Nonzero
+    residual draws alter w1/w3 input signs and w2 output signs and therefore
+    must be selected once per layer.  Nonzero intermediate draws alter the
+    opposite side and are salted by expert ID.
+    """
+
+    if any(
+        isinstance(draw, bool) or not isinstance(draw, int) or draw < 0
+        for draw in (residual_draw, intermediate_draw)
+    ):
+        raise ValueError("rotation draw indices must be nonnegative integers")
+    if intermediate_draw and (
+        expert is None
+        or isinstance(expert, bool)
+        or not isinstance(expert, int)
+        or not 0 <= expert < 896
+    ):
+        raise ValueError("a nonzero intermediate draw requires an expert in 0..895")
+    base = default_qsrt_transform_seeds(layer, matrix)
+    residual_offset = residual_draw * 10_000_019
+    private_offset = 0
+    if intermediate_draw:
+        assert expert is not None
+        private_offset = intermediate_draw * 100_000_007 + expert * 1_000_003
+    if matrix == "w2":
+        return QSRTTransformSeeds(
+            base.input_sign + private_offset,
+            base.output_sign + residual_offset,
+        )
+    return QSRTTransformSeeds(
+        base.input_sign + residual_offset,
+        base.output_sign + private_offset,
+    )
+
+
 @dataclass
 class QSRTMatrixEncoding:
     """One closed physical payload and its canonical-order reconstruction."""
@@ -170,6 +252,8 @@ class QSRTMatrixCandidate:
     tensors: dict[str, torch.Tensor]
     plan: QSRTMatrixPlan
     proxy: float
+    transform_seeds: QSRTTransformSeeds
+    global_scale: float = 1.0
 
 
 @dataclass
@@ -395,12 +479,14 @@ def _qsrt_quant_args(
     sqg_e4m3_luts_by_bits: Mapping[int, torch.Tensor | None] | None = None,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
+    transform_seeds: QSRTTransformSeeds | None = None,
+    g_scale_override: float | None = None,
 ) -> dict[str, object]:
     if codebook not in QSRT_CODEBOOKS:
         raise ValueError(
             f"unsupported QSRT codebook {codebook!r}; expected one of {QSRT_CODEBOOKS}"
         )
-    transform_seed = layer * 1_000_000 + MATRICES.index(matrix)
+    seeds = transform_seeds or default_qsrt_transform_seeds(layer, matrix)
     quant_args: dict[str, object] = {
         # Preserve the established K3 regularization and scale search.  The
         # heterogeneous map controls only the trellis operation.
@@ -409,8 +495,8 @@ def _qsrt_quant_args(
         # format names.
         "mixed_rate_axis": plan.rate_axis,
         "mixed_tile_bits": plan.encoder_tile_bits,
-        "seed": transform_seed,
-        "sv_seed": transform_seed + 499_979,
+        "seed": seeds.input_sign,
+        "sv_seed": seeds.output_sign,
         "sigma_reg": SIGMA_REG,
         "devices": [str(device)],
         "device_ratios": None,
@@ -425,17 +511,37 @@ def _qsrt_quant_args(
         quant_args["sqg_e4m3_mode"] = "normal"
     else:
         if sqg_e4m3_luts_by_bits is None:
-            if codebook != CODEBOOK_SQG_CHEB_NORMAL_E4M3:
+            if codebook == CODEBOOK_SQG_CHEB_NORMAL_E4M3:
+                sqg_e4m3_luts_by_bits = {
+                    bits: sqg_cheb_normal_e4m3_bytes(bits) for bits in (2, 3, 4)
+                }
+            elif codebook == CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3:
+                sqg_e4m3_luts_by_bits = {
+                    bits: sqg_cheb_normal_e4m3_bytes(bits) for bits in (2, 3, 4)
+                }
+                if matrix == "w2":
+                    sqg_e4m3_luts_by_bits[2] = (
+                        sqg_k2_eight_stratum_e4m3_bytes_from_rank_lut(
+                            sqg_cheb_normal_rank_e4m3_bytes(), history_bit=4
+                        )
+                    )
+            else:
                 raise AssertionError("QSRT codebook dispatch is incomplete")
-            sqg_e4m3_luts_by_bits = {
-                bits: sqg_cheb_normal_e4m3_bytes(bits) for bits in (2, 3, 4)
-            }
         if set(sqg_e4m3_luts_by_bits) != {2, 3, 4}:
             raise ValueError("rate-specific SQG LUTs must define K2, K3, and K4")
         quant_args["sqg_e4m3_luts_by_bits"] = dict(sqg_e4m3_luts_by_bits)
     if matrix in ("w1", "w3"):
         quant_args["shared_input_scales_key"] = (shared_scale_scope, matrix)
         quant_args["g_scale_into_sv"] = True
+    if g_scale_override is not None:
+        if (
+            isinstance(g_scale_override, bool)
+            or not isinstance(g_scale_override, (int, float))
+            or not math.isfinite(float(g_scale_override))
+            or float(g_scale_override) <= 0.0
+        ):
+            raise ValueError("g_scale_override must be positive and finite")
+        quant_args["g_scale_override"] = float(g_scale_override)
     return quant_args
 
 
@@ -472,6 +578,9 @@ def quantize_qsrt_matrix_candidates_batched(
     sqg_e4m3_luts_by_bits: Mapping[int, torch.Tensor | None] | None = None,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
+    transform_seeds: Mapping[str, QSRTTransformSeeds] | None = None,
+    intermediate_conditioning: torch.Tensor | None = None,
+    g_scale_override: float | None = None,
 ) -> dict[str, dict[int, QSRTMatrixCandidate]]:
     """Encode same-shape matrices and all requested R modes in one batch.
 
@@ -495,6 +604,9 @@ def quantize_qsrt_matrix_candidates_batched(
         sqg_e4m3_luts_by_bits=sqg_e4m3_luts_by_bits,
         ldlq_tf32=ldlq_tf32,
         tailbite_context=tailbite_context,
+        transform_seeds_by_expert=[transform_seeds or {}],
+        intermediate_conditioning_by_expert=[intermediate_conditioning],
+        g_scale_overrides_by_expert=[g_scale_override],
     )[0]
 
 
@@ -513,6 +625,9 @@ def quantize_qsrt_matrix_expert_batch(
     sqg_e4m3_luts_by_bits: Mapping[int, torch.Tensor | None] | None = None,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
+    transform_seeds_by_expert: list[Mapping[str, QSRTTransformSeeds]] | None = None,
+    intermediate_conditioning_by_expert: list[torch.Tensor | None] | None = None,
+    g_scale_overrides_by_expert: list[float | None] | None = None,
 ) -> list[dict[str, dict[int, QSRTMatrixCandidate]]]:
     """Batch the same projection family across several routed experts.
 
@@ -531,20 +646,46 @@ def quantize_qsrt_matrix_expert_batch(
         or len(hessians_by_expert) != expert_count
     ):
         raise ValueError("expert-batched QSRT inputs must have equal nonzero lengths")
+    if transform_seeds_by_expert is None:
+        transform_seeds_by_expert = [{} for _ in range(expert_count)]
+    elif len(transform_seeds_by_expert) != expert_count:
+        raise ValueError("expert-batched transform seed maps have the wrong length")
+    if intermediate_conditioning_by_expert is None:
+        intermediate_conditioning_by_expert = [None] * expert_count
+    elif len(intermediate_conditioning_by_expert) != expert_count:
+        raise ValueError("expert-batched conditioning profiles have the wrong length")
+    if g_scale_overrides_by_expert is None:
+        g_scale_overrides_by_expert = [None] * expert_count
+    elif len(g_scale_overrides_by_expert) != expert_count:
+        raise ValueError("expert-batched global-scale overrides have the wrong length")
 
-    entries: list[tuple[int, str, torch.Tensor, tuple[ModeSpec, ...]]] = []
+    entries: list[
+        tuple[int, str, torch.Tensor, tuple[ModeSpec, ...], torch.Tensor | None]
+    ] = []
     plans: list[dict[int, QSRTMatrixPlan]] = []
     weights: list[torch.Tensor] = []
     shared_hessians: list[dict[str, object]] = []
     quant_args_groups: list[list[dict[str, object]]] = []
     common_shape: tuple[int, ...] | None = None
 
-    for expert_index, (sources, contexts_raw, modes, hessians) in enumerate(
+    residual_side_seeds: dict[str, int] = {}
+    for expert_index, (
+        sources,
+        contexts_raw,
+        modes,
+        hessians,
+        seed_overrides,
+        conditioning_raw,
+        g_scale_override,
+    ) in enumerate(
         zip(
             sources_by_expert,
             block_contexts_by_expert,
             modes_by_expert,
             hessians_by_expert,
+            transform_seeds_by_expert,
+            intermediate_conditioning_by_expert,
+            g_scale_overrides_by_expert,
         )
     ):
         if not sources or set(sources) != set(hessians):
@@ -566,6 +707,15 @@ def quantize_qsrt_matrix_expert_batch(
             raise ValueError("expert-batched QSRT matrices must share one shape")
 
         contexts = contexts_raw.to(device=device, dtype=torch.long)
+        conditioning = None
+        if conditioning_raw is not None:
+            conditioning = conditioning_raw.to(device=device, dtype=torch.float32)
+            if conditioning.ndim != 1 or conditioning.numel() != INTERMEDIATE_CHANNELS:
+                raise ValueError("intermediate conditioning must cover 3072 channels")
+            if not bool(torch.all(torch.isfinite(conditioning))) or bool(
+                torch.any(conditioning <= 0)
+            ):
+                raise ValueError("intermediate conditioning must be finite and positive")
         for matrix in matrices:
             source = sources[matrix]
             hessian = hessians[matrix]
@@ -576,6 +726,28 @@ def quantize_qsrt_matrix_expert_batch(
                 )
             if matrix in ("w1", "w3") and shared_scale_scope is None:
                 raise ValueError(f"{matrix} requires a shared_scale_scope")
+            unknown_seed_matrices = set(seed_overrides) - set(MATRICES)
+            if unknown_seed_matrices:
+                raise ValueError(
+                    "transform seed map contains unknown matrices: "
+                    f"{sorted(unknown_seed_matrices)}"
+                )
+            seeds = seed_overrides.get(matrix) or default_qsrt_transform_seeds(
+                layer, matrix
+            )
+            if not isinstance(seeds, QSRTTransformSeeds):
+                raise TypeError("transform seed overrides must use QSRTTransformSeeds")
+            residual_seed = (
+                seeds.output_sign if matrix == "w2" else seeds.input_sign
+            )
+            previous_residual_seed = residual_side_seeds.setdefault(
+                matrix, residual_seed
+            )
+            if previous_residual_seed != residual_seed:
+                side = "output" if matrix == "w2" else "input"
+                raise ValueError(
+                    f"{matrix} {side}-sign seed must be layer-shared within a batch"
+                )
             matrix_plans = {
                 mode.mode_id: plan_qsrt_matrix(
                     contexts, mode, matrix=matrix, layout=layout
@@ -593,7 +765,20 @@ def quantize_qsrt_matrix_expert_batch(
                 ):
                     raise ValueError("rate candidates changed the physical neuron order")
             weight, _ = _encoder_weight(source, hessian, reference)
-            entries.append((expert_index, matrix, source, modes))
+            encoder_conditioning = None
+            if conditioning is not None and matrix in ("w1", "w3"):
+                encoder_conditioning = conditioning.index_select(
+                    0, reference.encoder_permutation
+                )
+                blocks = encoder_conditioning.reshape(-1, 128)
+                if not bool(torch.all(blocks == blocks[:, :1])):
+                    raise ValueError(
+                        "folded conditioning must be constant in each Hadamard block"
+                    )
+                weight = weight / encoder_conditioning.unsqueeze(0)
+            entries.append(
+                (expert_index, matrix, source, modes, encoder_conditioning)
+            )
             plans.append(matrix_plans)
             weights.append(weight)
             shared_hessians.append(
@@ -618,6 +803,8 @@ def quantize_qsrt_matrix_expert_batch(
                         sqg_e4m3_luts_by_bits=sqg_e4m3_luts_by_bits,
                         ldlq_tf32=ldlq_tf32,
                         tailbite_context=tailbite_context,
+                        transform_seeds=seeds,
+                        g_scale_override=g_scale_override,
                     )
                     for mode in modes
                 ]
@@ -645,7 +832,10 @@ def quantize_qsrt_matrix_expert_batch(
     ]
     finite_checks: list[torch.Tensor] = []
     finite_labels: list[tuple[int, str, int]] = []
-    for entry_index, ((expert_index, matrix, source, modes), raw_group) in enumerate(
+    for entry_index, (
+        (expert_index, matrix, source, modes, encoder_conditioning),
+        raw_group,
+    ) in enumerate(
         zip(entries, raw_groups)
     ):
         if len(raw_group) != len(modes):
@@ -656,6 +846,19 @@ def quantize_qsrt_matrix_expert_batch(
             encoder_weight = raw["weight_q"]
             if not isinstance(encoder_weight, torch.Tensor):
                 raise ValueError("QSRT batch omitted its reconstruction")
+            candidate_suh = raw["suh"]
+            candidate_svh = raw["svh"]
+            if encoder_conditioning is not None:
+                original_svh = candidate_svh.float()
+                candidate_svh = (
+                    original_svh * encoder_conditioning
+                ).to(torch.float16)
+                ratio = torch.ones_like(original_svh)
+                nonzero = original_svh != 0
+                ratio[nonzero] = (
+                    candidate_svh.float()[nonzero] / original_svh[nonzero]
+                )
+                encoder_weight = encoder_weight * ratio.unsqueeze(0)
             reconstruction = torch.empty_like(source)
             if matrix == "w2":
                 reconstruction[:, plan.encoder_permutation] = encoder_weight.T
@@ -672,9 +875,18 @@ def quantize_qsrt_matrix_expert_batch(
             matrix_result[mode.mode_id] = QSRTMatrixCandidate(
                 reconstruction=reconstruction,
                 encoded=raw["encoded"],
-                tensors={"suh": raw["suh"], "svh": raw["svh"]},
+                tensors={"suh": candidate_suh, "svh": candidate_svh},
                 plan=plan,
                 proxy=proxy,
+                transform_seeds=QSRTTransformSeeds(
+                    input_sign=int(
+                        quant_args_groups[entry_index][0]["seed"]
+                    ),
+                    output_sign=int(
+                        quant_args_groups[entry_index][0]["sv_seed"]
+                    ),
+                ),
+                global_scale=float(raw.get("g_scale", 1.0)),
             )
         result[expert_index][matrix] = matrix_result
     finite = torch.stack(finite_checks).cpu()
@@ -811,7 +1023,6 @@ def finalize_qsrt_matrix_candidate(
     )
     if index_bits != reconstruction.numel() * 3:
         raise ValueError("TP12 QSRT payload is not exactly three trellis bpw")
-    transform_seed = layer * 1_000_000 + MATRICES.index(plan.matrix)
     coding: dict[str, object] = {
         "proxy": candidate.proxy,
         "scale_bits": scale_bits,
@@ -840,8 +1051,8 @@ def finalize_qsrt_matrix_candidate(
             "suh" if plan.matrix == "w2" else "svh"
         ),
         "transform_seeds": {
-            "input_sign": transform_seed,
-            "output_sign": transform_seed + 499_979,
+            "input_sign": candidate.transform_seeds.input_sign,
+            "output_sign": candidate.transform_seeds.output_sign,
         },
     }
     return QSRTMatrixEncoding(
@@ -870,6 +1081,7 @@ def quantize_qsrt_matrix(
     codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
+    transform_seeds: QSRTTransformSeeds | None = None,
 ) -> QSRTMatrixEncoding:
     """Run dense-H heterogeneous LDLQ and close the stored TP12 payload.
 
@@ -922,7 +1134,7 @@ def quantize_qsrt_matrix(
             device=device,
         )
         shared_h = shared_h_data
-    transform_seed = layer * 1_000_000 + MATRICES.index(matrix)
+    seeds = transform_seeds or default_qsrt_transform_seeds(layer, matrix)
     quant_args = _qsrt_quant_args(
         plan,
         matrix=matrix,
@@ -932,6 +1144,7 @@ def quantize_qsrt_matrix(
         codebook=codebook,
         ldlq_tf32=ldlq_tf32,
         tailbite_context=tailbite_context,
+        transform_seeds=seeds,
     )
 
     packed_holder: dict[str, PackedTP12Trellis] = {}
@@ -1071,8 +1284,8 @@ def quantize_qsrt_matrix(
             "suh" if matrix == "w2" else "svh"
         ),
         "transform_seeds": {
-            "input_sign": transform_seed,
-            "output_sign": transform_seed + 499_979,
+            "input_sign": seeds.input_sign,
+            "output_sign": seeds.output_sign,
         },
     }
     return QSRTMatrixEncoding(
@@ -1099,6 +1312,7 @@ def quantize_qsrt_expert(
     codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
+    transform_seeds: Mapping[str, QSRTTransformSeeds] | None = None,
 ) -> QSRTExpertEncoding:
     """Encode all three expert matrices with one physical neuron order."""
 
@@ -1128,6 +1342,7 @@ def quantize_qsrt_expert(
             codebook=codebook,
             ldlq_tf32=ldlq_tf32,
             tailbite_context=tailbite_context,
+            transform_seeds=(transform_seeds or {}).get(matrix),
         )
         for matrix in MATRICES
     }

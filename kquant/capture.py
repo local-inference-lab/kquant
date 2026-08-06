@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file as load_torch_file
 from safetensors.torch import save_file as save_torch_file
 
@@ -23,7 +24,8 @@ from kquant import constants as C
 from kquant.io.stats_bundle import save_stats_bundle
 
 CAPTURE_SCHEMA_VERSION = 2
-HESSIAN_SCHEMA_VERSION = 1
+HESSIAN_SCHEMA_VERSION = 2
+SAMPLE_CACHE_SCHEMA_VERSION = 1
 _RANK_RE = re.compile(r"rank-(\d+)$")
 
 
@@ -416,6 +418,56 @@ class LayerSampleIndex:
         )
 
 
+@dataclass
+class LayerSampleCacheIndex:
+    """Lazy reader for a layer-indexed, input-only calibration cache."""
+
+    path: Path
+    geometry: CaptureGeometry
+    entries: dict[str, dict]
+    remaining: set[int]
+
+    def pop(self, layer: int) -> LayerSamples:
+        if layer not in self.remaining:
+            raise ValueError(f"MoE layer row {layer} is absent or already consumed")
+        entry = self.entries.get(str(layer + 1))
+        if entry is None:
+            raise ValueError(f"sample cache has no MoE layer row {layer}")
+        tensors = load_torch_file(str(self.path / entry["file"]), device="cpu")
+        required = (
+            "input.values",
+            "input.weight",
+            "input.observation",
+            "input.experts",
+            "input.gates",
+            "input.split",
+            "input.routed_latent",
+        )
+        missing = [key for key in required if key not in tensors]
+        if missing:
+            raise ValueError(f"cached layer {layer} is missing {missing}")
+        self.remaining.remove(layer)
+        return LayerSamples(
+            input_values=tensors["input.values"],
+            input_weights=tensors["input.weight"],
+            input_observations=tensors["input.observation"],
+            input_experts=tensors["input.experts"],
+            input_gates=tensors["input.gates"],
+            input_split=tensors["input.split"],
+            routed_latent=tensors["input.routed_latent"],
+            # Teacher middle rows are deliberately excluded.  The production
+            # candidate path recomputes official-source post-SiTU rows and
+            # uses identity ordering when an expert has no routed support.
+            mid_values=torch.empty(
+                (0, self.geometry.intermediate_size), dtype=torch.bfloat16
+            ),
+            mid_weights=torch.empty(0, dtype=torch.float32),
+            mid_observations=torch.empty(0, dtype=torch.int64),
+            mid_experts=torch.empty(0, dtype=torch.int32),
+            mid_split=torch.empty(0, dtype=torch.int8),
+        )
+
+
 def _group_sample_part(
     values: dict[str, torch.Tensor],
     prefix: str,
@@ -678,6 +730,183 @@ def _accumulate_hessian(
     return accumulator, denominator
 
 
+def _request_step_mask(
+    observations: torch.Tensor,
+    *,
+    request_step_min: int,
+    request_step_max: int | None,
+    request_steps: list[int] | None,
+) -> torch.Tensor:
+    """Return the authenticated request-epoch mask for captured observations."""
+
+    steps = torch.bitwise_right_shift(observations.to(torch.int64), 32)
+    selected = steps >= request_step_min
+    if request_step_max is not None:
+        selected &= steps <= request_step_max
+    if request_steps is not None:
+        allowed = torch.tensor(request_steps, dtype=steps.dtype)
+        selected &= torch.isin(steps, allowed)
+    return selected
+
+
+def _build_h13_identity_h2_streaming(
+    capture_path: str | Path,
+    output: Path,
+    *,
+    root: dict,
+    geometry: CaptureGeometry,
+    ranks: list[RankCapture],
+    selected: list[int],
+    device: torch.device,
+    min_rows: int,
+    sample_split: str,
+    request_step_min: int,
+    request_step_max: int | None,
+    request_steps: list[int] | None,
+) -> Path:
+    """Build all requested H13 matrices in one tensor-selective rank-0 pass.
+
+    The production H2 prior is identity.  Expert-local H2 matrices are rebuilt
+    just in time from official-source post-SiTU rows, so reading or pooling the
+    TP-sharded teacher ``mid.values`` here would be both wasteful and
+    semantically wrong.
+    """
+
+    rank_zero = next((capture for capture in ranks if capture.rank == 0), None)
+    if rank_zero is None:
+        raise ValueError("capture has no rank-zero input samples")
+    selected_set = set(selected)
+    split_values = {"train": 0, "validation": 1, "all": None}
+    split_value = split_values[sample_split]
+    accumulators = {
+        layer: torch.zeros(
+            (geometry.input_size, geometry.input_size),
+            dtype=torch.float32,
+            device=device,
+        )
+        for layer in selected
+    }
+    denominators = {layer: 0.0 for layer in selected}
+    rows = {layer: 0 for layer in selected}
+    total_rows = {layer: 0 for layer in selected}
+    validation_rows = {layer: 0 for layer in selected}
+    required = (
+        "input.layer",
+        "input.values",
+        "input.weight",
+        "input.observation",
+        "input.split",
+    )
+
+    for part in rank_zero.sample_parts():
+        with safe_open(str(part), framework="pt", device="cpu") as handle:
+            keys = set(handle.keys())
+            missing = [key for key in required if key not in keys]
+            if missing:
+                raise ValueError(f"sample part {part} is missing {missing}")
+            part_layers = handle.get_tensor("input.layer").to(torch.int64)
+            part_split = handle.get_tensor("input.split").to(torch.int8)
+            observations = handle.get_tensor("input.observation").to(torch.int64)
+            weights = handle.get_tensor("input.weight").to(torch.float32)
+            if not (
+                part_layers.ndim == part_split.ndim == observations.ndim == weights.ndim == 1
+                and part_layers.numel()
+                == part_split.numel()
+                == observations.numel()
+                == weights.numel()
+            ):
+                raise ValueError(f"sample part {part} has invalid input metadata")
+            values = handle.get_tensor("input.values")
+            if tuple(values.shape) != (part_layers.numel(), geometry.input_size):
+                raise ValueError(f"sample part {part} has invalid input.values shape")
+            if not bool(torch.all((part_split == 0) | (part_split == 1))):
+                raise ValueError(f"sample part {part} has invalid input split labels")
+            epoch_mask = _request_step_mask(
+                observations,
+                request_step_min=request_step_min,
+                request_step_max=request_step_max,
+                request_steps=request_steps,
+            )
+            for raw_layer in torch.unique(part_layers).tolist():
+                layer = int(raw_layer)
+                if layer not in selected_set:
+                    continue
+                layer_mask = part_layers == layer
+                total_rows[layer] += int(layer_mask.sum())
+                validation_rows[layer] += int((layer_mask & (part_split == 1)).sum())
+                mask = layer_mask & epoch_mask
+                if split_value is not None:
+                    mask &= part_split == split_value
+                indices = torch.nonzero(mask, as_tuple=False).flatten()
+                if not indices.numel():
+                    continue
+                x = values.index_select(0, indices).to(
+                    device=device, dtype=torch.float32
+                )
+                w = weights.index_select(0, indices).to(
+                    device=device, dtype=torch.float32
+                )
+                accumulators[layer].addmm_(x.T, x * w[:, None])
+                denominators[layer] += float(w.double().sum())
+                rows[layer] += int(indices.numel())
+
+    layer_meta: dict[str, dict] = {}
+    for layer in selected:
+        if rows[layer] < min_rows:
+            raise ValueError(
+                f"layer {layer} has too few H13 rows: {rows[layer]}, minimum={min_rows}"
+            )
+        if denominators[layer] <= 0:
+            raise ValueError(f"layer {layer} has a non-positive H13 denominator")
+        h13 = accumulators.pop(layer).div_(denominators[layer])
+        h13 = ((h13 + h13.T) * 0.5).cpu().contiguous()
+        layer_path = output / f"layer-{layer + 1:05d}.safetensors"
+        tmp = output / f".{layer_path.name}.tmp"
+        save_torch_file({"w13": h13}, str(tmp))
+        tmp.replace(layer_path)
+        layer_meta[str(layer + 1)] = {
+            "row": layer,
+            "w13_rows": rows[layer],
+            "w13_total_rows": total_rows[layer],
+            "w13_validation_rows": validation_rows[layer],
+            "w13_weight_sum": denominators[layer],
+            "w2_prior": "identity",
+            "w2_rows": 0,
+            "file": layer_path.name,
+        }
+
+    manifest = {
+        "schema_version": HESSIAN_SCHEMA_VERSION,
+        "kind": "kquant_dense_hessians",
+        "model": root.get("model", C.MODEL_ID),
+        "revision": root.get("revision", C.REVISION),
+        "run_id": root.get("run_id"),
+        "source_capture": str(Path(capture_path).resolve()),
+        "weighting": "gate_square",
+        "normalization": "sum(weight * x xT) / sum(weight)",
+        "sample_split": sample_split,
+        "h13_policy": "captured_layer_global",
+        "h2_policy": "identity_prior_expert_local_jit",
+        "request_step_range": {
+            "minimum_inclusive": request_step_min,
+            "maximum_inclusive": request_step_max,
+            "encoding": "observation_id >> 32",
+        },
+        "request_step_filter": request_steps,
+        "geometry": {
+            "num_layers": geometry.num_layers,
+            "input_size": geometry.input_size,
+            "intermediate_size": geometry.intermediate_size,
+        },
+        "layers": layer_meta,
+    }
+    manifest_path = output / "manifest.json"
+    tmp = output / ".manifest.json.tmp"
+    tmp.write_text(json.dumps(manifest, indent=1))
+    tmp.replace(manifest_path)
+    return output
+
+
 def _load_input_layer_samples(
     index: _SampleIndex, layer: int
 ) -> _SamplePart:
@@ -771,6 +1000,147 @@ def index_layer_samples(
     )
 
 
+def build_layer_sample_cache(
+    capture_path: str | Path,
+    output_path: str | Path,
+    *,
+    layers: Iterable[int] | None = None,
+) -> Path:
+    """Repack rank-0 route/input rows into one directly addressable file per layer."""
+
+    root, geometry, ranks = load_capture(capture_path, load_stats=False)
+    rank_zero = next((capture for capture in ranks if capture.rank == 0), None)
+    if rank_zero is None:
+        raise ValueError("capture has no rank-zero input samples")
+    selected = (
+        list(range(geometry.num_layers))
+        if layers is None
+        else sorted({int(layer) for layer in layers})
+    )
+    if not selected or any(not 0 <= layer < geometry.num_layers for layer in selected):
+        raise ValueError("sample-cache layers are empty or out of range")
+    output = Path(output_path)
+    if not output.name.endswith(".kqsamples"):
+        output = output.with_name(output.name + ".kqsamples")
+    if output.exists():
+        raise FileExistsError(f"sample cache destination already exists: {output}")
+    output.mkdir(parents=True)
+
+    required = (
+        "input.values",
+        "input.weight",
+        "input.observation",
+        "input.experts",
+        "input.gates",
+        "input.split",
+        "input.routed_latent",
+        "input.layer",
+    )
+    selected_set = set(selected)
+    grouped: _SampleIndex = {}
+    try:
+        for part in rank_zero.sample_parts():
+            with safe_open(str(part), framework="pt", device="cpu") as handle:
+                keys = set(handle.keys())
+                missing = [key for key in required if key not in keys]
+                if missing:
+                    raise ValueError(f"sample part {part} is missing {missing}")
+                values = {key: handle.get_tensor(key) for key in required}
+            _append_grouped(
+                grouped,
+                _group_sample_part(
+                    values,
+                    "input",
+                    selected_set,
+                    path=part,
+                    geometry=geometry,
+                ),
+            )
+
+        entries: dict[str, dict] = {}
+        for layer in selected:
+            samples = _load_input_layer_samples(grouped, layer)
+            assert samples.route_experts is not None
+            assert samples.route_gates is not None
+            assert samples.split is not None
+            assert samples.routed_latent is not None
+            layer_path = output / f"layer-{layer + 1:05d}.safetensors"
+            tmp = output / f".{layer_path.name}.tmp"
+            save_torch_file(
+                {
+                    "input.values": samples.values.contiguous(),
+                    "input.weight": samples.weights.contiguous(),
+                    "input.observation": samples.observations.contiguous(),
+                    "input.experts": samples.route_experts.contiguous(),
+                    "input.gates": samples.route_gates.contiguous(),
+                    "input.split": samples.split.contiguous(),
+                    "input.routed_latent": samples.routed_latent.contiguous(),
+                },
+                str(tmp),
+            )
+            tmp.replace(layer_path)
+            entries[str(layer + 1)] = {
+                "row": layer,
+                "rows": int(samples.values.shape[0]),
+                "validation_rows": int((samples.split == 1).sum()),
+                "file": layer_path.name,
+            }
+
+        manifest = {
+            "schema_version": SAMPLE_CACHE_SCHEMA_VERSION,
+            "kind": "kquant_layer_sample_cache",
+            "model": root.get("model", C.MODEL_ID),
+            "revision": root.get("revision", C.REVISION),
+            "run_id": root.get("run_id"),
+            "source_capture": str(Path(capture_path).resolve()),
+            "contents": "rank0_route_input_rows_no_teacher_middle",
+            "geometry": {
+                "num_layers": geometry.num_layers,
+                "num_experts": geometry.num_experts,
+                "input_size": geometry.input_size,
+                "intermediate_size": geometry.intermediate_size,
+                "top_k": geometry.top_k,
+            },
+            "layers": entries,
+        }
+        tmp = output / ".manifest.json.tmp"
+        tmp.write_text(json.dumps(manifest, indent=1))
+        tmp.replace(output / "manifest.json")
+    except Exception:
+        # Keep a missing manifest as an unmistakable incomplete-cache marker.
+        raise
+    return output
+
+
+def index_cached_layer_samples(
+    cache_path: str | Path, layers: Iterable[int]
+) -> LayerSampleCacheIndex:
+    """Open selected layer files lazily from a repacked input sample cache."""
+
+    path = Path(cache_path)
+    manifest = _read_json(path / "manifest.json")
+    if manifest.get("kind") != "kquant_layer_sample_cache":
+        raise ValueError(f"{path} is not a layer sample cache")
+    if int(manifest.get("schema_version", 0)) != SAMPLE_CACHE_SCHEMA_VERSION:
+        raise ValueError(f"unsupported layer sample cache schema in {path}")
+    geometry = CaptureGeometry.from_manifest(manifest)
+    selected = {int(layer) for layer in layers}
+    if not selected or any(not 0 <= layer < geometry.num_layers for layer in selected):
+        raise ValueError("cached sample layers are empty or out of range")
+    entries = manifest.get("layers")
+    if not isinstance(entries, dict):
+        raise ValueError("sample cache manifest has no layer index")
+    missing = [layer for layer in selected if str(layer + 1) not in entries]
+    if missing:
+        raise ValueError(f"sample cache lacks layer rows {missing}")
+    return LayerSampleCacheIndex(
+        path=path,
+        geometry=geometry,
+        entries=entries,
+        remaining=selected,
+    )
+
+
 def load_layer_samples(capture_path: str | Path, layer: int) -> LayerSamples:
     """Load one zero-based MoE layer with all route-aware sample metadata."""
 
@@ -789,8 +1159,14 @@ def build_hessians(
     request_step_min: int = 0,
     request_step_max: int | None = None,
     request_steps: Iterable[int] | None = None,
+    h2_policy: str = "identity_prior",
 ) -> Path:
-    """Build normalized dense per-layer H13/H2 matrices from raw samples."""
+    """Build production H13 bundles with a symbolic identity H2 prior.
+
+    ``diagnostic_captured_global`` is retained only to test TP joins and to
+    quantify why pooled post-SiTU coordinates are invalid. Candidate encoding
+    never uses its H2 values as a prior or fallback.
+    """
 
     if request_step_min < 0:
         raise ValueError("request_step_min must be non-negative")
@@ -803,6 +1179,11 @@ def build_hessians(
         not selected_request_steps or selected_request_steps[0] < 0
     ):
         raise ValueError("request_steps must be a nonempty set of nonnegative epochs")
+    if h2_policy not in {"diagnostic_captured_global", "identity_prior"}:
+        raise ValueError(
+            "h2_policy must be 'identity_prior' or "
+            "'diagnostic_captured_global'"
+        )
 
     root, geometry, ranks = load_capture(capture_path, load_stats=False)
     output = Path(output_path)
@@ -817,6 +1198,21 @@ def build_hessians(
         raise ValueError("sample_split must be 'train', 'validation', or 'all'")
     split_value = split_values[sample_split]
     target_device = torch.device(device)
+    if h2_policy == "identity_prior":
+        return _build_h13_identity_h2_streaming(
+            capture_path,
+            output,
+            root=root,
+            geometry=geometry,
+            ranks=ranks,
+            selected=selected,
+            device=target_device,
+            min_rows=min_rows,
+            sample_split=sample_split,
+            request_step_min=request_step_min,
+            request_step_max=request_step_max,
+            request_steps=selected_request_steps,
+        )
     input_index, mid_indices = _index_samples(ranks, set(selected), geometry)
     layer_meta: dict[str, dict] = {}
     for layer in selected:
@@ -910,6 +1306,8 @@ def build_hessians(
         "weighting": "gate_square",
         "normalization": "sum(weight * x xT) / sum(weight)",
         "sample_split": sample_split,
+        "h13_policy": "captured_layer_global",
+        "h2_policy": "diagnostic_invalid_layer_global",
         "request_step_range": {
             "minimum_inclusive": request_step_min,
             "maximum_inclusive": request_step_max,
@@ -943,4 +1341,7 @@ def load_layer_hessians(
     if entry is None:
         raise KeyError(f"Hessian bundle {path} has no decoder layer {layer}")
     tensors = load_torch_file(str(path / entry["file"]), device="cpu")
+    if entry.get("w2_prior") == "identity":
+        intermediate_size = int(manifest["geometry"]["intermediate_size"])
+        return tensors["w13"], torch.eye(intermediate_size, dtype=torch.float32)
     return tensors["w13"], tensors["w2"]

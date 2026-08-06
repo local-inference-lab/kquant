@@ -25,6 +25,11 @@ from scripts.validate_qsrt_b12x_tp12 import (
             "exl3_trellis_sqg_cheb_e4m3",
             {},
         ),
+        (
+            "sqg-cheb-normal-k2-q8h4-w2-e4m3",
+            "exl3_trellis_sqg_cheb_k2_q8h4_w2_e4m3",
+            {},
+        ),
     ),
 )
 def test_b12x_codebook_contract_selects_exact_procedural_marker(

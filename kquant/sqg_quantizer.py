@@ -16,7 +16,7 @@ from kquant.sqg_e4m3 import sqg_e4m3_bytes
 def _extension():
     project = Path(__file__).resolve().parents[1]
     return load(
-        name="kquant_sqg_quantize_ext_v5",
+        name="kquant_sqg_quantize_ext_v17",
         sources=[
             str(project / "kquant/csrc/sqg_quantize.cpp"),
             str(project / "kquant/csrc/sqg_quantize.cu"),
@@ -42,7 +42,7 @@ def _sqg_temp_buffers(device: torch.device, bits: int):
 
     multiprocessors = torch.cuda.get_device_properties(device).multi_processor_count
     edges = 65536 >> bits
-    decisions = edges // 2
+    decisions = edges // (4 if bits == 2 else 2)
     free_bytes, _ = torch.cuda.mem_get_info(device)
     decision_bytes_per_tile = 256 * decisions
     affordable = max(256, int(free_bytes * 0.5) // decision_bytes_per_tile)
@@ -71,6 +71,9 @@ def install_sqg_quantizer(quantizer_module) -> None:
     original = quantizer_module.quantize_tiles
 
     device_luts: dict[tuple[str, int, str], torch.Tensor] = {}
+    transposed_sqg_luts: dict[
+        tuple[str, int, int], tuple[torch.Tensor, torch.Tensor]
+    ] = {}
 
     def quantize_tiles(tiles: torch.Tensor, quant_args: dict):
         codebook = quant_args.get("sqg_e4m3_lut")
@@ -113,8 +116,8 @@ def install_sqg_quantizer(quantizer_module) -> None:
                 )
                 return output, indices
         elif codebook is None:
-            if mode not in ("normal", "tail"):
-                raise ValueError("sqg_e4m3_mode must be 'normal' or 'tail'")
+            if mode != "normal":
+                raise ValueError("the supported R44 mode is 'normal'")
             key = (str(tiles.device), bits, mode)
             codebook = device_luts.get(key)
             if codebook is None:
@@ -124,6 +127,27 @@ def install_sqg_quantizer(quantizer_module) -> None:
         indices = torch.empty_like(tiles, dtype=torch.int16)
         costs, edges = _sqg_temp_buffers(tiles.device, bits)
         lut = codebook.to(device=tiles.device, dtype=torch.uint8).contiguous()
+        if bits in (2, 3, 4):
+            source_key = codebook.data_ptr() if codebook.is_cuda else id(codebook)
+            cache_key = (str(tiles.device), bits, source_key)
+            cached = transposed_sqg_luts.get(cache_key)
+            if cached is None or cached[0] is not codebook:
+                # [predecessor, out-edge-pair, pair-byte] ->
+                # [out-edge-pair, predecessor, pair-byte].  Each CUDA thread
+                # can then fetch all predecessor labels in one uint2 (K2),
+                # one uint4 (K3), or two uint4s (K4), rather than issuing one
+                # gather per predecessor.
+                predecessors = 1 << bits
+                out_edge_pairs = (65536 >> bits) // 2
+                lut = (
+                    lut.reshape(predecessors, out_edge_pairs, 2)
+                    .permute(1, 0, 2)
+                    .contiguous()
+                    .reshape(-1)
+                )
+                transposed_sqg_luts[cache_key] = (codebook, lut)
+            else:
+                lut = cached[1]
         _extension().quantize_tiles_sqg(
             tiles,
             output,

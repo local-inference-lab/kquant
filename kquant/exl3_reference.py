@@ -8,6 +8,7 @@ import torch
 
 from kquant.sqg_e4m3 import (
     SQG_CHEB_NORMAL_E4M3,
+    SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     SQG_NORMAL_E4M3,
     sqg_codebook,
 )
@@ -17,9 +18,13 @@ TILE_VALUES = 256
 HADAMARD_BLOCK = 128
 CODEBOOK_SQG_NORMAL_E4M3 = SQG_NORMAL_E4M3
 CODEBOOK_SQG_CHEB_NORMAL_E4M3 = SQG_CHEB_NORMAL_E4M3
+CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3 = (
+    SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3
+)
 QSRT_CODEBOOKS = (
     CODEBOOK_SQG_NORMAL_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
+    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
 )
 
 
@@ -60,6 +65,7 @@ def _decode_codebook_states(
     codebook: str,
     *,
     bits: int | None = None,
+    rate_axis: str | None = None,
 ) -> torch.Tensor:
     if codebook in QSRT_CODEBOOKS:
         if bits is None:
@@ -67,7 +73,11 @@ def _decode_codebook_states(
         _validate_bits(bits)
         indices = (states.to(dtype=torch.int64) & 0xFFFF).long()
         values = sqg_codebook(
-            bits, codebook, device=states.device, dtype=torch.float16
+            bits,
+            codebook,
+            rate_axis=rate_axis,
+            device=states.device,
+            dtype=torch.float16,
         )
         return values.index_select(0, indices.flatten()).reshape_as(states)
     raise ValueError(
@@ -165,7 +175,9 @@ def decode_qsrt_regularized_weight(
     for bits in sorted(set(tile_bits)):
         positions = torch.nonzero(bits_tensor == bits).flatten()
         selected = states.index_select(axis, positions)
-        values = _decode_codebook_states(selected, codebook, bits=bits).float()
+        values = _decode_codebook_states(
+            selected, codebook, bits=bits, rate_axis=rate_axis
+        ).float()
         decoded_tiles.index_copy_(axis, positions, values)
 
     inverse = torch.argsort(tensor_core_permutation(states.device))

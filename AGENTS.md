@@ -12,7 +12,7 @@ new code, schemas, artifacts, or documentation. `X4T` is the only current X4
 format. MCG and MUL1 may remain only where they are active numerical controls
 or external EXL encoder APIs.
 
-## Current state (2026-08-04)
+## Current state (2026-08-06)
 
 - Kimi-K3 has 93 decoder layers. Layers 1-92 contain 896 routed experts each,
   for 82,432 layer/expert assignments.
@@ -22,21 +22,68 @@ or external EXL encoder APIs.
   allocation, capture, or kernel gates.
 - The lossy search is `R0/R1/R2`, with one `r13` decision shared by `w1` and
   `w3` and an independent `r2` decision for `w2`.
-- `sqg-normal-e4m3` is the frozen R44 baseline. `sqg-cheb-normal-e4m3` and K2
-  law/stratification variants remain controlled research candidates until the
-  production donor/recipient study selects one.
+- `sqg-normal-e4m3` is the frozen R44 control. The next production pool uses
+  immutable codebook/profile ID 5,
+  `sqg-cheb-normal-k2-q8h4-w2-e4m3`: one shared finite-E4M3 Chebyshev-normal
+  staircase at K2/K3/K4, native SQG reachability for `w1`/`w3` and K3/K4, and
+  retained codeword history bit 4 as a virtual third octile-selector bit only
+  for K2 on `w2`. On 384 unseen, support-stratified experts, fixed `R0/R2`
+  routed SSE improved by 0.13345% with 269/384 wins. The layer-stratified
+  expert bootstrap interval was +0.0771% to +0.1974% improvement and the
+  independent document-cluster interval was +0.0707% to +0.2031%. This is one
+  reconstruction staircase with matrix/rate-specific graph reachability, not
+  a second K2 codebook or a per-expert mode.
+- The fresh profile-ID-5 candidate pool is active at
+  `/models/Kimi-K3-QSRT-CHEB-Q8H4-CANDIDATES-v1`. At the 2026-08-05 04:59 PDT
+  snapshot, 44 complete atomic selection sidecars covered 27,176 experts in
+  33 partly or fully represented layers. The document-confirmation gate
+  accepted a nonzero rate shift for 6,691 experts (24.62%); `w2` selected R1+
+  for 24.13% and coupled `w13` selected R1+ for 20.35%. This is substantial
+  evidence that rate shifting remains useful with the new codebook and
+  conditional dense-H path, but it is not the final 82,432-expert frequency:
+  the work-balanced partial schedule is not a uniform layer sample.
 - X4T is the exact endpoint. There is no raw-MXFP4 or old variable-rate X4 tier
   in a QSRT artifact.
+- X4T promotion remains a whole-expert decision. The rejected matrix-granular
+  and conditional-restoration selectors are not part of the repository or
+  production workflow.
 - The earlier layer-global dense `H2` study was invalid as a production metric:
   post-SiTU coordinate indices are expert-local. Layer-global `H13` is valid,
   but `H2` must be built from expert-stratified routed rows and shrunk toward
   identity. Unsupported experts fall back to identity.
-- The immediate calibration target is a source-controlled 1,000,000-token
-  training capture. It is the first scale-up from the 65,536-token pilot, not
-  the final corpus. Mode-selection and final-validation captures must remain
-  document- and prompt-disjoint.
-- The next checkpoint must be built into a fresh artifact after the new capture
-  and Hessian path are validated. Do not resume the stopped R44/X4T build.
+- The source-controlled 1,000,000-token training capture is complete at
+  `/data/kquant/captures/k3-denseh-broad-v6-1m-train.kqcapture` (298 GiB,
+  1,226 documents, zero dropped rows). It is the first scale-up from the
+  65,536-token pilot, not the final corpus. Mode-selection and final-validation
+  captures must remain document- and prompt-disjoint.
+- Its reusable `H13`/identity-prior bundle is
+  `/data/kquant/hessians/k3-denseh-broad-v6-1m-train-h13-identity-v1.kqhess`;
+  the layer-indexed route/input cache is
+  `/data/kquant/captures/k3-denseh-broad-v6-1m-train-input-v1.kqsamples`.
+  On this host they build in about 9 and 13 seconds respectively once the raw
+  capture is available.
+- The offline SQG tile encoder now uses predecessor-major E4M3 label loads,
+  packed K2 traceback, rate-specific launch widths/cache carveouts, and packed
+  half2 comparisons. At full `C128`, a 512-tile SM120 benchmark improved from
+  7.270/6.378/6.054 ms to 4.825/4.015/3.345 ms at K2/K3/K4. Sixty-three
+  old/new comparisons spanning K2/K3/K4, C1/C32/C128, three input families,
+  and production/control LUTs were bit-exact; the full 374-test suite passed.
+  A layer-24, 20-expert, production-shaped endpoint run fell from about 136 to
+  89 seconds and emitted the same candidate-payload SHA-256 as the preceding
+  C128 implementation. The active pool was resumed with this encoder on all
+  12 workers at 2026-08-05 06:13 PDT.
+- `C32` remains a research-only screening context. On the initial 20-expert
+  comparison it put every C128 confirmation winner in its top three, but that
+  evidence is not broad enough to change this production pool. Candidate
+  construction and final selection for the active pool remain full `C128`.
+- The next pool keeps `h2_reverse` neuron ordering, rotation draw zero, and
+  `folded_scale_power=0`. On the 24-expert production panel, identity,
+  energy-balanced, and stratified-energy-balanced permutations all lost to
+  `h2_reverse`; every tested nonzero folded-scale strength (`0.25`, `0.5`,
+  `1.0`) also increased routed validation SSE. Keep those alternatives as
+  research controls rather than silently enabling them in production.
+- Resume the active profile-ID-5 pool only with identical settings. Do not
+  resume the stopped R44/X4T build or mix its shards into the new artifact.
 
 The active design is documented in [docs/qsrt-technical-brief.md](docs/qsrt-technical-brief.md).
 Capture and covariance requirements are in
@@ -222,7 +269,31 @@ The vLLM launcher must set `K3_KQUANT_CAPTURE_DIR` and use the interim EXL3
 teacher. Finalize the capture exactly once and reject any dropped sample rows,
 TP join mismatch, epoch-zero probe contamination, or document overlap.
 
-### 3. Build and seal all-expert candidates
+### 3. Reduce the capture once
+
+Do not let every candidate worker rescan the raw TP12 capture. Build the valid
+layer-global `H13` matrices in one tensor-selective GPU pass and repack the
+rank-zero route/input rows into directly addressable layer files. The bundle
+stores only a symbolic identity fallback for `H2`. For every supported expert,
+the encoder reconstructs each decoded `r13` candidate, builds
+`H2[e,r13]` just in time from its post-SiTU rows, shrinks it only toward
+`trace(H2[e,r13]) / 3072 * I`, and discards it after encoding. A pooled
+layer-global post-SiTU covariance must never enter this calculation.
+
+```bash
+.venv/bin/python scripts/build_qsrt_hessians.py \
+  <training-capture> <fresh-kqhess> \
+  --device cuda:0 --request-step-min 1
+
+.venv/bin/python scripts/build_qsrt_sample_cache.py \
+  <training-capture> <fresh-layer-sample-cache>
+```
+
+The sample cache intentionally excludes TP-sharded teacher-middle rows. Do not
+pool those rows into a layer-global `H2`; intermediate coordinates are
+expert-local.
+
+### 4. Build and seal all-expert candidates
 
 Candidate generation streams official MXFP4 matrices one expert batch at a
 time. It must use the new capture, the validated Hessian bundle, separate
@@ -232,12 +303,15 @@ time. It must use the new capture, the validated Hessian bundle, separate
 .venv/bin/python scripts/pack_qsrt_candidates_tp12.py \
   --dest <fresh-candidate-pool> \
   --capture <training-capture> \
+  --sample-cache <layer-sample-cache> \
   --training-report <training-report> \
   --hessians <validated-kqhess> \
   --hessian-policy captured_blend \
   --mode-ids 0,1,2 \
-  --codebook sqg-normal-e4m3 \
+  --codebook sqg-cheb-normal-k2-q8h4-w2-e4m3 \
   --layout qsrt_guarded_reuse \
+  --permutation-policy h2_reverse \
+  --folded-scale-power 0 \
   --ldlq-tf32
 
 .venv/bin/python scripts/finalize_qsrt_candidate_pool.py \
@@ -248,7 +322,7 @@ Do not use `captured_blend` until the bundle and candidate path prove that
 `H2` is expert-stratified. Identity H is the scientific control, not a silent
 fallback for a malformed dense-H bundle.
 
-### 4. Score untouched validation data
+### 5. Score untouched validation data
 
 ```bash
 .venv/bin/python scripts/score_qsrt_validation.py \
@@ -268,7 +342,7 @@ The untouched capture estimates keep-tier damage and verifies each accepted
 shift against its R0/R0 counterfactual. Final validation cannot tune modes,
 codebooks, margins, or the X4T allocation.
 
-### 5. Index X4T and allocate exact bytes
+### 6. Index X4T and allocate exact bytes
 
 ```bash
 .venv/bin/python scripts/index_x4t_costs.py \

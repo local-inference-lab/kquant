@@ -10,8 +10,7 @@ The selection split is deliberately asymmetric:
 * fit documents determine the neuron order and expert-local covariance blends;
 * confirmation documents choose among the already-encoded fixed-rate formats
   and must also clear a paired bootstrap lower-bound gate against R0; and
-* insufficient support deterministically falls back to R0 and layer-global
-  covariance.
+* insufficient support deterministically falls back to R0 and identity H2.
 
 This separation matters because the fit rows also define the encoder Hessian.
 Using their reconstruction error to choose a mode can reward a mode for
@@ -25,18 +24,23 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 import numpy as np
 import torch
 
-from kquant.candidate_hessian import shrink_covariance, weighted_covariance
+from kquant.candidate_hessian import (
+    adaptive_identity_shrinkage,
+    shrink_covariance,
+    weighted_covariance,
+)
 from kquant.capture import LayerSamples
 from kquant.qsrt import (
     CONTEXT_GROUP_CHANNELS,
     INTERMEDIATE_CHANNELS,
     PHASE1_H13_EXPERT_LOCAL_ALPHA,
     PHASE1_H2_EXPERT_LOCAL_ALPHA,
+    PHASE1_H2_SHRINKAGE_POLICY,
     PHASE1_MODE_IDS,
     RECORDS_PER_EXPERT,
 )
@@ -69,6 +73,19 @@ PHASE1_MIN_CONFIRMATION_DOCUMENTS = 4
 PHASE1_BOOTSTRAP_REPLICATES = 2_000
 PHASE1_SELECTION_SEED = 20_260_801
 
+PermutationPolicy = Literal[
+    "identity",
+    "h2_reverse",
+    "energy_balanced",
+    "stratified_energy_balanced",
+]
+PERMUTATION_POLICIES: tuple[PermutationPolicy, ...] = (
+    "identity",
+    "h2_reverse",
+    "energy_balanced",
+    "stratified_energy_balanced",
+)
+
 
 @dataclass(frozen=True)
 class RequestPartition:
@@ -89,6 +106,7 @@ class RoutedRows:
     inputs: torch.Tensor
     gates: torch.Tensor
     request_steps: torch.Tensor
+    row_indices: torch.Tensor | None = None
 
     @property
     def rows(self) -> int:
@@ -97,6 +115,41 @@ class RoutedRows:
     @property
     def documents(self) -> int:
         return int(torch.unique(self.request_steps).numel())
+
+
+@dataclass(frozen=True)
+class RoutedRowIndex:
+    """One-pass inverted index from expert ID to captured routed rows.
+
+    Validation visits every expert in a layer.  Recomputing the full
+    ``rows x top-k`` expert mask for each expert makes that pass quadratic in
+    the number of experts and leaves the scoring GPUs idle.  This index scans
+    routes once, groups them by expert, and materializes only the requested
+    expert's input rows on demand.
+    """
+
+    samples: LayerSamples
+    request_steps: torch.Tensor
+    row_indices: torch.Tensor
+    gates: torch.Tensor
+    offsets: torch.Tensor
+
+    @property
+    def experts(self) -> int:
+        return int(self.offsets.numel() - 1)
+
+    def select(self, expert: int) -> RoutedRows:
+        if not 0 <= int(expert) < self.experts:
+            raise ValueError(f"expert must be in 0..{self.experts - 1}")
+        begin = int(self.offsets[int(expert)])
+        end = int(self.offsets[int(expert) + 1])
+        rows = self.row_indices[begin:end]
+        return RoutedRows(
+            inputs=self.samples.input_values.index_select(0, rows),
+            gates=self.gates[begin:end],
+            request_steps=self.request_steps.index_select(0, rows),
+            row_indices=rows,
+        )
 
 
 @dataclass(frozen=True)
@@ -226,11 +279,86 @@ def select_expert_rows(
         sorted(map(int, requests)), dtype=steps.dtype, device=steps.device
     )
     selected &= torch.isin(steps, allowed)
+    row_indices = torch.nonzero(selected, as_tuple=False).flatten()
     gates = (samples.input_gates[selected] * matches[selected]).sum(dim=1)
     return RoutedRows(
         inputs=samples.input_values[selected],
         gates=gates,
         request_steps=steps[selected],
+        row_indices=row_indices,
+    )
+
+
+def index_expert_rows(
+    samples: LayerSamples,
+    requests: Mapping[int, str],
+    *,
+    num_experts: int = 896,
+) -> RoutedRowIndex:
+    """Build an exact all-expert route index with one layer-level scan."""
+
+    if not requests:
+        raise ValueError("request mapping must be nonempty")
+    if num_experts <= 0:
+        raise ValueError("num_experts must be positive")
+    if samples.input_experts.ndim != 2:
+        raise ValueError("captured route experts must be a matrix")
+    if samples.input_gates.shape != samples.input_experts.shape:
+        raise ValueError("captured route gates and experts must align")
+    if samples.input_values.shape[0] != samples.input_experts.shape[0]:
+        raise ValueError("captured inputs and routes must align")
+
+    steps = torch.bitwise_right_shift(samples.input_observations, 32)
+    allowed = torch.tensor(
+        sorted(map(int, requests)), dtype=steps.dtype, device=steps.device
+    )
+    allowed_rows = torch.nonzero(torch.isin(steps, allowed), as_tuple=False).flatten()
+    route_experts = samples.input_experts.index_select(0, allowed_rows).reshape(-1)
+    route_gates = samples.input_gates.index_select(0, allowed_rows).reshape(-1)
+    if route_experts.numel() and (
+        int(route_experts.min()) < 0 or int(route_experts.max()) >= num_experts
+    ):
+        raise ValueError("captured expert ID is outside the index range")
+
+    top_k = int(samples.input_experts.shape[1])
+    route_rows = allowed_rows.repeat_interleave(top_k)
+    order = torch.argsort(route_experts, stable=True)
+    sorted_experts = route_experts.index_select(0, order).to(torch.long)
+    sorted_rows = route_rows.index_select(0, order)
+    sorted_gates = route_gates.index_select(0, order)
+
+    # Normal router output contains unique experts per token.  Preserve the
+    # historical selector's sum semantics if malformed or synthetic data
+    # repeats an expert within one row.
+    if sorted_rows.numel() > 1:
+        keys = sorted_experts * samples.input_values.shape[0] + sorted_rows
+        duplicate = keys[1:] == keys[:-1]
+        if bool(duplicate.any()):
+            unique_keys, inverse = torch.unique_consecutive(
+                keys, return_inverse=True
+            )
+            combined_gates = torch.zeros(
+                unique_keys.numel(),
+                dtype=sorted_gates.dtype,
+                device=sorted_gates.device,
+            )
+            combined_gates.index_add_(0, inverse, sorted_gates)
+            sorted_experts = torch.div(
+                unique_keys, samples.input_values.shape[0], rounding_mode="floor"
+            )
+            sorted_rows = torch.remainder(unique_keys, samples.input_values.shape[0])
+            sorted_gates = combined_gates
+
+    counts = torch.bincount(sorted_experts, minlength=num_experts)
+    offsets = torch.empty(num_experts + 1, dtype=torch.long, device=counts.device)
+    offsets[0] = 0
+    torch.cumsum(counts, dim=0, out=offsets[1:])
+    return RoutedRowIndex(
+        samples=samples,
+        request_steps=steps,
+        row_indices=sorted_rows,
+        gates=sorted_gates,
+        offsets=offsets,
     )
 
 
@@ -271,6 +399,101 @@ def activation_block_contexts(
     return rank_contexts(scores, contexts), scores
 
 
+def _balanced_contexts(
+    scores: torch.Tensor,
+    *,
+    contexts: int,
+    strata: int,
+) -> torch.Tensor:
+    """Greedily balance score mass within ordered importance strata.
+
+    ``strata=1`` is the deliberately aggressive energy-balanced control.  A
+    larger divisor retains coarse low-to-high importance regions while
+    preventing one 128-channel Hadamard record from monopolizing the energy
+    inside its region.  The implementation is deterministic and every final
+    record contains exactly 128 channels.
+    """
+
+    if scores.ndim != 1 or not torch.is_floating_point(scores):
+        raise ValueError("context scores must be a floating-point vector")
+    if not torch.all(torch.isfinite(scores)):
+        raise ValueError("context scores must be finite")
+    if strata <= 0 or contexts % strata or scores.numel() % strata:
+        raise ValueError("strata must evenly divide contexts and score groups")
+    contexts_per_stratum = contexts // strata
+    groups_per_stratum = scores.numel() // strata
+    if groups_per_stratum % contexts_per_stratum:
+        raise ValueError("strata do not produce equal-population contexts")
+    capacity = groups_per_stratum // contexts_per_stratum
+    ranked = torch.argsort(scores, stable=True)
+    result = torch.empty(scores.numel(), dtype=torch.long, device=scores.device)
+    for stratum in range(strata):
+        begin = stratum * groups_per_stratum
+        members = ranked[begin : begin + groups_per_stratum]
+        # Largest-first greedy scheduling minimizes the maximum record energy.
+        descending = members.flip(0)
+        totals = [0.0] * contexts_per_stratum
+        counts = [0] * contexts_per_stratum
+        assignments: list[list[int]] = [[] for _ in range(contexts_per_stratum)]
+        for raw_group in descending.tolist():
+            choices = [
+                context
+                for context in range(contexts_per_stratum)
+                if counts[context] < capacity
+            ]
+            target = min(choices, key=lambda context: (totals[context], context))
+            assignments[target].append(raw_group)
+            totals[target] += float(scores[raw_group])
+            counts[target] += 1
+        # Preserve a globally monotone record axis after balancing.
+        context_order = sorted(
+            range(contexts_per_stratum), key=lambda context: (totals[context], context)
+        )
+        for local_context, assignment in enumerate(context_order):
+            result[torch.tensor(assignments[assignment], device=scores.device)] = (
+                stratum * contexts_per_stratum + local_context
+            )
+    return result
+
+
+def permutation_policy_contexts(
+    middle: torch.Tensor,
+    gates: torch.Tensor,
+    *,
+    policy: PermutationPolicy = "h2_reverse",
+    contexts: int = RECORDS_PER_EXPERT,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build one common intermediate-neuron record assignment.
+
+    The production ``h2_reverse`` policy is the existing gate-square weighted
+    post-SiTU energy ranking.  Its score is the four-neuron average of the raw
+    expert-local H2 diagonal; trace-scaled identity shrinkage preserves this
+    ordering.  Because LDLQ traverses the encoded axis backwards, placing high
+    scores at the end visits them first.
+    """
+
+    if policy not in PERMUTATION_POLICIES:
+        raise ValueError(f"unsupported permutation policy: {policy}")
+    ranked, scores = activation_block_contexts(middle, gates, contexts=contexts)
+    if policy == "h2_reverse":
+        return ranked, scores
+    if policy == "identity":
+        groups_per_context = scores.numel() // contexts
+        return (
+            torch.div(
+                torch.arange(scores.numel(), device=scores.device),
+                groups_per_context,
+                rounding_mode="floor",
+            ),
+            scores,
+        )
+    if policy == "energy_balanced":
+        return _balanced_contexts(scores, contexts=contexts, strata=1), scores
+    # Six coarse importance strata retain donor/recipient separation while
+    # balancing four physical Hadamard records inside each stratum.
+    return _balanced_contexts(scores, contexts=contexts, strata=6), scores
+
+
 def layer_fallback_contexts(
     samples: LayerSamples,
     requests: Mapping[int, str],
@@ -278,6 +501,21 @@ def layer_fallback_contexts(
     contexts: int = RECORDS_PER_EXPERT,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build a layer-global post-SiTU order for unsupported experts."""
+
+    if not samples.mid_values.shape[0]:
+        # Layer-global middle coordinates are not semantically shared across
+        # experts.  Input-only sample caches therefore omit teacher middle
+        # rows and use a deterministic logical order only when an expert has
+        # no official-source routed rows of its own.
+        groups = INTERMEDIATE_CHANNELS // CONTEXT_GROUP_CHANNELS
+        if groups % contexts:
+            raise ValueError("fallback contexts do not evenly divide neuron groups")
+        return (
+            torch.arange(contexts, dtype=torch.long).repeat_interleave(
+                groups // contexts
+            ),
+            torch.zeros(groups, dtype=torch.float32),
+        )
 
     steps = torch.bitwise_right_shift(samples.mid_observations, 32)
     allowed = torch.tensor(
@@ -302,37 +540,80 @@ def build_expert_hessians(
     global_h2: torch.Tensor,
     device: torch.device,
     h13_alpha: float = PHASE1_H13_EXPERT_LOCAL_ALPHA,
-    h2_alpha: float = PHASE1_H2_EXPERT_LOCAL_ALPHA,
+    h2_alpha: float | None = None,
     chunk_rows: int = 256,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-    """Construct the frozen source-local covariance blends for one expert."""
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | str]]:
+    """Construct H13 and a support-aware post-SiTU H2 for one expert.
+
+    Passing ``h2_alpha`` retains an explicit fixed-alpha control.  The normal
+    production path uses weighted OAS reliability capped by
+    ``PHASE1_H2_EXPERT_LOCAL_ALPHA`` and shrinks only toward the expert-local
+    covariance's trace-scaled identity. ``global_h2`` is retained solely as a
+    legacy dimension contract; its values never participate in H2 fitting.
+    """
 
     if inputs.ndim != 2 or inputs.shape[0] != gates.shape[0]:
         raise ValueError("invalid expert input covariance samples")
     if source_middle.ndim != 2 or source_middle.shape[0] != inputs.shape[0]:
         raise ValueError("source middle rows do not match expert inputs")
+    global_h13 = global_h13.to(device=device, dtype=torch.float32)
+    if global_h2.shape != (source_middle.shape[1], source_middle.shape[1]):
+        raise ValueError("global H2 dimension does not match source middle rows")
     weights = gates.float().square()
-    local_h13, h13_weight = weighted_covariance(
-        inputs,
-        weights,
-        device=device,
-        chunk_rows=chunk_rows,
-    )
+    if h13_alpha == 0.0:
+        h13 = global_h13
+        h13_weight = float(weights.double().sum())
+    else:
+        local_h13, h13_weight = weighted_covariance(
+            inputs,
+            weights,
+            device=device,
+            chunk_rows=chunk_rows,
+            return_cpu=False,
+        )
+        h13 = shrink_covariance(global_h13, local_h13, h13_alpha)
     local_h2, h2_weight = weighted_covariance(
         source_middle,
         weights,
         device=device,
         chunk_rows=chunk_rows,
+        return_cpu=False,
     )
     if not math.isclose(h13_weight, h2_weight, rel_tol=1e-9, abs_tol=1e-12):
         raise ValueError("H13 and H2 expert covariance weights differ")
+    if h2_alpha is None:
+        h2, shrinkage = adaptive_identity_shrinkage(
+            local_h2,
+            weights,
+            max_local_alpha=PHASE1_H2_EXPERT_LOCAL_ALPHA,
+        )
+        h2_evidence: dict[str, float | str] = {
+            "h2_shrinkage_policy": PHASE1_H2_SHRINKAGE_POLICY,
+            "h2_local_alpha": shrinkage["local_alpha"],
+            "h2_local_alpha_cap": shrinkage["max_local_alpha"],
+            "h2_effective_sample_size": shrinkage["effective_sample_size"],
+            "h2_oas_shrinkage": shrinkage["oas_shrinkage"],
+            "h2_identity_scale": shrinkage["identity_scale"],
+        }
+    else:
+        identity_scale = float(torch.trace(local_h2) / local_h2.shape[0])
+        identity_prior = torch.eye(
+            local_h2.shape[0], dtype=torch.float32, device=device
+        ).mul_(identity_scale)
+        h2 = shrink_covariance(identity_prior, local_h2, h2_alpha)
+        h2_evidence = {
+            "h2_shrinkage_policy": "fixed_alpha_scaled_identity",
+            "h2_local_alpha": float(h2_alpha),
+            "h2_local_alpha_cap": float(h2_alpha),
+            "h2_identity_scale": identity_scale,
+        }
     return (
-        shrink_covariance(global_h13, local_h13, h13_alpha),
-        shrink_covariance(global_h2, local_h2, h2_alpha),
+        h13,
+        h2,
         {
             "gate_square_sum": h13_weight,
             "h13_local_alpha": float(h13_alpha),
-            "h2_local_alpha": float(h2_alpha),
+            **h2_evidence,
         },
     )
 

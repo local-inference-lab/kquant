@@ -22,6 +22,7 @@ import torch
 
 from kquant.exl3_reference import (
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
+    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
     decode_qsrt_regularized_weight,
     normalized_hadamard,
@@ -80,6 +81,8 @@ def _b12x_codebook_contract(codebook: str) -> tuple[str, dict[str, int]]:
         return "exl3_trellis_sqg_e4m3", {}
     if codebook == CODEBOOK_SQG_CHEB_NORMAL_E4M3:
         return "exl3_trellis_sqg_cheb_e4m3", {}
+    if codebook == CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3:
+        return "exl3_trellis_sqg_cheb_k2_q8h4_w2_e4m3", {}
     raise ValueError(f"unsupported materialized QSRT codebook: {codebook!r}")
 
 
@@ -379,6 +382,66 @@ def _reference_routed_experts(
     return output
 
 
+def _reference_route_middle(
+    reader: TP12LayerReader,
+    *,
+    source: torch.Tensor,
+    selected_experts: torch.Tensor,
+    rank: int,
+) -> torch.Tensor:
+    """Reconstruct route-major physical pre-w2 rows independently of B12X."""
+
+    hadamard = normalized_hadamard(device=source.device)
+    routes: list[torch.Tensor] = []
+    selected = [int(expert) for expert in selected_experts.cpu().tolist()]
+    for expert in selected:
+        gate_weight, gate_suh, gate_svh = _regularized_matrix(
+            reader,
+            expert=expert,
+            matrix="w1",
+            rank=rank,
+            device=source.device,
+        )
+        gate_a = _right_hadamard(
+            source.to(torch.float16),
+            hadamard,
+            suh=gate_suh,
+            store_fp16=True,
+        )
+        gate = (gate_a.float() @ gate_weight.float()).to(torch.float16)
+        gate = _right_hadamard(
+            gate, hadamard, svh=gate_svh, store_fp16=True
+        )
+
+        up_weight, up_suh, up_svh = _regularized_matrix(
+            reader,
+            expert=expert,
+            matrix="w3",
+            rank=rank,
+            device=source.device,
+        )
+        up_a = _right_hadamard(
+            source.to(torch.float16),
+            hadamard,
+            suh=up_suh,
+            store_fp16=True,
+        )
+        up = (up_a.float() @ up_weight.float()).to(torch.float16)
+        up = _right_hadamard(up, hadamard, svh=up_svh, store_fp16=True)
+        routes.append(
+            (
+                4.0
+                * torch.tanh(gate.float() / 4.0)
+                * torch.sigmoid(gate.float())
+                * 25.0
+                * torch.tanh(up.float() / 25.0)
+            ).to(torch.float16)
+        )
+
+    # The kernel cache is token-major, then top-k route-major.
+    return torch.stack(routes, dim=1).reshape(-1, LOCAL_INTERMEDIATE)
+
+
 def _numerical_metrics(
     actual: torch.Tensor, expected: torch.Tensor
 ) -> dict[str, float]:
@@ -585,6 +648,8 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
                 fast_math=True,
             )
 
+        restore_middle = None
+
     else:
         runtime_decoder = "trellis_w4a16"
         execution_plan = fused_moe.plan(
@@ -618,7 +683,30 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         def run_compressed() -> torch.Tensor:
             return binding.run()
 
+        def restore_middle() -> torch.Tensor:
+            from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                restore_kquant_exl3_mid,
+            )
+
+            prepared = weights.representation.value
+            cache = binding.intermediate_cache2
+            if cache is None:
+                raise RuntimeError("B12X did not expose its pre-w2 cache")
+            logical_scratch = torch.empty(
+                (args.tokens * args.topk, LOCAL_INTERMEDIATE),
+                dtype=cache.dtype,
+                device=device,
+            )
+            return restore_kquant_exl3_mid(
+                binding=binding,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+                intermediate_rotations=prepared.intermediate_rotations,
+                logical_scratch=logical_scratch,
+            )
+
     eager = run_compressed().clone()
+    restored_middle = None if restore_middle is None else restore_middle().clone()
     torch.cuda.synchronize(device)
     if not bool(torch.all(torch.isfinite(eager))):
         raise RuntimeError("materialized rank produced non-finite eager output")
@@ -639,7 +727,22 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
             topk_weights=topk_weights,
             rank=args.rank,
         )
+        expected_middle = (
+            None
+            if restored_middle is None
+            else _reference_route_middle(
+                reader,
+                source=source,
+                selected_experts=selected_cpu,
+                rank=args.rank,
+            )
+        )
     numerical = _numerical_metrics(eager, expected)
+    middle_numerical = (
+        None
+        if restored_middle is None or expected_middle is None
+        else _numerical_metrics(restored_middle, expected_middle)
+    )
     numerical_pass = bool(
         numerical["relative_error"] <= args.max_relative_error
         and numerical["cosine"] >= args.min_cosine
@@ -688,6 +791,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         "output_max_abs": float(eager.float().abs().max()),
         "eager_finite": True,
         "cuda_graph_exact": graph_exact,
+        "restored_pre_w2": middle_numerical,
         "independent_reference": {
             "implementation": (
                 f"kquant_pytorch_regularized_{codebook.replace('-', '_')}"

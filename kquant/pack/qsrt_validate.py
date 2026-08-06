@@ -182,9 +182,9 @@ def validate_qsrt_artifact(
     plan = validate_qsrt_materialization_allocation(allocation, pool, x4t_index)
     allocation_meta = allocation["meta"]
     expected_damage_contract = {
-        "allocation_damage_metric": allocation_meta["damage_metric"],
-        "allocation_damage_weighting": allocation_meta["damage_weighting"],
-        "allocation_damage_provenance": allocation_meta["damage_provenance"],
+        "allocation_damage_metric": allocation_meta.get("damage_metric"),
+        "allocation_damage_weighting": allocation_meta.get("damage_weighting"),
+        "allocation_damage_provenance": allocation_meta.get("damage_provenance"),
     }
     for name, expected in expected_damage_contract.items():
         if build.get(name) != expected:

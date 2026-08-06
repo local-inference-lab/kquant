@@ -2304,6 +2304,7 @@ def quantize_qsrt_batch(
         "buf_size_k",
         "ldlq_tf32",
         "tailbite_context",
+        "g_scale_override",
     )
     for group in quant_args_groups:
         reference = group[0]
@@ -2364,11 +2365,39 @@ def quantize_qsrt_batch(
         )
 
     # One batched global-scale search still returns an independent optimum for
-    # every source and is the same operation used by the serial search.
-    samples = [sample_scale_tiles(item["weight_r"]) for item in prepared]
-    scales = g_scale_search_batch(samples, quant_args_groups[0][0])
-    del samples
-    for item, group, (g_scale, _) in zip(prepared, quant_args_groups, scales):
+    # every source and is the same operation used by the serial search.  A
+    # forced value is an experiment hook for path-aware scale-oracle studies;
+    # it remains source-local and is folded into the ordinary persisted scale
+    # vectors exactly like a searched value.
+    scales: list[tuple[float, torch.Tensor | None] | None] = [None] * source_count
+    search_sources = []
+    search_samples = []
+    for source, (item, group) in enumerate(zip(prepared, quant_args_groups)):
+        override = group[0].get("g_scale_override")
+        if override is None:
+            search_sources.append(source)
+            search_samples.append(sample_scale_tiles(item["weight_r"]))
+        else:
+            if (
+                isinstance(override, bool)
+                or not isinstance(override, (int, float))
+                or not math.isfinite(float(override))
+                or float(override) <= 0.0
+            ):
+                raise ValueError("g_scale_override must be positive and finite")
+            scales[source] = (float(override), None)
+    if search_samples:
+        searched = g_scale_search_batch(
+            search_samples, quant_args_groups[search_sources[0]][0]
+        )
+        for source, result in zip(search_sources, searched):
+            scales[source] = result
+    del search_samples
+    if any(result is None for result in scales):
+        raise AssertionError("global scale search did not cover every source")
+    for item, group, result in zip(prepared, quant_args_groups, scales):
+        assert result is not None
+        g_scale, _ = result
         item["weight_r"], item["su"], item["sv"] = apply_g_scale(
             item["weight_r"],
             item["su"],
@@ -2500,6 +2529,7 @@ def quantize_qsrt_batch(
                 "suh": suh,
                 "svh": svh,
                 "proxy": proxy_err,
+                "g_scale": prepared[source]["g_scale"],
             }
         )
     return results

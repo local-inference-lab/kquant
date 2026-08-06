@@ -22,6 +22,7 @@ import torch
 
 from kquant.exl3_reference import (
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
+    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
     QSRT_CODEBOOKS,
     decode_qsrt_weight,
@@ -100,10 +101,13 @@ KEEP_STORAGE_EXTERNAL_X4T = "external-x4t"
 KEEP_STORAGE_IDS = {KEEP_STORAGE_EXTERNAL_X4T: 1}
 KEEP_STORAGES_BY_ID = {value: key for key, value in KEEP_STORAGE_IDS.items()}
 # ID 3 is frozen for the clipped-R44 SQG checkpoint. ID 4 identifies the
-# full-tail SQG-Cheb normal staircase while retaining the same SQG graph.
+# full-tail SQG-Cheb normal staircase while retaining the same SQG graph. ID 5
+# keeps that staircase and uses the validated bit-4 virtual-octile K2 graph on
+# w2 only; w1/w3 and every K3/K4 tile retain the native SQG graph.
 CODEBOOK_IDS = {
     CODEBOOK_SQG_NORMAL_E4M3: 3,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3: 4,
+    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3: 5,
 }
 CODEBOOKS_BY_ID = {value: key for key, value in CODEBOOK_IDS.items()}
 CODEBOOK_MULTIPLIERS = {
@@ -112,6 +116,7 @@ CODEBOOK_MULTIPLIERS = {
     # arithmetic parameter.
     CODEBOOK_SQG_NORMAL_E4M3: 0,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3: 0,
+    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3: 0,
 }
 
 RateAxis = Literal["k", "n"]
@@ -234,9 +239,12 @@ EXPERIMENTAL_MODE_CANDIDATES = RATE_TRANSFER_MODES
 PHASE1_MODE_IDS = (0, 1, 2)
 PHASE1_MODE_CANDIDATES = tuple(RATE_TRANSFER_MODES[r] for r in PHASE1_MODE_IDS)
 PHASE1_SHARED_RATE_MODE = False
-PHASE1_H13_EXPERT_LOCAL_ALPHA = 0.25
+PHASE1_H13_EXPERT_LOCAL_ALPHA = 0.0
+# Maximum local weight for adaptive, scaled-identity OAS H2 shrinkage.  The
+# actual alpha is support-dependent and can be substantially smaller.
 PHASE1_H2_EXPERT_LOCAL_ALPHA = 0.75
-PHASE1_H2_LOCAL_BASIS = "official_source_post_situ"
+PHASE1_H2_LOCAL_BASIS = "decoded_candidate_post_situ"
+PHASE1_H2_SHRINKAGE_POLICY = "weighted_oas_scaled_identity"
 _MODES_BY_NAME = {mode.name: mode for mode in RATE_TRANSFER_MODES}
 _MODES_BY_ID = {mode.mode_id: mode for mode in RATE_TRANSFER_MODES}
 
