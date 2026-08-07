@@ -1,0 +1,138 @@
+--- a/encode_b300.py
++++ b/encode_b300.py
+@@ -23,15 +23,15 @@
+ import traceback
+ 
+ 
+-BASE_ENCODER_SHA256 = "e9a85a47e165c8d8644354cef611efbb81dfd9ba88544ca59f0c80ee6bc75032"
++BASE_ENCODER_SHA256 = "400c0df1c95c81c30a2ce31e060f0445a798fd29ad9339923d4e02e3ee40f6f7"
+ CORPUS_SHA256 = "cf247acc7c5da9f0600c7d6ab3b7c2fcfc54ec30b794e3b6047559285fa44df4"
+ EXPECTED_SHARDS = 282
+-EXPECTED_LAYER_TENSORS = 256 * 3 * 4 * 4
++EXPECTED_LAYER_TENSORS = 256 * 3 * 4 * 3 + 3 * 4
+ EXPECTED_TOTAL_TR3_TENSORS = 75 * EXPECTED_LAYER_TENSORS
+ EXPECTED_REPLACED_WEIGHTS = 75 * 256 * 3
+ CAPTURE_PLAN_SCHEMA = "glm52-b300-capture-plan-v1"
+ DONE_SCHEMA = "glm52-b300-exl3-layer-v1"
+-ADAPTER_VERSION = "1"
++ADAPTER_VERSION = "shared-h-v1"
+ RAM_FILESYSTEMS = {"tmpfs", "ramfs"}
+ GIB = 1 << 30
+ DEFAULT_DISK_RESERVE_BYTES = 256 * GIB
+@@ -290,6 +290,9 @@
+             "out_scales": args.out_scales,
+             "lockstep": base.resolve_lockstep(args.lockstep),
+             "gss_lockstep": True,
++            "rotation_layout": "shared_h_v1",
++            "shared_profile": "signed-geometric-mean over all 256 experts",
++            "shared_profile_passes": 2,
+         },
+     }
+ 
+@@ -310,10 +313,18 @@
+                     k, n = base.SLICE, base.HIDDEN
+                 else:
+                     k, n = base.HIDDEN, base.SLICE
+-                expected[f"{prefix}.suh"] = ("F16", (k,))
+-                expected[f"{prefix}.svh"] = ("F16", (n,))
++                if proj == "down_proj":
++                    expected[f"{prefix}.suh"] = ("F16", (k,))
++                else:
++                    expected[f"{prefix}.svh"] = ("F16", (n,))
+                 expected[f"{prefix}.trellis"] = ("I16", (k // 16, n // 16, 48))
+                 expected[f"{prefix}.mcg"] = ("I32", ())
++    for proj in base.PROJS:
++        for rank in range(base.TP):
++            field = "svh" if proj == "down_proj" else "suh"
++            expected[
++                f"model.layers.{layer}.mlp.experts.shared_h.{proj}.rank{rank}.{field}"
++            ] = ("F16", (base.HIDDEN,))
+     return expected
+ 
+ 
+@@ -354,6 +365,7 @@
+             int(done.get("tp", -1)) == 4,
+             done.get("keep_nvfp4") == [],
+             done.get("tail_tr3") == list(range(256)),
++            done.get("rotation_layout") == "shared_h_v1",
+             int(done.get("tensor_count", -1)) == EXPECTED_LAYER_TENSORS,
+             expected_recipe is None or done.get("recipe_fingerprint") == expected_recipe,
+             done.get("file_sha256") == sha256_file(st_path),
+@@ -531,9 +543,38 @@
+ def process_layer_b300(args, src, layer: int, logfile: str, expected_recipe: str) -> None:
+     global ACTIVE_SOURCE_HASHER, ACTIVE_SOURCE_TENSORS
+     assert_disk_free(Path(args.work), ENCODE_LAYER_ALLOWANCE_BYTES, f"encode layer {layer}")
+-    ACTIVE_SOURCE_HASHER = hashlib.sha256()
++    ACTIVE_SOURCE_HASHER = None
+     ACTIVE_SOURCE_TENSORS = 0
+     LayerCalibRAM.expected_fingerprint = args.capture_plan["capture_fingerprint"]
++    layer_manifest = json.loads(
++        (Path(args.capture_dir) / f"layer_{layer:03d}" / "layer_manifest.json").read_text()
++    )
++    profile_identity = canonical_hash(
++        {
++            "schema": "glm52-exl3-shared-h-profile-identity-v1",
++            "recipe_fingerprint": expected_recipe,
++            "layer": layer,
++            "capture_sha256_x": layer_manifest["sha256_x"],
++            "capture_sha256_ids": layer_manifest["sha256_ids"],
++        }
++    )
++    BASE.profile_layer_shared_h(
++        src,
++        args.work,
++        layer,
++        {"auto": None, "always": True, "never": False}[args.out_scales],
++        args.capture_dir,
++        args.min_routed,
++        logfile,
++        profile_identity,
++    )
++    shared_h_profiles, shared_h_profile_done = BASE.load_layer_shared_h_profiles(
++        args.work, layer, expected_identity=profile_identity
++    )
++    # The production source digest covers the actual LDLQ encode pass. The
++    # profile pass reads the same tensors but is independently hash-pinned.
++    ACTIVE_SOURCE_HASHER = hashlib.sha256()
++    ACTIVE_SOURCE_TENSORS = 0
+     BASE.process_layer(
+         src,
+         args.work,
+@@ -543,6 +584,7 @@
+         args.min_routed,
+         logfile,
+         BASE.resolve_lockstep(args.lockstep),
++        shared_h_profiles,
+     )
+     if ACTIVE_SOURCE_TENSORS != 256 * 3:
+         raise RuntimeError(
+@@ -550,9 +592,6 @@
+         )
+     st_path, done_path = BASE.layer_paths(args.work, layer)
+     done = json.loads(Path(done_path).read_text())
+-    layer_manifest = json.loads(
+-        (Path(args.capture_dir) / f"layer_{layer:03d}" / "layer_manifest.json").read_text()
+-    )
+     if done.get("keep_nvfp4") != [] or done.get("tail_tr3") != list(range(256)):
+         raise RuntimeError(f"layer {layer}: encoder tier drifted from all-256 EXL3")
+     done.update(
+@@ -570,6 +609,8 @@
+                 "sha256_ids": layer_manifest["sha256_ids"],
+             },
+             "source_format": "BF16-direct",
++            "rotation_layout": "shared_h_v1",
++            "shared_h_profile_sha256": shared_h_profile_done["file_sha256"],
+             "keep_nvfp4": [],
+             "tail_tr3": list(range(256)),
+         }
+@@ -894,6 +935,10 @@
+         "nvfp4_keep_per_layer": 0,
+         "tr3_tail_per_layer": 256,
+         "tp": 4,
++        "rotation_layout": "shared_h_v1",
++        "shared_h_tensor_schema": (
++            "model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{suh|svh}"
++        ),
+         "recipe_fingerprint": args.expected_recipe,
+         "calibration": {
+             "corpus_sha256": plan["corpus_sha256"],

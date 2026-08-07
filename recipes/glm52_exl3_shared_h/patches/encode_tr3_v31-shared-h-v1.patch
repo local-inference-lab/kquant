@@ -1,0 +1,423 @@
+--- a/encode_tr3_v31.py
++++ b/encode_tr3_v31.py
+@@ -743,7 +743,30 @@
+     return apply_out_scales, weight, g_scale, su, sv
+ 
+ 
+-def regularize_pre(weight, su, sv, quant_args, H_diag=None, q_fallback=False):
++def _force_shared_rotation(candidate, forced, label):
++    if forced is None:
++        return candidate
++    forced = forced.to(device=candidate.device, dtype=candidate.dtype)
++    if tuple(forced.shape) != tuple(candidate.shape):
++        raise ValueError(
++            f"{label} shared profile shape {tuple(forced.shape)} != "
++            f"candidate {tuple(candidate.shape)}"
++        )
++    if not (forced.sign() == candidate.sign()).all().item():
++        raise ValueError(f"{label} shared profile changes Hadamard signs")
++    return forced
++
++
++def regularize_pre(
++    weight,
++    su,
++    sv,
++    quant_args,
++    H_diag=None,
++    q_fallback=False,
++    forced_suh=None,
++    forced_svh=None,
++):
+     """v3.1: VERBATIM regularize() head — everything up to (excluding) the
+     g_scale_gss call, so the search itself can run pooled across slices
+     (g_scale_gss_lockstep) followed by regularize_post().  regularize() above
+@@ -785,6 +808,7 @@
+         out_channel_scales[zero_out_scales] = 0.1
+         sv = (sv * out_channel_scales + 1e-10).float()
+ 
++    sv = _force_shared_rotation(sv, forced_svh, "svh")
+     weight /= sv
+     sv[zero_out_scales] = 0.0
+     blockwise_preapply_had_r_(weight, HAD_N)
+@@ -792,17 +816,21 @@
+     in_channel_scales = block_rms(weight, dim=1, keepdim=True)
+     in_channel_scales[in_channel_scales.abs() < 1e-30] = 0.1
+     su = (su * in_channel_scales / (-CODEBOOK_SCALE) + 1e-10).float()
++    su = _force_shared_rotation(su, forced_suh, "suh")
+     weight /= su
+     blockwise_preapply_had_l_(weight, HAD_K)
+ 
+     return apply_out_scales, weight, su, sv
+ 
+ 
+-def regularize_post(weight, su, g_scale):
++def regularize_post(weight, su, sv, g_scale, g_scale_into_svh=False):
+     """v3.1: VERBATIM regularize() tail (g_scale application)."""
+     weight *= g_scale
+-    su /= g_scale
+-    return weight, su
++    if g_scale_into_svh:
++        sv /= g_scale
++    else:
++        su /= g_scale
++    return weight, su, sv
+ 
+ 
+ @lru_cache
+@@ -1525,7 +1553,19 @@
+     return out, stats
+ 
+ 
+-def encode_slice_prologue_pre(w_slice, H_data, seed, out_scales, logfile=None):
++def encode_slice_prologue_pre(
++    w_slice,
++    H_data,
++    seed,
++    out_scales,
++    logfile=None,
++    *,
++    su_seed=None,
++    sv_seed=None,
++    forced_suh=None,
++    forced_svh=None,
++    g_scale_into_svh=False,
++):
+     """v3.1: first part of encode_slice_prologue() (v2-verbatim math): seed ->
+     finalize (su on first use of a shared H) -> sv draw -> regularize_pre
+     (out-scale decision, su/sv scaling, Hadamard transforms; g_scale NOT yet
+@@ -1546,7 +1586,7 @@
+                   "mcg": True, "sigma_reg": SIGMA_REG}
+ 
+     # --- reference order: seed -> finalize (su on first use) -> sv ----------
+-    torch.manual_seed(seed)
++    torch.manual_seed(seed if su_seed is None else su_seed)
+     q_fallback, H, L, su, H_diag = finalize_capture_H(H_data, quant_args, verbose=False)
+     if H is not None and not H.is_cuda:
+         H = H.to(device)                 # working copy for the proxy metric
+@@ -1556,6 +1596,8 @@
+         su = su.to(device)
+     if H_diag is not None and H_diag.device != device:
+         H_diag = H_diag.to(device)
++    if sv_seed is not None:
++        torch.manual_seed(sv_seed)
+     sv = (torch.randn(n, device=device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+     # reference keeps the stored L on CPU between linears sharing this H_data
+     if H_data.get("L") is not None and H_data["L"].is_cuda:
+@@ -1563,11 +1605,20 @@
+ 
+     w_orig = w_slice
+     apply_out_scales, weight_r, su, sv = regularize_pre(
+-        w_slice.clone(), su, sv, quant_args, H_diag=H_diag, q_fallback=q_fallback)
++        w_slice.clone(),
++        su,
++        sv,
++        quant_args,
++        H_diag=H_diag,
++        q_fallback=q_fallback,
++        forced_suh=forced_suh,
++        forced_svh=forced_svh,
++    )
+ 
+     return {"k": k, "n": n, "device": device, "quant_args": quant_args,
+             "q_fallback": q_fallback, "H": H, "L": L, "H_diag": H_diag,
+             "su": su, "sv": sv, "g_scale": None,
++            "g_scale_into_svh": bool(g_scale_into_svh),
+             "apply_out_scales": apply_out_scales, "w_orig": w_orig,
+             "weight_r": weight_r, "wq_reg": None, "encoded": None}
+ 
+@@ -1581,8 +1632,14 @@
+     torch, ext = _lazy_torch()
+     assert ctx["g_scale"] is not None, \
+         "prologue_post called before the pooled g_scale search set ctx['g_scale']"
+-    weight_r, su = regularize_post(ctx["weight_r"], ctx["su"], ctx["g_scale"])
+-    ctx["weight_r"], ctx["su"] = weight_r, su
++    weight_r, su, sv = regularize_post(
++        ctx["weight_r"],
++        ctx["su"],
++        ctx["sv"],
++        ctx["g_scale"],
++        ctx.get("g_scale_into_svh", False),
++    )
++    ctx["weight_r"], ctx["su"], ctx["sv"] = weight_r, su, sv
+     L, q_fallback, quant_args = ctx["L"], ctx["q_fallback"], ctx["quant_args"]
+ 
+     wq_reg, encoded = None, None
+@@ -1640,6 +1697,196 @@
+     return (SEED_BASE * 1000003 + L * 65536 + E * 16 + proj_idx * 4 + r) & 0x7FFFFFFF
+ 
+ 
++def shared_h_seed(L, side, r=0):
++    """Stable expert-independent seed for one hidden-side rotation.
++
++    Gate and up share the same calibrated input Hessian within an expert, so
++    they must also share one Hadamard sign draw. Down keeps expert-local SU
++    and shares only its output-side SV draw per TP rank.
++    """
++    side_id = {"gate_up_su": 0, "down_sv": 1}[side]
++    return (0x5EED * 1000003 + L * 65536 + side_id * 4096 + r) & 0x7FFFFFFF
++
++
++def shared_h_profile_paths(work, L):
++    root = os.path.join(work, "shared-h-profiles")
++    return (
++        os.path.join(root, f"shared-h-layer-{L:03d}.safetensors"),
++        os.path.join(root, f"shared-h-layer-{L:03d}.done.json"),
++    )
++
++
++def _shared_h_name(L, proj, r):
++    field = "svh" if proj == "down_proj" else "suh"
++    return f"model.layers.{L}.mlp.experts.shared_h.{proj}.rank{r}.{field}"
++
++
++def _shared_h_encode_kwargs(L, E, proj, proj_idx, r, profiles=None):
++    seed = slice_seed(L, E, proj_idx, r)
++    if proj == "down_proj":
++        kwargs = {"sv_seed": shared_h_seed(L, "down_sv", r)}
++        if profiles is not None:
++            kwargs["forced_svh"] = profiles[(proj, r)]
++    else:
++        kwargs = {
++            "su_seed": shared_h_seed(L, "gate_up_su"),
++            # Keep the sharded output-side rotation expert-local.
++            "sv_seed": seed,
++            # The per-expert scalar belongs on the expert-local side when SU
++            # is shared. This is algebraically identical to dividing SU.
++            "g_scale_into_svh": True,
++        }
++        if profiles is not None:
++            kwargs["forced_suh"] = profiles[(proj, r)]
++    return seed, kwargs
++
++
++def _profile_accumulate(accumulators, key, candidate):
++    torch, _ = _lazy_torch()
++    flat = candidate.detach().flatten().float().cpu()
++    signs = flat.sign().to(torch.int8)
++    magnitude = flat.abs()
++    state = accumulators.get(key)
++    if state is None:
++        state = {
++            "sign": signs,
++            "log_sum": magnitude.clamp_min(1e-30).log().double(),
++            "all_zero": magnitude == 0,
++            "count": 1,
++        }
++        accumulators[key] = state
++        return
++    incompatible = (state["sign"] != signs) & (state["sign"] != 0) & (signs != 0)
++    if incompatible.any().item():
++        raise RuntimeError(f"shared-H sign mismatch for {key}")
++    state["sign"] = torch.where(state["sign"] == 0, signs, state["sign"])
++    state["log_sum"] += magnitude.clamp_min(1e-30).log().double()
++    state["all_zero"] &= magnitude == 0
++    state["count"] += 1
++
++
++def profile_layer_shared_h(
++    src,
++    work,
++    L,
++    out_scales,
++    capture_dir,
++    min_routed,
++    logfile,
++    profile_identity=None,
++):
++    """Derive calibrated shared H-side profiles before the LDLQ encode.
++
++    This is deliberately a separate pass. The auto output-scale decision and
++    channel profiles depend on each expert's calibrated Hessian and weights;
++    deriving them from an already-quantized checkpoint would compound error.
++    """
++    torch, _ = _lazy_torch()
++    st_path, done_path = shared_h_profile_paths(work, L)
++    if os.path.exists(st_path) and os.path.exists(done_path):
++        try:
++            with open(done_path) as handle:
++                done = json.load(handle)
++            if (
++                done.get("file_sha256") == sha256_file(st_path)
++                and done.get("profile_identity") == profile_identity
++            ):
++                return st_path
++        except Exception:
++            pass
++    os.makedirs(os.path.dirname(st_path), exist_ok=True)
++    calib = LayerCalib(capture_dir, L, logfile)
++    accumulators = {}
++    routed_count = []
++    for E in range(NUM_EXPERTS):
++        W = {proj: load_expert_bf16(src, L, E, proj, "cuda:0", logfile) for proj in PROJS}
++        hd_gu, hd_down, hmeta = build_expert_hessians(
++            calib, E, W["gate_proj"], W["up_proj"], "cuda:0", min_routed
++        )
++        routed_count.append(hmeta["routed"])
++        for proj_idx, proj in enumerate(PROJS):
++            for r, sl in expert_slices(W[proj], proj):
++                hd = hd_gu if proj != "down_proj" else hd_down[r]
++                seed, shared_kwargs = _shared_h_encode_kwargs(
++                    L, E, proj, proj_idx, r
++                )
++                ctx = encode_slice_prologue_pre(
++                    sl,
++                    hd,
++                    seed,
++                    out_scales,
++                    logfile=logfile,
++                    **shared_kwargs,
++                )
++                candidate = ctx["sv"] if proj == "down_proj" else ctx["su"]
++                _profile_accumulate(accumulators, (proj, r), candidate)
++                ctx.clear()
++        free_H_data(hd_gu, *hd_down)
++        del W
++        if E % 32 == 31:
++            log(f"layer {L}: shared-H profile {E + 1}/{NUM_EXPERTS}", logfile)
++    entries = []
++    for proj in PROJS:
++        for r in range(TP):
++            state = accumulators[(proj, r)]
++            profile = state["sign"].double() * (
++                state["log_sum"] / state["count"]
++            ).exp()
++            profile[state["all_zero"]] = 0
++            profile = profile.half().contiguous()
++            name = _shared_h_name(L, proj, r)
++            entries.append((name, "F16", tuple(profile.shape), profile.numpy().tobytes()))
++    _, file_sha = write_safetensors(st_path, entries, metadata={"format": "pt"})
++    payload = {
++        "schema": "glm52-exl3-shared-h-profile-v1",
++        "layer": L,
++        "experts": NUM_EXPERTS,
++        "aggregation": "signed-geometric-mean",
++        "profile_identity": profile_identity,
++        "capture_tokens": calib.tokens,
++        "expert_routed_count": routed_count,
++        "file": os.path.basename(st_path),
++        "file_sha256": file_sha,
++    }
++    tmp = done_path + ".tmp"
++    with open(tmp, "w") as handle:
++        json.dump(payload, handle, indent=1)
++    os.replace(tmp, done_path)
++    del calib
++    return st_path
++
++
++def load_layer_shared_h_profiles(
++    work, L, device="cuda:0", expected_identity=None
++):
++    torch, _ = _lazy_torch()
++    import numpy as np
++
++    st_path, done_path = shared_h_profile_paths(work, L)
++    if not (os.path.exists(st_path) and os.path.exists(done_path)):
++        raise RuntimeError(f"layer {L}: shared-H profile is missing")
++    with open(done_path) as handle:
++        done = json.load(handle)
++    if done.get("file_sha256") != sha256_file(st_path):
++        raise RuntimeError(f"layer {L}: shared-H profile hash mismatch")
++    if done.get("profile_identity") != expected_identity:
++        raise RuntimeError(f"layer {L}: shared-H profile identity mismatch")
++    reader = STReader(st_path)
++    profiles = {}
++    for proj in PROJS:
++        for r in range(TP):
++            name = _shared_h_name(L, proj, r)
++            dtype, shape, _, _ = reader.tensors[name]
++            if dtype != "F16":
++                raise RuntimeError(f"{name}: expected F16, got {dtype}")
++            array = np.frombuffer(reader.read_bytes(name), dtype=np.float16).copy()
++            vector = torch.from_numpy(array).to(device=device, dtype=torch.float32)
++            profiles[(proj, r)] = (
++                vector.view(1, -1) if proj == "down_proj" else vector.view(-1, 1)
++            )
++    return profiles, done
++
++
+ # ----------------------------------------------------------------------------
+ # calibration artifacts (Pass A, capture_hessians.py) -> per-expert Hessians
+ # ----------------------------------------------------------------------------
+@@ -1880,7 +2127,8 @@
+ 
+ 
+ def process_layer(src: SourceModel, work: str, L: int, out_scales, capture_dir: str,
+-                  min_routed: int, logfile: str, lockstep_n: int = None):
++                  min_routed: int, logfile: str, lockstep_n: int = None,
++                  shared_h_profiles=None):
+     torch, _ = _lazy_torch()
+     t0 = time.time()
+     device = "cuda:0"
+@@ -1928,8 +2176,19 @@
+             for pi, proj in enumerate(PROJS):
+                 for r, sl in expert_slices(W[proj], proj):
+                     hd = hd_gu if proj != "down_proj" else hd_down[r]
++                    seed, shared_kwargs = _shared_h_encode_kwargs(
++                        L, E, proj, pi, r, shared_h_profiles
++                    ) if shared_h_profiles is not None else (
++                        slice_seed(L, E, pi, r), {}
++                    )
+                     ctx = encode_slice_prologue_pre(
+-                        sl, hd, slice_seed(L, E, pi, r), out_scales, logfile=logfile)
++                        sl,
++                        hd,
++                        seed,
++                        out_scales,
++                        logfile=logfile,
++                        **shared_kwargs,
++                    )
+                     pre_list.append((E, proj, r, ctx))
+             del W
+             group_hd.append((hd_gu, hd_down))
+@@ -1990,16 +2249,35 @@
+ 
+     entries = []
+     mcg_bytes = struct.pack("<I", MCG_MULT)    # stored as I32 scalar (uint32 bit pattern)
++    if shared_h_profiles is not None:
++        for proj in PROJS:
++            for r in range(TP):
++                field = "svh" if proj == "down_proj" else "suh"
++                expected = shared_h_profiles[(proj, r)].flatten().half().cpu()
++                for E in tail:
++                    if not torch.equal(stash[(E, proj, r)][field], expected):
++                        raise RuntimeError(
++                            f"layer {L} {proj} rank {r}: shared {field} drifted "
++                            f"for expert {E}"
++                        )
++                entries.append((
++                    _shared_h_name(L, proj, r),
++                    "F16",
++                    tuple(expected.shape),
++                    expected.numpy().tobytes(),
++                ))
+     for E in tail:
+         for proj in PROJS:
+             for r in range(TP):
+                 t = stash[(E, proj, r)]
+                 base = f"model.layers.{L}.mlp.experts.{E}.{proj}.rank{r}"
+                 tr = t["trellis"]
+-                entries.append((f"{base}.suh", "F16", tuple(t["suh"].shape),
+-                                t["suh"].numpy().tobytes()))
+-                entries.append((f"{base}.svh", "F16", tuple(t["svh"].shape),
+-                                t["svh"].numpy().tobytes()))
++                if shared_h_profiles is None or proj == "down_proj":
++                    entries.append((f"{base}.suh", "F16", tuple(t["suh"].shape),
++                                    t["suh"].numpy().tobytes()))
++                if shared_h_profiles is None or proj != "down_proj":
++                    entries.append((f"{base}.svh", "F16", tuple(t["svh"].shape),
++                                    t["svh"].numpy().tobytes()))
+                 entries.append((f"{base}.trellis", "I16", tuple(tr.shape),
+                                 tr.numpy().tobytes()))
+                 entries.append((f"{base}.mcg", "I32", (), mcg_bytes))
+@@ -2033,6 +2311,9 @@
+         "seed_base": SEED_BASE,
+         "lockstep": lockstep_n,
+         "gss_lockstep": True,
++        "rotation_layout": (
++            "shared_h_v1" if shared_h_profiles is not None else "per_expert_v1"
++        ),
+         "exllamav3": "0.0.43",
+         "file": os.path.basename(st_path),
+         "file_sha256": file_sha,
