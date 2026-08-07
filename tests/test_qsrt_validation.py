@@ -5,10 +5,12 @@ import pytest
 import torch
 
 from kquant import constants as C
+from kquant.pack import qsrt_validation
 from kquant.pack.qsrt_validation import (
     VALIDATION_DAMAGE_METRIC,
     official_expert_output,
     physical_expert_output,
+    selected_candidate_output,
     validate_validation_layer_metrics,
 )
 from kquant.tp_simulator import situ
@@ -70,13 +72,47 @@ def test_official_expert_output_dequantizes_directly_on_requested_device() -> No
         layer=1,
         expert=2,
         device=requested,
+        activation="silu",
     )
     gate = torch.nn.functional.linear(inputs, store.weights["w1"])
     up = torch.nn.functional.linear(inputs, store.weights["w3"])
-    expected = torch.nn.functional.linear(situ(gate, up), store.weights["w2"])
+    expected = torch.nn.functional.linear(
+        torch.nn.functional.silu(gate) * up,
+        store.weights["w2"],
+    )
 
     torch.testing.assert_close(actual, expected)
     assert store.devices == [requested, requested, requested]
+
+
+def test_selected_candidate_output_propagates_silu(monkeypatch) -> None:
+    weights = {
+        "w1": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "w3": torch.tensor([[2.0, -1.0], [0.5, 3.0]]),
+        "w2": torch.tensor([[1.5], [-0.25]]),
+    }
+
+    def fake_decode(*args, matrix: str, **kwargs) -> torch.Tensor:
+        return weights[matrix]
+
+    monkeypatch.setattr(qsrt_validation, "decode_candidate_matrix", fake_decode)
+    inputs = torch.tensor([[0.5, -2.0]])
+
+    actual = selected_candidate_output(
+        object(),
+        inputs,
+        layer=3,
+        expert=4,
+        r13_mode_id=1,
+        r2_mode_id=2,
+        device=torch.device("cpu"),
+        activation="silu",
+    )
+
+    gate = inputs @ weights["w1"]
+    up = inputs @ weights["w3"]
+    expected = (torch.nn.functional.silu(gate) * up) @ weights["w2"]
+    torch.testing.assert_close(actual, expected)
 
 
 def _validation_metrics() -> dict[str, torch.Tensor]:

@@ -29,14 +29,10 @@ from kquant import constants as C
 from kquant.capture import LayerSamples, load_layer_hessians, load_layer_samples
 from kquant.exl3_loader import load_qsrt_encoder
 from kquant.exl3_reference import decode_exl3_weight
-from kquant.sqg_e4m3 import (
-    SQG_CHEB_NORMAL_E4M3,
-    SQG_NORMAL_E4M3,
-    sqg_e4m3_bytes,
-    sqg_e4m3_bytes_from_rank_lut,
-    sqg_e4m3_codebook,
-)
-from kquant.sqg_quantizer import install_sqg_quantizer
+from kquant.expert_activation import ExpertActivation, expert_middle
+from kquant.ldlq import SIGMA_REG, make_shared_h
+from kquant.pack.qsrt_encoder import plan_qsrt_matrix
+from kquant.qsrt import RATE_TRANSFER_MODES, unpack_trellis_states
 from kquant.qsrt_candidates import (
     RequestPartition,
     activation_block_contexts,
@@ -45,12 +41,16 @@ from kquant.qsrt_candidates import (
     request_documents,
     select_expert_rows,
 )
-from kquant.qsrt import RATE_TRANSFER_MODES, unpack_trellis_states
-from kquant.ldlq import SIGMA_REG, make_shared_h
-from kquant.pack.qsrt_encoder import plan_qsrt_matrix
 from kquant.source_weights import OfficialMXFP4Store
-from kquant.tp_simulator import comparison_metrics, situ
-
+from kquant.sqg_e4m3 import (
+    SQG_CHEB_NORMAL_E4M3,
+    SQG_NORMAL_E4M3,
+    sqg_e4m3_bytes,
+    sqg_e4m3_bytes_from_rank_lut,
+    sqg_e4m3_codebook,
+)
+from kquant.sqg_quantizer import install_sqg_quantizer
+from kquant.tp_simulator import comparison_metrics
 
 MATRICES = C.EXPERT_MATRICES
 
@@ -70,8 +70,14 @@ def _expert_output(
     w1: torch.Tensor,
     w3: torch.Tensor,
     w2: torch.Tensor,
+    *,
+    activation: ExpertActivation = "situ",
 ) -> torch.Tensor:
-    middle = situ(F.linear(inputs, w1), F.linear(inputs, w3))
+    middle = expert_middle(
+        F.linear(inputs, w1),
+        F.linear(inputs, w3),
+        activation,
+    )
     return F.linear(middle, w2)
 
 
@@ -116,6 +122,7 @@ def _coupled_activation_metrics(
     training_request_documents: Mapping[int, str] | None = None,
     training_confirmation_documents: Mapping[int, str] | None = None,
     validation_request_documents: Mapping[int, str] | None = None,
+    activation: ExpertActivation = "situ",
 ) -> dict[str, dict | None]:
     """Score a complete reconstructed expert on document-separated routes."""
 
@@ -147,9 +154,9 @@ def _coupled_activation_metrics(
                 validation_request_documents,
             )
         )
-    for name, samples, split, request_documents in selections:
+    for name, samples, split, document_map in selections:
         inputs, gates, teacher_mixture, request_steps = _selected_expert_rows(
-            samples, expert, split, request_documents
+            samples, expert, split, document_map
         )
         if not inputs.shape[0]:
             metrics[name] = None
@@ -157,8 +164,8 @@ def _coupled_activation_metrics(
         inputs = inputs.float().to(device)
         gates = gates.float().to(device)
         teacher_mixture = teacher_mixture.float().to(device)
-        reference = _expert_output(inputs, *source)
-        candidate = _expert_output(inputs, *reconstruction)
+        reference = _expert_output(inputs, *source, activation=activation)
+        candidate = _expert_output(inputs, *reconstruction, activation=activation)
         route_weights = gates.double().square()
         row_sse = (candidate - reference).double().square().sum(dim=1) * route_weights
         row_energy = reference.double().square().sum(dim=1) * route_weights
@@ -183,17 +190,13 @@ def _coupled_activation_metrics(
                 {
                     "request_step": request_step,
                     "document_hash": (
-                        None
-                        if request_documents is None
-                        else request_documents[request_step]
+                        None if document_map is None else document_map[request_step]
                     ),
                     "rows": int(index.numel()),
                     "gate_square_sum": float(row_weights[index].sum()),
                     "route_weighted_squared_error": float(row_sse[index].sum()),
                     "route_weighted_reference_energy": float(row_energy[index].sum()),
-                    "teacher_mixture_energy": float(
-                        row_mixture_energy[index].sum()
-                    ),
+                    "teacher_mixture_energy": float(row_mixture_energy[index].sum()),
                 }
             )
         metrics[name] = {
@@ -219,9 +222,7 @@ def _parse_ints(value: str, *, minimum: int, maximum: int) -> tuple[int, ...]:
     if not values or len(set(values)) != len(values):
         raise argparse.ArgumentTypeError("values must be nonempty and unique")
     if any(not minimum <= item <= maximum for item in values):
-        raise argparse.ArgumentTypeError(
-            f"values must be in {minimum}..{maximum}"
-        )
+        raise argparse.ArgumentTypeError(f"values must be in {minimum}..{maximum}")
     return values
 
 
@@ -306,9 +307,9 @@ def _encoder_coordinates(
     if matrix == "w2":
         weight = source.index_select(1, permutation).T.contiguous()
         hessian_permutation = permutation.to(device=hessian.device)
-        encoder_hessian = hessian.index_select(
-            0, hessian_permutation
-        ).index_select(1, hessian_permutation)
+        encoder_hessian = hessian.index_select(0, hessian_permutation).index_select(
+            1, hessian_permutation
+        )
     else:
         weight = source.index_select(0, permutation).T.contiguous()
         encoder_hessian = hessian
@@ -393,15 +394,11 @@ def _quantize_uniform_matrix(
         raw_codebook = external_sqg_luts[bits].to(device=device)
         quant_args["sqg_e4m3_lut"] = raw_codebook
         custom_codebook = (
-            raw_codebook.view(torch.float8_e4m3fn)
-            .to(dtype=torch.float16)
-            .contiguous()
+            raw_codebook.view(torch.float8_e4m3fn).to(dtype=torch.float16).contiguous()
         )
     elif codebook == SQG_NORMAL_E4M3:
         mode = "normal"
-        quant_args["sqg_e4m3_lut"] = sqg_e4m3_bytes(
-            bits, mode, device=device
-        )
+        quant_args["sqg_e4m3_lut"] = sqg_e4m3_bytes(bits, mode, device=device)
         custom_codebook = sqg_e4m3_codebook(
             bits, mode, device=device, dtype=torch.float16
         )
@@ -453,8 +450,7 @@ def _quantize_uniform_matrix(
     raw_energy = source.double().square().sum()
     trellis_bytes = tensors["trellis"].numel() * tensors["trellis"].element_size()
     scale_bytes = sum(
-        tensors[name].numel() * tensors[name].element_size()
-        for name in ("suh", "svh")
+        tensors[name].numel() * tensors[name].element_size() for name in ("suh", "svh")
     )
     closure = comparison_metrics(quantized, stored_encoder_weight)
     if not all(math.isfinite(value) for value in closure.values()):
@@ -479,8 +475,7 @@ def _quantize_uniform_matrix(
         ),
         "stored_fp16_scale_closure_vs_encoder_float_scales": closure,
         "tensor_shapes": {
-            name: list(tensors[name].shape)
-            for name in ("trellis", "suh", "svh")
+            name: list(tensors[name].shape) for name in ("trellis", "suh", "svh")
         },
     }
     return reconstruction, evidence
@@ -489,7 +484,9 @@ def _quantize_uniform_matrix(
 def _aggregate_matrix_evidence(
     matrix_evidence: Sequence[Mapping[str, object]],
 ) -> dict[str, float | int]:
-    raw_numerator = sum(float(value["weight_squared_error"]) for value in matrix_evidence)
+    raw_numerator = sum(
+        float(value["weight_squared_error"]) for value in matrix_evidence
+    )
     raw_denominator = sum(
         float(value["weight_reference_energy"]) for value in matrix_evidence
     )
@@ -591,7 +588,10 @@ def _fit_contract(
 ) -> RequestPartition:
     partition = partition_requests(training_requests)
     manifest = _read_json(args.hessians / "manifest.json")
-    if Path(str(manifest.get("source_capture", ""))).resolve() != args.capture.resolve():
+    if (
+        Path(str(manifest.get("source_capture", ""))).resolve()
+        != args.capture.resolve()
+    ):
         raise ValueError("Hessian bundle does not come from the training capture")
     if manifest.get("sample_split") != "all":
         raise ValueError("Hessian bundle must retain all selected fit-document rows")
@@ -617,7 +617,10 @@ def _validate_corpus_contract(
             raise ValueError(f"{name} corpus report is not finalized")
         if Path(str(report.get("capture_dir", ""))).resolve() != capture.resolve():
             raise ValueError(f"{name} report and capture disagree")
-        if Path(str(report.get("model_dir", ""))).resolve() != args.checkpoint.resolve():
+        if (
+            Path(str(report.get("model_dir", ""))).resolve()
+            != args.checkpoint.resolve()
+        ):
             raise ValueError(f"{name} capture used a different resident teacher")
 
     training_fold = training_report.get("fold", {})
@@ -683,6 +686,7 @@ def _signature(
     source: Path,
     *,
     sqg_rank_lut: Mapping[str, object] | None,
+    activation: ExpertActivation,
 ) -> dict:
     return {
         "resident_teacher": str(args.checkpoint.resolve()),
@@ -700,12 +704,17 @@ def _signature(
         "ldlq_tf32": args.ldlq_tf32,
         "tailbite_context": args.tailbite_context,
         "compact": args.compact,
+        "activation": activation,
         "sqg_rank_lut": dict(sqg_rank_lut) if sqg_rank_lut is not None else None,
         "provenance": provenance,
     }
 
 
-def run(args: argparse.Namespace) -> dict:
+def run(
+    args: argparse.Namespace,
+    *,
+    activation: ExpertActivation = "situ",
+) -> dict:
     device = torch.device(args.device)
     if device.type != "cuda":
         raise ValueError("the full dense-H endpoint study requires CUDA")
@@ -717,9 +726,7 @@ def run(args: argparse.Namespace) -> dict:
     )
     partition = _fit_contract(args, training_requests)
     training_samples = load_layer_samples(args.capture, args.layer - 1)
-    validation_samples = load_layer_samples(
-        args.validation_capture, args.layer - 1
-    )
+    validation_samples = load_layer_samples(args.validation_capture, args.layer - 1)
     global_h13, global_h2 = load_layer_hessians(args.hessians, args.layer)
     external_sqg_luts: dict[int, torch.Tensor] | None = None
     sqg_rank_lut_metadata: dict[str, object] | None = None
@@ -738,6 +745,7 @@ def run(args: argparse.Namespace) -> dict:
         provenance,
         store.root,
         sqg_rank_lut=sqg_rank_lut_metadata,
+        activation=activation,
     )
     if args.resume:
         if not args.output.is_file():
@@ -769,10 +777,7 @@ def run(args: argparse.Namespace) -> dict:
         _atomic_write(args.output, payload)
 
     quantizer_module = load_qsrt_encoder(args.exllamav3_root)
-    if any(
-        codebook in STUDY_CODEBOOKS
-        for codebook in args.codebooks
-    ):
+    if any(codebook in STUDY_CODEBOOKS for codebook in args.codebooks):
         install_sqg_quantizer(quantizer_module)
     completed = set(payload["results"]) | set(payload["skipped"])
     for expert in args.experts:
@@ -789,7 +794,9 @@ def run(args: argparse.Namespace) -> dict:
         )
         support = {
             "fit_rows": int(fit_mask.sum()),
-            "fit_documents": int(torch.unique(all_rows.request_steps[fit_mask]).numel()),
+            "fit_documents": int(
+                torch.unique(all_rows.request_steps[fit_mask]).numel()
+            ),
             "confirmation_rows": int(confirmation_mask.sum()),
             "confirmation_documents": int(
                 torch.unique(all_rows.request_steps[confirmation_mask]).numel()
@@ -810,20 +817,20 @@ def run(args: argparse.Namespace) -> dict:
             continue
 
         source = tuple(
-            store.load_matrix(
-                args.layer, expert, matrix, device=device
-            ).float().contiguous()
+            store.load_matrix(args.layer, expert, matrix, device=device)
+            .float()
+            .contiguous()
             for matrix in MATRICES
         )
         fit_inputs = all_rows.inputs[fit_mask].float().to(device=device)
         fit_gates = all_rows.gates[fit_mask].float().to(device=device)
         with torch.inference_mode():
-            source_middle = torch.nn.functional.silu(
-                torch.nn.functional.linear(fit_inputs, source[0])
-            ) * torch.nn.functional.linear(fit_inputs, source[1])
-            contexts, block_scores = activation_block_contexts(
-                source_middle, fit_gates
+            source_middle = expert_middle(
+                torch.nn.functional.linear(fit_inputs, source[0]),
+                torch.nn.functional.linear(fit_inputs, source[1]),
+                activation,
             )
+            contexts, block_scores = activation_block_contexts(source_middle, fit_gates)
             h13, h2, covariance = build_expert_hessians(
                 fit_inputs,
                 fit_gates,
@@ -870,6 +877,7 @@ def run(args: argparse.Namespace) -> dict:
                     training_request_documents=partition.fit,
                     training_confirmation_documents=partition.confirmation,
                     validation_request_documents=validation_requests,
+                    activation=activation,
                 )
                 candidates[candidate_key] = {
                     "codebook": codebook,
@@ -903,10 +911,9 @@ def run(args: argparse.Namespace) -> dict:
                 trial = k4["routed_function"].get(fold)
                 if baseline is None or trial is None:
                     continue
-                comparison[f"{fold}_routed_error_ratio_k4_over_k3"] = (
-                    float(trial["route_weighted_squared_error"])
-                    / float(baseline["route_weighted_squared_error"])
-                )
+                comparison[f"{fold}_routed_error_ratio_k4_over_k3"] = float(
+                    trial["route_weighted_squared_error"]
+                ) / float(baseline["route_weighted_squared_error"])
                 comparison[f"{fold}_paired_document_improvement"] = (
                     _document_improvement(
                         baseline,
@@ -1022,9 +1029,7 @@ def parse_args() -> argparse.Namespace:
     if args.bootstrap_replicates < 100:
         parser.error("--bootstrap-replicates must be at least 100")
     if SQG_CHEB_NORMAL_E4M3 in args.codebooks and args.sqg_rank_lut is None:
-        parser.error(
-            f"--sqg-rank-lut is required for {SQG_CHEB_NORMAL_E4M3}"
-        )
+        parser.error(f"--sqg-rank-lut is required for {SQG_CHEB_NORMAL_E4M3}")
     return args
 
 

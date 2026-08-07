@@ -6,8 +6,17 @@ import pytest
 import torch
 
 import kquant.pack.qsrt_candidates as packed_candidates
-
 from kquant.capture import LayerSamples
+from kquant.pack.qsrt_candidates import (
+    _candidate_middle_by_r13,
+    _conditional_h2_by_r13,
+    _defer_functional_row_sse,
+    _finish_deferred_functional_sse,
+    _folded_intermediate_conditioning,
+    _prepare_deferred_functional_rows,
+    _quantize_conditional_down_grid,
+)
+from kquant.qsrt import INTERMEDIATE_CHANNELS, RECORDS_PER_EXPERT
 from kquant.qsrt_candidates import (
     activation_block_contexts,
     functional_sse_by_request,
@@ -19,16 +28,6 @@ from kquant.qsrt_candidates import (
     select_expert_rows,
     select_phase1_mode,
     select_phase1_rate_pair,
-)
-from kquant.qsrt import INTERMEDIATE_CHANNELS, RECORDS_PER_EXPERT
-from kquant.pack.qsrt_candidates import (
-    _candidate_middle_by_r13,
-    _conditional_h2_by_r13,
-    _defer_functional_row_sse,
-    _finish_deferred_functional_sse,
-    _folded_intermediate_conditioning,
-    _prepare_deferred_functional_rows,
-    _quantize_conditional_down_grid,
 )
 
 
@@ -280,6 +279,41 @@ def test_deferred_functional_sse_matches_reference(mask: torch.Tensor) -> None:
         torch.testing.assert_close(plan.reference_energy, expected_energy, rtol=0, atol=0)
         assert torch.equal(plan.counts, expected_counts)
 
+
+def test_candidate_middle_propagates_selected_activation(monkeypatch) -> None:
+    activations = []
+
+    def recording_middle(
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        activation: str,
+    ) -> torch.Tensor:
+        activations.append(activation)
+        return gate + up
+
+    monkeypatch.setattr(packed_candidates, "expert_middle", recording_middle)
+    inputs = torch.eye(2)
+    upstream = {
+        "w1": {
+            0: SimpleNamespace(reconstruction=torch.eye(2)),
+            1: SimpleNamespace(reconstruction=2.0 * torch.eye(2)),
+        },
+        "w3": {
+            0: SimpleNamespace(reconstruction=3.0 * torch.eye(2)),
+            1: SimpleNamespace(reconstruction=4.0 * torch.eye(2)),
+        },
+    }
+
+    result = _candidate_middle_by_r13(
+        inputs,
+        upstream,
+        (0, 1),
+        activation="silu",
+    )
+
+    assert activations == ["silu", "silu"]
+    torch.testing.assert_close(result[0], 4.0 * torch.eye(2))
+    torch.testing.assert_close(result[1], 6.0 * torch.eye(2))
 
 def test_conditional_h2_uses_each_decoded_upstream_candidate() -> None:
     inputs = torch.tensor(
