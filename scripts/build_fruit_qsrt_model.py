@@ -59,40 +59,180 @@ BASE_MANIFEST_SHA256 = (
 )
 KQUANT_REVISION = "a9c94ebc1039c77525c7129fcae9a32f4feb4ebc"
 EXLLAMAV3_REVISION = "791c83073f7f90c44f765a0ceeab7a05fa15b96b"
-B12X_REVISION = "9bbae67841e4818e7472e1edcdca8ebcbda68611"
-VLLM_REVISION = "ad1d3d1cf7123864bdd5e2bf1ed52c3437035828"
+B12X_REVISION = "5fefb62b64d7f544a977d47dedf33bfc65f2f392"
+VLLM_REVISION = "e353fa8d27241705772007f0f2c6aa82973470e0"
 _SOURCE_SUFFIXES = frozenset(
     {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".py", ".toml"}
 )
 _COMPLETE_MARKER_NAME = "QSRT_COMPLETE.json"
-MODEL_CARD = """---
-license: apache-2.0
+MODEL_CARD = r"""---
+license: mit
 library_name: transformers
+pipeline_tag: text-generation
 tags:
+- glm
+- mixture-of-experts
 - kquant
 - qsrt
-- mixture-of-experts
+- vllm
+- b12x
+- experimental
 ---
 
-# GLM-5.2-SIQ-Fruit-QSRT
+# GLM-5.2 QSRT Fruit
 
-Exact fixed-payload QSRT conversion of the Fruit-annealed GLM-5.2-SIQ model.
-Every routed expert in layers 3 through 13 uses the public SQG-XOR-Cheb-T12
-codebook, two fixed P24/P33 pairs per matrix, and expert-specific EXL rotations.
-Formats are chosen from the complete coupled `(R13, R2)` grid using a
-document-disjoint activation capture: fit documents construct global H13 and
-candidate-conditional expert H2, confirmation documents bootstrap-gate the
-winner against R0/R0, and a third fold remains untouched for validation.
-The TP-independent atom container stores every expert at exactly three trellis
-bits per coefficient. Serving shards its 16 whole 32-channel atoms at load
-time; no dense routed-expert fallback or serialized TP rank exists.
+This is a **5.04B-parameter GLM-5.2 serving proxy**, not the 754B GLM-5.2 model.
+It is the first complete Fruit checkpoint encoded in KQuant's canonical QSRT
+atom format and served without reconstructing dense expert weights.
 
-Serving requires the exact kquant, ExLlamaV3, b12x, and vLLM source identities
-recorded in `qsrt-manifest.json`. `qsrt-calibration-evidence.json` authenticates
-the selection capture without inflating the model with raw activation rows. The
-single-GPU runtime uses W4A8 for batches up to 16 tokens and W4A16 above that.
-`MANIFEST.sha256` authenticates the published files; `QSRT_COMPLETE.json` is
-written only after full structural validation.
+The artifact is a codec/runtime qualification release. Packaging, provenance,
+exact state decoding, full-vocabulary logit diagnostics, and single-GPU serving
+are complete. The checkpoint itself is **not chat-quality**; see
+[Known limitations](#known-limitations).
+
+## What is included
+
+- 13 transformer layers: 3 dense and 10 MoE layers, plus the packaged MTP
+  expert layer.
+- Hidden size 1,024; MoE intermediate size 512; 256 routed experts per MoE/MTP
+  layer.
+- 2,816 QSRT experts in 11 canonical atom files.
+- SQG-XOR-Cheb-T12 E4M3 codebook, three-bit trellis payload, fixed P24/P33 pair
+  records, and physical atom rotation.
+- Canonical `qsrt_atoms_v1` storage with complete per-file SHA-256 manifests
+  and a fail-closed `QSRT_COMPLETE.json` marker.
+- W4A16 prefill/reference execution and W4A8 decode execution through B12X.
+
+The expert allocation selected by the frozen calibration evidence is recorded
+in each `qsrt-layer-*.json` sidecar. Aggregate allocation counts are:
+
+| Allocation code | Experts |
+|---|---:|
+| `R13=0,R2=0` | 2,804 |
+| `R13=1,R2=0` | 10 |
+| `R13=1,R2=1` | 1 |
+| `R13=2,R2=2` | 1 |
+
+## Size and memory
+
+| Artifact | Bytes | GiB | Relative to QSRT |
+|---|---:|---:|---:|
+| This QSRT model payload | 2,963,006,983 | 2.7595 | baseline |
+| Prior SIQ mixed payload | 3,125,525,449 | 2.9109 | QSRT is 5.20% smaller |
+| BF16 source payload | 7,593,020,594 | 7.0716 | QSRT is 60.98% smaller |
+
+The canonical QSRT atom tensors account for 1,686,953,224 bytes (1.5711 GiB).
+In the validated TP1 server, vLLM reported 2.71 GiB of model memory and 0.18 GiB
+peak activation memory. W4A8 and W4A16 use the same stored weights, so their
+loader memory is identical; W4A8's benefit is decode throughput.
+
+## Quality diagnostics
+
+Forward KL is `KL(BF16 Fruit || served artifact)` over all 154,880 vocabulary
+logits at six teacher-forced positions for `Once upon a time, there was`. This
+is an exact full-vocabulary diagnostic, but only six positions; it is not a
+corpus evaluation.
+
+| Candidate | Mean forward KL | Max forward KL | Top-1 agreement | Mean top-10 overlap |
+|---|---:|---:|---:|---:|
+| QSRT W4A8 decode | 0.001730886 | 0.003468058 | 100% | 98.33% |
+| QSRT W4A16 | 0.002560550 | 0.011606094 | 100% | 98.33% |
+| Prior SIQ mixed | 0.001320508 | 0.006553701 | 100% | 98.33% |
+
+Raw reports are published under `evaluation/`. The W4A8 result shows that the
+activation-quantized decode path remains close to the frozen BF16 graph on this
+diagnostic. It does not establish that QSRT dominates SIQ on model quality.
+
+## Decode benchmark
+
+Measured on one NVIDIA GeForce RTX 5090 (32,607 MiB, driver 610.57.04), TP1,
+eager execution, `max_model_len=1024`, `max_num_seqs=1`, and NVFP4 MLA KV
+cache. Four prompts were issued sequentially with 700 output tokens each; all
+hit the length cap.
+
+| Mode | Steady vLLM decode | Mean client time, warm 700-token requests |
+|---|---:|---:|
+| QSRT W4A8 | 38.0-38.5 tok/s | 18.373 s |
+| QSRT W4A16 | 28.3-29.1 tok/s | 24.349 s |
+
+W4A8 reduced warm request time by 24.5%, equivalent to a 1.325x throughput
+speedup, under this single-request configuration. These are observed serving
+measurements, not a standardized benchmark.
+
+## Reproducible runtime
+
+The model requires the matching experimental branches until the pull requests
+merge:
+
+- KQuant encoder: [`local-inference-lab/kquant#4`](https://github.com/local-inference-lab/kquant/pull/4),
+  tested head `6854ed89642bad4653d0b107dc8b8a950ba824ab`.
+- B12X kernels: [`local-inference-lab/b12x#129`](https://github.com/local-inference-lab/b12x/pull/129),
+  tested head `5fefb62b64d7f544a977d47dedf33bfc65f2f392`.
+- vLLM loader: [`local-inference-lab/vllm#269`](https://github.com/local-inference-lab/vllm/pull/269),
+  tested head `e353fa8d27241705772007f0f2c6aa82973470e0`.
+
+```bash
+git clone --branch feat/fruit-qsrt-runtime https://github.com/malaiwah/sparkinfer.git b12x-fruit
+git -C b12x-fruit checkout 5fefb62b64d7f544a977d47dedf33bfc65f2f392
+
+git clone --branch feat/fruit-qsrt-runtime https://github.com/malaiwah/vllm-voipmonitor.git vllm-fruit
+git -C vllm-fruit checkout e353fa8d27241705772007f0f2c6aa82973470e0
+
+hf download malaiwah/GLM-5.2-QSRT-Fruit --local-dir GLM-5.2-QSRT-Fruit
+
+B12X_ROOT="$PWD/b12x-fruit" \
+MODEL="$PWD/GLM-5.2-QSRT-Fruit" \
+PYTHON_BIN="$PWD/vllm-fruit/.venv/bin/python" \
+CUDA_VISIBLE_DEVICES=0 \
+MAX_NUM_SEQS=1 \
+./vllm-fruit/serve-glm52-fruit-qsrt.sh
+```
+
+The tested environment uses SM120, CUDA 13.2-era wheels,
+`nvidia-cutlass-dsl >= 4.6`, and the r31 vLLM/B12X image stack. The launcher
+defaults to one sequence because the current B12X sparse-prefill backend
+requires single-request prefill chunks. Only TP1 has been validated for this
+Fruit package.
+
+W4A16 is used for prefill and any row count above the W4A8 decode ceiling. W4A8
+is selected for decode-sized batches of at most 16 rows. Unsupported shapes,
+activation modes, metadata, or incomplete manifests fail closed.
+
+## Provenance and integrity
+
+- Frozen Fruit checkpoint SHA-256:
+  `98ac7cb4f7799194424782b505d622069fecf4dbca5f5acb2658f2a66c3631f6`.
+- Calibration capture ID:
+  `cc686d28f505d62653763cdb746e830374207137d103d3c26ebbcec070059053`.
+- Calibration manifest SHA-256:
+  `77fd947235b89e67549fa264a08dc1436d3913ba8646d58da558d78e75d892cde`.
+- The encoder authenticated 256 documents / 46,223 tokens from disjoint fit,
+  confirmation, and validation splits.
+- Full encoding: 2,816 experts, 1,399.72 GPU-seconds, 2.537 GiB peak CUDA
+  allocation.
+- `MANIFEST.sha256`, `qsrt-manifest.json`, `.qsrt-source-evidence.json`,
+  `qsrt-calibration-evidence.json`, and `QSRT_COMPLETE.json` bind the published
+  package to the source and encoder fingerprints.
+
+## Known limitations
+
+- **Not chat-quality.** In a four-prompt instruction battery, all W4A8 and W4A16
+  generations reached the 700-token cap; responses were often repetitive or
+  unrelated to the instruction. Do not deploy this checkpoint as a user-facing
+  assistant.
+- The KL result covers six positions, not a representative corpus.
+- TP2 atom ownership was prepared and unit-tested, but only TP1 physical
+  serving was run because the validation host had one RTX 5090.
+- The current sparse-attention prefill backend requires `max_num_seqs=1`.
+- CUDA graphs were not used for the reported benchmark; correctness and
+  throughput were validated in eager mode.
+- This release qualifies the QSRT codec, storage, loader, and kernels. It does
+  not establish broad downstream task quality.
+
+## License
+
+MIT, matching the packaged Fruit source license. KQuant, B12X, and vLLM retain
+their respective repository licenses.
 """
 _SOURCE_EVIDENCE_NAME = ".qsrt-source-evidence.json"
 _SOURCE_EVIDENCE_SHA_NAME = ".qsrt-source-evidence.sha256"
