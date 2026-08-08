@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -23,18 +24,17 @@ from safetensors.torch import load_file
 
 from kquant import constants as C
 from kquant.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12
-from kquant.qsrt_candidates import RoutedRows, functional_sse_by_request
+from kquant.expert_activation import ExpertActivation, expert_middle
+from kquant.pack.qsrt_candidates import MatrixStore, candidate_tensor_name
 from kquant.qsrt import (
-    SCHEMA,
     MATRIX_TRELLIS_BYTES,
+    SCHEMA,
     PackedQSRTTrellis,
     QSRTTrellisDescriptor,
     decode_qsrt_exl3_weight,
     resolve_mode,
 )
-from kquant.pack.qsrt_candidates import MatrixStore, candidate_tensor_name
-from kquant.tp_simulator import situ
-
+from kquant.qsrt_candidates import RoutedRows, functional_sse_by_request
 
 VALIDATION_SCORE_KIND = "kquant_kimi_k3_qsrt_validation_scores"
 VALIDATION_SCORE_SCHEMA_VERSION = 4
@@ -218,6 +218,8 @@ def physical_expert_output(
     w1_input_output: torch.Tensor,
     w3_input_output: torch.Tensor,
     w2_input_output: torch.Tensor,
+    *,
+    activation: ExpertActivation = "situ",
 ) -> torch.Tensor:
     """Execute one candidate directly in its shared physical neuron order."""
 
@@ -233,7 +235,7 @@ def physical_expert_output(
         raise ValueError("expert inputs have the wrong width")
     gate = inputs @ w1_input_output
     up = inputs @ w3_input_output
-    return situ(gate, up) @ w2_input_output
+    return expert_middle(gate, up, activation) @ w2_input_output
 
 
 def official_expert_output(
@@ -243,6 +245,7 @@ def official_expert_output(
     layer: int,
     expert: int,
     device: torch.device,
+    activation: ExpertActivation = "situ",
 ) -> torch.Tensor:
     """Stream and execute one official expert with one source matrix resident."""
 
@@ -252,7 +255,7 @@ def official_expert_output(
     source_w3 = store.load_matrix(layer, expert, "w3", device=device)
     up = F.linear(inputs, source_w3)
     del source_w3
-    middle = situ(gate, up)
+    middle = expert_middle(gate, up, activation)
     del gate, up
     source_w2 = store.load_matrix(layer, expert, "w2", device=device)
     output = F.linear(middle, source_w2)
@@ -316,6 +319,7 @@ def selected_candidate_output(
     device: torch.device,
     logical_trellis_schema: str = SCHEMA,
     codebook: str = CODEBOOK_SQG_XOR_CHEB_T12,
+    activation: ExpertActivation = "situ",
 ) -> torch.Tensor:
     """Decode and execute one selected candidate with bounded matrix residency."""
 
@@ -343,7 +347,7 @@ def selected_candidate_output(
     )
     up = inputs @ w3.float()
     del w3
-    middle = situ(gate, up)
+    middle = expert_middle(gate, up, activation)
     del gate, up
     w2 = decode_candidate_matrix(
         reader,
@@ -373,6 +377,7 @@ def score_selected_expert(
     device: torch.device,
     logical_trellis_schema: str = SCHEMA,
     codebook: str = CODEBOOK_SQG_XOR_CHEB_T12,
+    activation: ExpertActivation = "situ",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return held-out routed SSE, reference energy, and counts by document."""
 
@@ -391,6 +396,7 @@ def score_selected_expert(
         layer=layer,
         expert=expert,
         device=device,
+        activation=activation,
     )
     candidate = selected_candidate_output(
         reader,
@@ -402,6 +408,7 @@ def score_selected_expert(
         device=device,
         logical_trellis_schema=logical_trellis_schema,
         codebook=codebook,
+        activation=activation,
     )
     result = functional_sse_by_request(
         reference,

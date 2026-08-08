@@ -7,9 +7,68 @@ import torch
 
 from scripts.validate_qsrt_codebooks import (
     _compact_functional_evidence,
+    _expert_output,
     _load_sqg_rank_lut,
+    _signature,
     _validate_corpus_contract,
 )
+
+
+def test_expert_output_uses_selected_activation() -> None:
+    inputs = torch.tensor([[0.5, -1.0]])
+    w1 = torch.tensor([[1.0, 2.0], [-0.5, 0.25]])
+    w3 = torch.tensor([[0.25, -1.0], [2.0, 0.5]])
+    w2 = torch.tensor([[1.5, -0.75]])
+
+    actual = _expert_output(inputs, w1, w3, w2, activation="silu")
+
+    gate = torch.nn.functional.linear(inputs, w1)
+    up = torch.nn.functional.linear(inputs, w3)
+    expected = torch.nn.functional.linear(
+        torch.nn.functional.silu(gate) * up,
+        w2,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_study_signature_binds_selected_activation(tmp_path) -> None:
+    args = Namespace(
+        checkpoint=tmp_path / "teacher",
+        official_revision="revision",
+        capture=tmp_path / "training.kqcapture",
+        validation_capture=tmp_path / "validation.kqcapture",
+        hessians=tmp_path / "hessians",
+        training_report=tmp_path / "training.json",
+        validation_report=tmp_path / "validation.json",
+        layer=3,
+        experts=(0,),
+        rates=(3,),
+        codebooks=("sqg-normal-e4m3",),
+        ldlq_tf32=False,
+        tailbite_context=128,
+        compact=False,
+    )
+    provenance = {"document_overlap": 0}
+    source = tmp_path / "official"
+
+    situ_signature = _signature(
+        args,
+        provenance,
+        source,
+        sqg_rank_lut=None,
+        activation="situ",
+    )
+    silu_signature = _signature(
+        args,
+        provenance,
+        source,
+        sqg_rank_lut=None,
+        activation="silu",
+    )
+
+    assert situ_signature["activation"] == "situ"
+    assert silu_signature["activation"] == "silu"
+    assert situ_signature != silu_signature
 
 
 def test_compact_functional_evidence_preserves_aggregate_folds() -> None:
@@ -37,9 +96,7 @@ def test_compact_functional_evidence_preserves_aggregate_folds() -> None:
 
 def test_compact_functional_evidence_rejects_immutable_fold() -> None:
     candidates = {
-        "sqg-normal-e4m3:K4": {
-            "routed_function": {"train": ("not", "mutable")}
-        }
+        "sqg-normal-e4m3:K4": {"routed_function": {"train": ("not", "mutable")}}
     }
 
     with pytest.raises(TypeError, match="fold evidence must be mutable"):
