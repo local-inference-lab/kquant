@@ -1,19 +1,52 @@
 from __future__ import annotations
 
+import hashlib
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import scripts.build_fruit_qsrt_model as builder
+import scripts.encode_fruit_qsrt as encoder
 
 
-def test_current_encoder_provenance_hashes_local_source_trees(tmp_path: Path) -> None:
+def _commit_test_checkout(root: Path) -> str:
+    subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+    subprocess.run(("git", "add", "."), cwd=root, check=True)
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=KQuant Test",
+            "-c",
+            "user.email=kquant@example.invalid",
+            "commit",
+            "-qm",
+            "test source",
+        ),
+        cwd=root,
+        check=True,
+    )
+    return subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_current_encoder_provenance_requires_committed_source(
+    monkeypatch, tmp_path: Path
+) -> None:
     exllamav3_root = tmp_path / "exllamav3-root"
     package = exllamav3_root / "exllamav3"
     package.mkdir(parents=True)
     source = package / "codec.py"
     source.write_text("CODEBOOK = 1\n", encoding="utf-8")
+    revision = _commit_test_checkout(exllamav3_root)
+    monkeypatch.setattr(builder, "EXLLAMAV3_REVISION", revision)
     calibration = SimpleNamespace(
         fingerprint="calibration-fingerprint",
         capture_id="capture-id",
@@ -25,40 +58,62 @@ def test_current_encoder_provenance_hashes_local_source_trees(tmp_path: Path) ->
         calibration=calibration,
     )
     source.write_text("CODEBOOK = 2\n", encoding="utf-8")
-    after = builder.current_encoder_provenance(
-        exllamav3_root=exllamav3_root,
-        calibration=calibration,
-    )
 
-    assert before["exllamav3_source_sha256"] != after["exllamav3_source_sha256"]
-    assert before["fingerprint"] != after["fingerprint"]
+    with pytest.raises(ValueError, match="uncommitted"):
+        builder.current_encoder_provenance(
+            exllamav3_root=exllamav3_root,
+            calibration=calibration,
+        )
+    assert before["exllamav3_revision"] == revision
 
 
-def test_encoder_fingerprint_is_content_addressed_not_revision_addressed(
-    monkeypatch, tmp_path: Path
+def test_encoder_fingerprint_binds_source_revisions() -> None:
+    encoder = {
+        "kquant_revision": "1" * 40,
+        "kquant_source_sha256": "2" * 64,
+        "exllamav3_revision": "3" * 40,
+        "exllamav3_source_sha256": "4" * 64,
+        "calibration_fingerprint": "5" * 64,
+        "calibration_capture_id": "6" * 64,
+        "calibration_manifest_sha256": "7" * 64,
+    }
+
+    first = hashlib.sha256(
+        builder._canonical_json(builder._encoder_fingerprint_payload(encoder)).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    encoder["kquant_revision"] = "8" * 40
+    second = hashlib.sha256(
+        builder._canonical_json(builder._encoder_fingerprint_payload(encoder)).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+    assert first != second
+
+
+def test_encoder_run_manifests_are_isolated_by_shard_and_assignment(
+    tmp_path: Path,
 ) -> None:
-    package = tmp_path / "exllamav3" / "exllamav3"
-    package.mkdir(parents=True)
-    (package / "codec.py").write_text("CODEBOOK = 1\n", encoding="utf-8")
-    calibration = SimpleNamespace(
-        fingerprint="calibration-fingerprint",
-        capture_id="capture-id",
-        manifest_sha256="manifest-sha256",
+    first = encoder._run_manifest_path(
+        tmp_path,
+        selection="all_assignments",
+        shard_count=8,
+        shard_index=0,
+        assignments=((3, 0), (3, 8)),
     )
-    revisions = iter(("first-revision", "second-revision"))
-    monkeypatch.setattr(builder, "_git_revision", lambda _root: next(revisions))
-
-    first = builder.current_encoder_provenance(
-        exllamav3_root=package.parent,
-        calibration=calibration,
-    )
-    second = builder.current_encoder_provenance(
-        exllamav3_root=package.parent,
-        calibration=calibration,
+    second = encoder._run_manifest_path(
+        tmp_path,
+        selection="all_assignments",
+        shard_count=8,
+        shard_index=1,
+        assignments=((3, 1), (3, 9)),
     )
 
-    assert first["kquant_revision"] != second["kquant_revision"]
-    assert first["fingerprint"] == second["fingerprint"]
+    assert first.parent == tmp_path / "run-manifests"
+    assert second.parent == first.parent
+    assert first != second
 
 
 def _rate_sweep(
@@ -147,6 +202,8 @@ def test_model_card_uses_sealed_calibration_and_layer_evidence(monkeypatch) -> N
         source_evidence={
             "source_kind": "safetensors_manifest",
             "source_sha256": "source-digest",
+            "source_repository": "owner/source",
+            "source_revision": "1" * 40,
         },
         calibration=calibration,
         producer=producer,
@@ -158,6 +215,8 @@ def test_model_card_uses_sealed_calibration_and_layer_evidence(monkeypatch) -> N
     assert "| `R13=1,R2=0` | 1 |" in card
     assert "capture-id" in card
     assert "calibration-manifest" in card
+    assert "https://huggingface.co/owner/source" in card
+    assert "1" * 40 in card
     assert "2 documents /" in card and "18 tokens" in card
     assert "2 experts, 4.00 GPU-seconds" in card
     assert "2.000 GiB peak CUDA allocation" in card
@@ -214,9 +273,7 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
         )
 
 
-def test_package_files_include_evaluation_but_exclude_resume_cache(
-    tmp_path: Path,
-) -> None:
+def test_package_files_reject_resume_cache_before_sealing(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
     evaluation = tmp_path / "evaluation"
     evaluation.mkdir()
@@ -225,8 +282,11 @@ def test_package_files_include_evaluation_but_exclude_resume_cache(
     parts.mkdir()
     (parts / "resume.bin").write_bytes(b"resume")
 
-    files = builder._package_files(tmp_path)
+    with pytest.raises(ValueError, match="unexpected Fruit package directory"):
+        builder._package_files(tmp_path)
 
+    builder._remove_part_cache(tmp_path)
+    files = builder._package_files(tmp_path)
     assert set(files) == {"config.json", "evaluation/report.json"}
 
 

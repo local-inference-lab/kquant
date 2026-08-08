@@ -65,6 +65,9 @@ class FruitModelSpec:
     intermediate_size: int
     trained_rope_theta: float
     serve_conv_v: int | None = None
+    safetensors_repository: str | None = None
+    safetensors_revision: str | None = None
+    safetensors_manifest_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_id, str) or not self.model_id:
@@ -105,6 +108,29 @@ class FruitModelSpec:
             raise ValueError("trained_rope_theta must be a finite positive number")
         if self.serve_conv_v is not None and self.serve_conv_v != 2:
             raise ValueError("serve_conv_v must be None for legacy layout or 2")
+        safetensors_identity = (
+            self.safetensors_repository,
+            self.safetensors_revision,
+            self.safetensors_manifest_sha256,
+        )
+        if any(value is not None for value in safetensors_identity):
+            if not all(
+                isinstance(value, str) and value for value in safetensors_identity
+            ):
+                raise ValueError(
+                    "safetensors repository, revision, and manifest identity "
+                    "must be configured together"
+                )
+            assert self.safetensors_revision is not None
+            assert self.safetensors_manifest_sha256 is not None
+            if re.fullmatch(r"[0-9a-f]{40}", self.safetensors_revision) is None:
+                raise ValueError(
+                    "safetensors_revision must be a 40-character lowercase Git SHA"
+                )
+            if _SHA256_RE.fullmatch(self.safetensors_manifest_sha256) is None:
+                raise ValueError(
+                    "safetensors_manifest_sha256 must be 64 lowercase hex digits"
+                )
 
 
 FRUIT_ANNEALED_SPEC = FruitModelSpec(
@@ -119,6 +145,11 @@ FRUIT_ANNEALED_SPEC = FruitModelSpec(
     intermediate_size=512,
     trained_rope_theta=500_000.0,
     serve_conv_v=None,
+    safetensors_repository="malaiwah/GLM-5.2-SIQ-Fruit-bf16",
+    safetensors_revision="ef68013aa6e16453cf52b5b77647f72fbe258c3c",
+    safetensors_manifest_sha256=(
+        "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
+    ),
 )
 
 
@@ -479,11 +510,19 @@ class FruitSafetensorsStore:
             or _SHA256_RE.fullmatch(expected_manifest_sha256) is None
         ):
             raise ValueError("expected_manifest_sha256 must be 64 lowercase hex digits")
+        if (
+            spec.safetensors_manifest_sha256 is not None
+            and expected_manifest_sha256 != spec.safetensors_manifest_sha256
+        ):
+            raise ValueError(
+                "expected_manifest_sha256 disagrees with the Fruit model specification"
+            )
 
         manifest_path = resolved / "MANIFEST.sha256"
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise FileNotFoundError(manifest_path)
-        actual_manifest_sha256 = _sha256(manifest_path)
+        manifest_bytes = manifest_path.read_bytes()
+        actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
         if actual_manifest_sha256 != expected_manifest_sha256:
             raise ValueError(
                 "Fruit safetensors manifest SHA-256 mismatch: "
@@ -491,7 +530,11 @@ class FruitSafetensorsStore:
                 f"expected {expected_manifest_sha256}"
             )
         entries: dict[str, str] = {}
-        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        try:
+            manifest_text = manifest_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Fruit safetensors manifest is not UTF-8") from exc
+        for line in manifest_text.splitlines():
             fields = line.split()
             if len(fields) != 2:
                 raise ValueError(f"malformed Fruit safetensors manifest line: {line!r}")
@@ -656,6 +699,8 @@ class FruitSafetensorsStore:
             "path": str(resolved),
             "safetensors_manifest_sha256": actual_manifest_sha256,
             "source_container": "hf_bf16_safetensors",
+            "source_repository": spec.safetensors_repository,
+            "source_revision": spec.safetensors_revision,
             "status": "pass",
             "version": 1,
         }

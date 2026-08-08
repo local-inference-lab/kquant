@@ -56,9 +56,8 @@ HIDDEN_SIZE = FRUIT_ANNEALED_SPEC.hidden_size
 INTERMEDIATE_SIZE = FRUIT_ANNEALED_SPEC.intermediate_size
 PAIR_COUNT = FRUIT_QSRT_PAIR_COUNT
 PAIR_WORDS = FRUIT_QSRT_PAIR_WORDS
-BASE_MANIFEST_SHA256 = (
-    "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
-)
+assert FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256 is not None
+BASE_MANIFEST_SHA256 = FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256
 EXLLAMAV3_REVISION = "791c83073f7f90c44f765a0ceeab7a05fa15b96b"
 _COMPLETE_MARKER_NAME = "QSRT_COMPLETE.json"
 MODEL_CARD_TEMPLATE = r"""---
@@ -147,7 +146,7 @@ payloads, not parameter-count estimates.
 | Artifact | Revision | Repository bytes | Safetensors bytes |
 |---|---|---:|---:|
 | [Fruit QSRT (pre-adjacent-rate-evidence publication)](https://huggingface.co/malaiwah/GLM-5.2-QSRT-Fruit/tree/c1a0c62d220602fdd8b7940dcba716671fb0033c) | `c1a0c62d` | 2,963,027,998 | 2,909,352,104 |
-| [Fruit BF16](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit-bf16/tree/ff1178d233fddc644dc053c723d58839eb921334) | `ff1178d2` | 10,102,776,679 | 10,081,800,232 |
+| [Fruit BF16](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit-bf16/tree/ff1178d233fd6c644dc053c72c3d58839eb921334) | `ff1178d2` | 10,102,776,679 | 10,081,800,232 |
 | [Fruit prior mixed SIQ](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit/tree/c1798e3676fa16b4a874381171adab1e3033fbd5) | `c1798e36` | 3,125,527,019 | 3,102,116,152 |
 | [Full GLM-5.2 BF16](https://huggingface.co/zai-org/GLM-5.2/tree/b4734de4facf877f85769a911abafc5283eab3d9) | `b4734de4` | 1,506,693,036,946 | 1,506,667,387,408 |
 | [Full GLM-5.2 FP8](https://huggingface.co/zai-org/GLM-5.2-FP8/tree/ba978f7d347eaf65d22f1a86833408afdb953541) | `ba978f7d` | 755,663,676,164 | 755,632,050,320 |
@@ -170,8 +169,7 @@ serving throughput.
 
 ## Reproducible runtime
 
-The model requires the matching experimental branches until the pull requests
-merge:
+The runtime is pinned to the reviewed commits below:
 
 - KQuant encoder: [`local-inference-lab/kquant#4`](https://github.com/local-inference-lab/kquant/pull/4),
   encoded with KQuant revision `__KQUANT_REVISION__`.
@@ -180,27 +178,50 @@ merge:
 - vLLM loader: [`local-inference-lab/vllm#269`](https://github.com/local-inference-lab/vllm/pull/269),
   tested revision `__VLLM_REVISION__`.
 
+The first Docker build compiles that vLLM commit. The second adds the exact
+B12X checkout and the fail-closed launcher. `MODEL_REVISION` resolves the Hub
+branch once; `hf download` then uses the resulting immutable commit SHA.
+
 ```bash
-git clone --branch feat/fruit-qsrt-runtime https://github.com/malaiwah/sparkinfer.git b12x-fruit
-git -C b12x-fruit checkout __B12X_REVISION__
-git clone --branch feat/fruit-qsrt-runtime https://github.com/malaiwah/vllm-voipmonitor.git vllm-fruit
-git -C vllm-fruit checkout __VLLM_REVISION__
+git clone https://github.com/malaiwah/vllm-voipmonitor.git vllm-fruit
+git -C vllm-fruit checkout --detach __VLLM_REVISION__
 
-hf download malaiwah/GLM-5.2-QSRT-Fruit --local-dir GLM-5.2-QSRT-Fruit
+docker build \
+  --target vllm-openai \
+  --file vllm-fruit/docker/Dockerfile \
+  --tag fruit-vllm-base:__VLLM_REVISION__ \
+  vllm-fruit
+docker build \
+  --file vllm-fruit/Dockerfile.fruit-qsrt \
+  --build-arg VLLM_BASE_IMAGE=fruit-vllm-base:__VLLM_REVISION__ \
+  --build-arg VLLM_REVISION=__VLLM_REVISION__ \
+  --build-arg B12X_REVISION=__B12X_REVISION__ \
+  --tag fruit-qsrt:__VLLM_REVISION__ \
+  vllm-fruit
 
-B12X_ROOT="$PWD/b12x-fruit" \
-MODEL="$PWD/GLM-5.2-QSRT-Fruit" \
-PYTHON_BIN="$PWD/vllm-fruit/.venv/bin/python" \
-CUDA_VISIBLE_DEVICES=0 \
-MAX_NUM_SEQS=1 \
-./vllm-fruit/serve-glm52-fruit-qsrt.sh
+MODEL_REVISION="$(
+  curl -fsSL https://huggingface.co/api/models/malaiwah/GLM-5.2-QSRT-Fruit \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
+)"
+MODEL_DIR="GLM-5.2-QSRT-Fruit-${MODEL_REVISION}"
+test ! -e "${MODEL_DIR}"
+hf download malaiwah/GLM-5.2-QSRT-Fruit \
+  --revision "${MODEL_REVISION}" \
+  --local-dir "${MODEL_DIR}"
+
+docker run --rm --gpus '"device=0"' --shm-size=16g \
+  --publish 8000:8000 \
+  --volume "$PWD/${MODEL_DIR}:/model:ro" \
+  --env MODEL=/model \
+  fruit-qsrt:__VLLM_REVISION__
 ```
 
-The tested environment uses SM120, CUDA 13.2-era wheels,
-`nvidia-cutlass-dsl >= 4.6`, and the r31 vLLM/B12X image stack. The launcher
-defaults to one sequence because the current B12X sparse-prefill backend
-requires single-request prefill chunks. Only TP1 has been validated for this
-Fruit package.
+The qualified path is SM120 with the CUDA 13.0.2 base pinned by the vLLM
+Dockerfile and `nvidia-cutlass-dsl == 4.6.0` pinned by B12X. The launcher rejects
+extra vLLM arguments and any value other than TP1, `max_num_seqs=1`,
+`max_model_len=4096`, and `max_num_batched_tokens=4096` before importing the GPU
+runtime. The current B12X sparse-prefill backend requires single-request
+prefill chunks.
 
 W4A16 is used for prefill and any row count above the W4A8 decode ceiling. W4A8
 is selected for decode-sized batches of at most 16 rows. Unsupported shapes,
@@ -208,7 +229,9 @@ activation modes, metadata, or incomplete manifests fail closed.
 
 ## Provenance and integrity
 
-- Authenticated encoder source (`__SOURCE_KIND__`) SHA-256:
+- Authenticated BF16 source: [`__SOURCE_REPOSITORY__`](https://huggingface.co/__SOURCE_REPOSITORY__)
+  at immutable revision `__SOURCE_REVISION__`.
+- Authenticated source manifest (`__SOURCE_KIND__`) SHA-256:
   `__SOURCE_SHA256__`.
 - Calibration capture ID:
   `__CALIBRATION_CAPTURE_ID__`.
@@ -237,8 +260,9 @@ activation modes, metadata, or incomplete manifests fail closed.
 
 ## License
 
-MIT, matching the packaged Fruit source license. KQuant, B12X, and vLLM retain
-their respective repository licenses.
+The packaged model files are MIT, matching the authenticated Fruit BF16 source
+license. B12X and vLLM are Apache-2.0. KQuant is not redistributed in this
+model repository and remains subject to its upstream repository licensing.
 """
 _SOURCE_EVIDENCE_NAME = ".qsrt-source-evidence.json"
 _SOURCE_EVIDENCE_SHA_NAME = ".qsrt-source-evidence.sha256"
@@ -246,7 +270,7 @@ _CALIBRATION_EVIDENCE_NAME = "qsrt-calibration-evidence.json"
 
 _RATE_SWEEP_SCHEMA = "kquant_fruit_uniform_rate_sweep_v1"
 _RATE_SWEEP_NAME = "evaluation/fruit-uniform-rate-sweep.json"
-_ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v2"
+_ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v3"
 _DTYPE_BYTES = {
     "BOOL": 1,
     "U8": 1,
@@ -292,7 +316,7 @@ def _git_revision(root: Path) -> str:
     return revision
 
 
-def _require_clean_source(root: Path, pathspec: str) -> None:
+def _require_clean_source(root: Path) -> None:
     _git_revision(root)
     try:
         result = subprocess.run(
@@ -301,10 +325,8 @@ def _require_clean_source(root: Path, pathspec: str) -> None:
                 "-C",
                 str(root),
                 "status",
-                "--porcelain",
+                "--porcelain=v1",
                 "--untracked-files=all",
-                "--",
-                pathspec,
             ),
             check=True,
             capture_output=True,
@@ -313,38 +335,33 @@ def _require_clean_source(root: Path, pathspec: str) -> None:
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"cannot inspect source tree: {root}") from exc
     if result.stdout:
-        raise ValueError(f"source tree has uncommitted files under {root / pathspec}")
+        raise ValueError(f"source checkout has uncommitted files: {root}")
 
 
 def _source_tree_sha256(root: Path) -> str:
     if not root.is_dir():
         raise FileNotFoundError(root)
-    entries = tuple(path for path in root.rglob("*") if "__pycache__" not in path.parts)
-    for path in entries:
-        if path.is_symlink():
-            raise ValueError(f"source tree must not contain symbolic links: {path}")
-    files = sorted(
-        (path for path in entries if path.is_file()),
-        key=lambda path: path.relative_to(root).as_posix(),
-    )
-    if not files:
-        raise ValueError(f"source tree has no fingerprinted files: {root}")
-    digest = hashlib.sha256()
-    for path in files:
-        relative = path.relative_to(root).as_posix().encode("utf-8")
-        content = path.read_bytes()
-        digest.update(len(relative).to_bytes(4, "little"))
-        digest.update(relative)
-        digest.update(len(content).to_bytes(8, "little"))
-        digest.update(content)
-    return digest.hexdigest()
+    _require_clean_source(root)
+    try:
+        result = subprocess.run(
+            ("git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", "HEAD"),
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"cannot enumerate tracked source tree: {root}") from exc
+    if not result.stdout:
+        raise ValueError(f"source checkout has no tracked files: {root}")
+    return hashlib.sha256(b"git-ls-tree-v1\0" + result.stdout).hexdigest()
 
 
 def _encoder_fingerprint_payload(encoder: dict[str, object]) -> dict[str, object]:
     return {
         "schema": _ENCODER_FINGERPRINT_SCHEMA,
+        "kquant_revision": encoder["kquant_revision"],
         "kquant_source_sha256": encoder["kquant_source_sha256"],
         "exllamav3_source_sha256": encoder["exllamav3_source_sha256"],
+        "exllamav3_revision": encoder["exllamav3_revision"],
         "calibration_fingerprint": encoder["calibration_fingerprint"],
         "calibration_capture_id": encoder["calibration_capture_id"],
         "calibration_manifest_sha256": encoder["calibration_manifest_sha256"],
@@ -357,12 +374,14 @@ def current_encoder_provenance(
     calibration: FruitCalibrationStore,
 ) -> dict[str, object]:
     kquant_checkout = Path(__file__).resolve().parents[1]
-    kquant_root = kquant_checkout / "kquant"
+    exllamav3_revision = _git_revision(exllamav3_root)
+    if exllamav3_revision != EXLLAMAV3_REVISION:
+        raise ValueError("ExLlamaV3 source revision does not match the pinned encoder")
     encoder: dict[str, object] = {
         "kquant_revision": _git_revision(kquant_checkout),
-        "kquant_source_sha256": _source_tree_sha256(kquant_root),
-        "exllamav3_revision": EXLLAMAV3_REVISION,
-        "exllamav3_source_sha256": _source_tree_sha256(exllamav3_root / "exllamav3"),
+        "kquant_source_sha256": _source_tree_sha256(kquant_checkout),
+        "exllamav3_revision": exllamav3_revision,
+        "exllamav3_source_sha256": _source_tree_sha256(exllamav3_root),
         "calibration_fingerprint": calibration.fingerprint,
         "calibration_capture_id": calibration.capture_id,
         "calibration_manifest_sha256": calibration.manifest_sha256,
@@ -387,9 +406,9 @@ def _producer_provenance(
     )
     runtime = {
         "b12x_revision": _git_revision(b12x_root),
-        "b12x_source_sha256": _source_tree_sha256(b12x_root / "b12x"),
+        "b12x_source_sha256": _source_tree_sha256(b12x_root),
         "vllm_revision": _git_revision(vllm_root),
-        "vllm_source_sha256": _source_tree_sha256(vllm_root / "vllm"),
+        "vllm_source_sha256": _source_tree_sha256(vllm_root),
     }
     provenance: dict[str, object] = {
         "schema": "kquant_fruit_qsrt_producer_v1",
@@ -695,6 +714,8 @@ def _render_model_card(
         "__KQUANT_REVISION__": str(encoder["kquant_revision"]),
         "__B12X_REVISION__": str(runtime["b12x_revision"]),
         "__VLLM_REVISION__": str(runtime["vllm_revision"]),
+        "__SOURCE_REPOSITORY__": str(source_evidence["source_repository"]),
+        "__SOURCE_REVISION__": str(source_evidence["source_revision"]),
         "__SOURCE_KIND__": str(source_evidence["source_kind"]),
         "__SOURCE_SHA256__": str(source_evidence["source_sha256"]),
         "__CALIBRATION_CAPTURE_ID__": calibration.capture_id,
@@ -1139,6 +1160,8 @@ def _validate_source_evidence(value: object) -> dict[str, object]:
                 "source_kind": "safetensors_manifest",
                 "expected_checkpoint_sha256": (FRUIT_ANNEALED_SPEC.checkpoint_sha256),
                 "safetensors_manifest_sha256": BASE_MANIFEST_SHA256,
+                "source_repository": FRUIT_ANNEALED_SPEC.safetensors_repository,
+                "source_revision": FRUIT_ANNEALED_SPEC.safetensors_revision,
             }
         )
     elif value.get("source_container") in ("model", "state_dict"):
@@ -1497,14 +1520,19 @@ def _authenticate_base_model(base_model: Path) -> dict[str, object]:
     manifest_path = base_model / "MANIFEST.sha256"
     if not manifest_path.is_file():
         raise FileNotFoundError(manifest_path)
-    manifest_sha256 = _sha256(manifest_path)
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     if manifest_sha256 != BASE_MANIFEST_SHA256:
         raise ValueError(
             "Fruit BF16 base manifest identity mismatch: "
             f"{manifest_sha256} != {BASE_MANIFEST_SHA256}"
         )
     entries: dict[str, str] = {}
-    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+    try:
+        manifest_text = manifest_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Fruit BF16 base manifest is not UTF-8") from exc
+    for line in manifest_text.splitlines():
         fields = line.split()
         if len(fields) != 2:
             raise ValueError(f"malformed Fruit BF16 base manifest line: {line!r}")
@@ -1727,10 +1755,13 @@ def _package_files(output: Path) -> dict[str, Path]:
     for path in output.iterdir():
         if path.is_symlink():
             raise ValueError(f"Fruit package path must not be a symbolic link: {path}")
-        if path.is_file() and path.name not in {
-            "MANIFEST.sha256",
-            _COMPLETE_MARKER_NAME,
-        }:
+        if path.is_dir():
+            if path.name != "evaluation":
+                raise ValueError(f"unexpected Fruit package directory: {path}")
+            continue
+        if not path.is_file():
+            raise ValueError(f"unexpected Fruit package path: {path}")
+        if path.name not in {"MANIFEST.sha256", _COMPLETE_MARKER_NAME}:
             files[path.name] = path
     evaluation = output / "evaluation"
     if evaluation.is_dir():
@@ -2059,13 +2090,13 @@ def main() -> None:
     if args.output.resolve() == args.base_model.resolve():
         raise ValueError("output must not alias base_model")
     source_roots = (
-        (Path(__file__).resolve().parents[1], "kquant"),
-        (args.exllamav3_root, "exllamav3"),
-        (args.b12x_root, "b12x"),
-        (args.vllm_root, "vllm"),
+        Path(__file__).resolve().parents[1],
+        args.exllamav3_root,
+        args.b12x_root,
+        args.vllm_root,
     )
-    for source_root, pathspec in source_roots:
-        _require_clean_source(source_root, pathspec)
+    for source_root in source_roots:
+        _require_clean_source(source_root)
     calibration = FruitCalibrationStore(args.calibration)
     if _git_revision(args.exllamav3_root) != EXLLAMAV3_REVISION:
         raise ValueError("ExLlamaV3 source revision does not match the pinned encoder")

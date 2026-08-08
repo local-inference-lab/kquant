@@ -106,6 +106,28 @@ def _artifact_paths(root: Path, layer: int, expert: int) -> tuple[Path, Path]:
     )
 
 
+def _run_manifest_path(
+    root: Path,
+    *,
+    selection: str,
+    shard_count: int,
+    shard_index: int,
+    assignments: tuple[tuple[int, int], ...],
+) -> Path:
+    identity = {
+        "selection": selection,
+        "shard_count": shard_count,
+        "shard_index": shard_index,
+        "assignments": [list(value) for value in assignments],
+    }
+    digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()[:16]
+    return (
+        root
+        / "run-manifests"
+        / f"run-{shard_index:04d}-of-{shard_count:04d}-{digest}.json"
+    )
+
+
 def _resume_evidence(
     tensor_path: Path,
     manifest_path: Path,
@@ -335,6 +357,13 @@ def main() -> None:
     by_layer: dict[int, int] = defaultdict(int)
     for layer, _ in assignments:
         by_layer[layer] += 1
+    selection = (
+        "frozen_19_assignment_sample"
+        if args.sample
+        else "all_assignments"
+        if args.all
+        else "explicit_assignments"
+    )
     run_manifest = {
         "schema": "kquant_fruit_qsrt_encode_run_v1",
         "version": 1,
@@ -343,13 +372,7 @@ def main() -> None:
         "codebook": FRUIT_QSRT_CODEBOOK,
         "source": store.evidence,
         "encoder": encoder,
-        "selection": (
-            "frozen_19_assignment_sample"
-            if args.sample
-            else "all_assignments"
-            if args.all
-            else "explicit_assignments"
-        ),
+        "selection": selection,
         "shard": {
             "count": args.shard_count,
             "index": args.shard_index,
@@ -361,7 +384,15 @@ def main() -> None:
         "results": results,
         "status": "pass",
     }
-    _atomic_text(args.output / "run-manifest.json", _canonical_json(run_manifest))
+    run_manifest_path = _run_manifest_path(
+        args.output,
+        selection=selection,
+        shard_count=args.shard_count,
+        shard_index=args.shard_index,
+        assignments=assignments,
+    )
+    run_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_text(run_manifest_path, _canonical_json(run_manifest))
 
 
 if __name__ == "__main__":

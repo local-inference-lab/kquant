@@ -1494,7 +1494,7 @@ def _encode_calibrated_expert(
         "policy": "activation_coupled_functional_sse_v1",
         "calibrated_activations": True,
         "hessian_policy": "global_fit_h13_candidate_conditional_expert_h2",
-        "permutation_policy": "gate_square_post_situ_energy_h2_reverse",
+        "permutation_policy": "gate_square_post_silu_energy_h2_reverse",
         "calibration_fingerprint": calibration.fingerprint,
         "proposed": {
             "r13": decision.proposed_r13,

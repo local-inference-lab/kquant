@@ -41,9 +41,8 @@ from kquant.fruit_source import FRUIT_ANNEALED_SPEC
 
 _SMALL_TOKENIZER_FILES = tuple(FRUIT_CALIBRATION_TOKENIZER_FILES)
 
-_BF16_BASE_MANIFEST_SHA256 = (
-    "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
-)
+assert FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256 is not None
+_BF16_BASE_MANIFEST_SHA256 = FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256
 _BF16_BASE_INDEX = "model.safetensors.index.json"
 _MODEL_MARKER_KEYS = frozenset({"rope_theta_trained", "serve_conv_v"})
 
@@ -432,11 +431,16 @@ def _authenticate_bf16_base(root: Path) -> tuple[dict[str, object], dict[str, st
     manifest_path = root / "MANIFEST.sha256"
     if not manifest_path.is_file() or manifest_path.is_symlink():
         raise FileNotFoundError(manifest_path)
-    manifest_sha256 = _sha256(manifest_path)
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     if manifest_sha256 != _BF16_BASE_MANIFEST_SHA256:
         raise ValueError("Fruit BF16 base MANIFEST.sha256 identity mismatch")
     entries: dict[str, str] = {}
-    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+    try:
+        manifest_text = manifest_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Fruit BF16 base MANIFEST.sha256 is not UTF-8") from exc
+    for line in manifest_text.splitlines():
         fields = line.split()
         if (
             len(fields) != 2

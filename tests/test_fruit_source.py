@@ -29,6 +29,22 @@ _BASE_SPEC = FruitModelSpec(
     trained_rope_theta=500_000.0,
 )
 _STACKED = {"w1": "w_gate", "w3": "w_up", "w2": "w_down"}
+
+
+def test_annealed_bf16_source_identity_is_publicly_pinned() -> None:
+    assert (
+        FRUIT_ANNEALED_SPEC.safetensors_repository == "malaiwah/GLM-5.2-SIQ-Fruit-bf16"
+    )
+    assert (
+        FRUIT_ANNEALED_SPEC.safetensors_revision
+        == "ef68013aa6e16453cf52b5b77647f72fbe258c3c"
+    )
+    assert (
+        FRUIT_ANNEALED_SPEC.safetensors_manifest_sha256
+        == "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
+    )
+
+
 _PROJECTION = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
 
 
@@ -165,6 +181,11 @@ def test_real_annealed_spec_freezes_source_identity_and_geometry() -> None:
         intermediate_size=512,
         trained_rope_theta=500_000.0,
         serve_conv_v=None,
+        safetensors_repository="malaiwah/GLM-5.2-SIQ-Fruit-bf16",
+        safetensors_revision="ef68013aa6e16453cf52b5b77647f72fbe258c3c",
+        safetensors_manifest_sha256=(
+            "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
+        ),
     )
 
 
