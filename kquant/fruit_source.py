@@ -381,6 +381,9 @@ class FruitCheckpointStore:
             "checkpoint_bytes": before.st_size,
             "checkpoint_filename": resolved.name,
             "checkpoint_sha256": actual,
+            "source_sha256": actual,
+            "checkpoint_sha256_provenance": "checkpoint_file_authenticated",
+            "source_kind": "torch_checkpoint",
             "conventions": conventions,
             "expert_inventory": {
                 "dtypes": list(dtypes),
@@ -622,7 +625,13 @@ class FruitSafetensorsStore:
         self._weight_map: dict[str, str] = weight_map
         self._keys = keys
         self.evidence: dict[str, object] = {
-            "checkpoint_sha256": spec.checkpoint_sha256,
+            "checkpoint_sha256": actual_manifest_sha256,
+            "checkpoint_sha256_provenance": "safetensors_manifest_authenticated",
+            "source_sha256": actual_manifest_sha256,
+            "checkpoint_filename": manifest_path.name,
+            "checkpoint_bytes": manifest_path.stat().st_size,
+            "source_kind": "safetensors_manifest",
+            "expected_checkpoint_sha256": spec.checkpoint_sha256,
             "conventions": {
                 "kind": "legacy",
                 "trained_rope_theta": float(spec.trained_rope_theta),

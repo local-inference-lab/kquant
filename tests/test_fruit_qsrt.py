@@ -6,6 +6,10 @@ import torch
 from kquant.exl3_reference import reconstruct_trellis_states
 from kquant.fruit_qsrt import (
     FRUIT_QSRT_ARTIFACT_TENSORS,
+    FRUIT_QSRT_ATOM_BUNDLE_BYTES,
+    FRUIT_QSRT_ATOM_TENSOR,
+    FRUIT_QSRT_ATOMS_PER_EXPERT,
+    FRUIT_QSRT_FORMAT_TENSOR,
     FRUIT_QSRT_MATRIX_BYTES,
     FRUIT_QSRT_PAIR_COUNT,
     FRUIT_QSRT_PAIR_WORDS,
@@ -16,9 +20,17 @@ from kquant.fruit_qsrt import (
     fruit_pair_modes,
     fruit_transform_seeds,
     fruit_weight_permutations,
+    pack_fruit_atom_layer,
+    pack_fruit_expert_atoms,
+    pack_fruit_local_scale_atoms,
+    pack_fruit_matrix_atoms,
     pack_fruit_trellis,
+    rotate_fruit_expert_atoms,
     stack_fruit_layer,
+    unpack_fruit_local_scale_atoms,
+    unpack_fruit_matrix_atoms,
     unpack_fruit_trellis,
+    unrotate_fruit_expert_atoms,
 )
 from kquant.logical_qsrt import (
     FRUIT_QSRT_GEOMETRY,
@@ -208,3 +220,65 @@ def test_trellis_payload_rejects_wrong_dtype_shape_and_geometry() -> None:
         unpack_fruit_trellis(payload.flatten(), R0, rate_axis="n")
     with pytest.raises(ValueError, match="geometry"):
         pack_fruit_trellis(states[:, :-1], R0, rate_axis="n")
+
+
+@pytest.mark.parametrize("mode", fruit_rate_modes())
+@pytest.mark.parametrize("matrix,rate_axis", (("w1", "n"), ("w3", "n"), ("w2", "k")))
+def test_matrix_atoms_round_trip_every_mode_and_orientation(
+    mode, matrix: str, rate_axis: str
+) -> None:
+    payload = pack_fruit_trellis(
+        _closed_states(mode, rate_axis), mode, rate_axis=rate_axis
+    )
+
+    atoms = pack_fruit_matrix_atoms(payload, mode, matrix=matrix)
+
+    assert atoms.shape[0] == FRUIT_QSRT_ATOMS_PER_EXPERT
+    assert torch.equal(unpack_fruit_matrix_atoms(atoms, mode, matrix=matrix), payload)
+
+
+def test_local_scale_and_physical_rotation_atoms_round_trip() -> None:
+    scale = torch.arange(FRUIT_QSRT_GEOMETRY.intermediate_channels, dtype=torch.float16)
+    scale_atoms = pack_fruit_local_scale_atoms(scale)
+    logical = torch.arange(FRUIT_QSRT_ATOMS_PER_EXPERT * 7, dtype=torch.int32).reshape(
+        FRUIT_QSRT_ATOMS_PER_EXPERT, 7
+    )
+
+    assert torch.equal(unpack_fruit_local_scale_atoms(scale_atoms), scale)
+    assert torch.equal(
+        unrotate_fruit_expert_atoms(
+            rotate_fruit_expert_atoms(logical, layer=13, expert=255),
+            layer=13,
+            expert=255,
+        ),
+        logical,
+    )
+
+
+def test_atom_layer_matches_independently_packed_experts() -> None:
+    encodings = (_expert(0, r13=0, r2=1), _expert(1, r13=2, r2=2))
+    artifact = stack_fruit_layer(3, encodings)
+
+    packed = pack_fruit_atom_layer(artifact.tensors, layer=3)
+
+    assert packed[FRUIT_QSRT_FORMAT_TENSOR][:2].tolist() == [0x01, 0x22]
+    atom_slab = packed[FRUIT_QSRT_ATOM_TENSOR][
+        :, : len(encodings) * FRUIT_QSRT_ATOM_BUNDLE_BYTES
+    ].reshape(
+        FRUIT_QSRT_ATOMS_PER_EXPERT,
+        len(encodings),
+        FRUIT_QSRT_ATOM_BUNDLE_BYTES,
+    )
+    for index, encoding in enumerate(encodings):
+        expected = pack_fruit_expert_atoms(
+            layer=3,
+            expert=encoding.expert,
+            r13=encoding.r13,
+            r2=encoding.r2,
+            w13_trellis=artifact.tensors["w13_trellis"][:, index].contiguous(),
+            w2_trellis=artifact.tensors["w2_trellis"][index].contiguous(),
+            intermediate_rotations=artifact.tensors["intermediate_rotations"][
+                index
+            ].contiguous(),
+        )
+        assert torch.equal(atom_slab[:, index], expected)

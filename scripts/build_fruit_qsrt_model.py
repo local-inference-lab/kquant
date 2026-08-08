@@ -7,8 +7,10 @@ import argparse
 import errno
 import hashlib
 import json
+import math
 import os
 import shutil
+import subprocess
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -57,15 +59,9 @@ PAIR_WORDS = FRUIT_QSRT_PAIR_WORDS
 BASE_MANIFEST_SHA256 = (
     "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
 )
-KQUANT_REVISION = "a9c94ebc1039c77525c7129fcae9a32f4feb4ebc"
 EXLLAMAV3_REVISION = "791c83073f7f90c44f765a0ceeab7a05fa15b96b"
-B12X_REVISION = "5fefb62b64d7f544a977d47dedf33bfc65f2f392"
-VLLM_REVISION = "e353fa8d27241705772007f0f2c6aa82973470e0"
-_SOURCE_SUFFIXES = frozenset(
-    {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".py", ".toml"}
-)
 _COMPLETE_MARKER_NAME = "QSRT_COMPLETE.json"
-MODEL_CARD = r"""---
+MODEL_CARD_TEMPLATE = r"""---
 license: mit
 library_name: vllm
 pipeline_tag: text-generation
@@ -85,10 +81,10 @@ This is a **5.04B-parameter GLM-5.2 serving proxy**, not the 754B GLM-5.2 model.
 It is the first complete Fruit checkpoint encoded in KQuant's canonical QSRT
 atom format and served without reconstructing dense expert weights.
 
-The artifact is a codec/runtime qualification release. Packaging, provenance,
-exact state decoding, full-vocabulary logit diagnostics, and single-GPU serving
-are complete. The checkpoint itself is **not chat-quality**; see
-[Known limitations](#known-limitations).
+The artifact is a codec/storage/runtime integration release. Packaging,
+provenance, exact state decoding, and the canonical single-GPU runtime path are
+implemented. The checkpoint itself has no downstream chat-quality
+qualification; see [Known limitations](#known-limitations).
 
 ## What is included
 
@@ -108,56 +104,69 @@ in each `qsrt-layer-*.json` sidecar. Aggregate allocation counts are:
 
 | Allocation code | Experts |
 |---|---:|
-| `R13=0,R2=0` | 2,804 |
-| `R13=1,R2=0` | 10 |
-| `R13=1,R2=1` | 1 |
-| `R13=2,R2=2` | 1 |
+__ALLOCATION_ROWS__
 
 ## Size and memory
 
-| Artifact | Bytes | GiB | Relative to QSRT |
-|---|---:|---:|---:|
-| This QSRT model payload | 2,963,006,983 | 2.7595 | baseline |
-| Prior SIQ mixed payload | 3,125,525,449 | 2.9109 | QSRT is 5.20% smaller |
-| BF16 source payload | 7,593,020,594 | 7.0716 | QSRT is 60.98% smaller |
+The apples-to-apples baseline is the complete BF16 tensor set. All three rows
+below cover the same 5,040,368,896 logical parameters and count only
+Safetensors files; `effective bpw` is stored bytes times eight divided by that
+parameter count, so it includes container and quantization metadata.
 
-The canonical QSRT atom tensors account for 1,686,953,224 bytes (1.5711 GiB).
-In the validated TP1 server, vLLM reported 2.71 GiB of model memory and 0.18 GiB
-peak activation memory. W4A8 and W4A16 use the same stored weights, so their
-loader memory is identical; W4A8's benefit is decode throughput.
-
-## Quality diagnostics
-
-Forward KL is `KL(BF16 Fruit || served artifact)` over all 154,880 vocabulary
-logits at six teacher-forced positions for `Once upon a time, there was`. This
-is an exact full-vocabulary diagnostic, but only six positions; it is not a
-corpus evaluation.
-
-| Candidate | Mean forward KL | Max forward KL | Top-1 agreement | Mean top-10 overlap |
+| Tensor payload | Bytes | GiB | Effective bpw | Relative to BF16 |
 |---|---:|---:|---:|---:|
-| QSRT W4A8 decode | 0.001730886 | 0.003468058 | 100% | 98.33% |
-| QSRT W4A16 | 0.002560550 | 0.011606094 | 100% | 98.33% |
-| Prior SIQ mixed | 0.001320508 | 0.006553701 | 100% | 98.33% |
+| BF16 source | 10,081,800,232 | 9.3894 | 16.0017 | baseline |
+| Prior SIQ mixed | 3,102,116,152 | 2.8891 | 4.9236 | 69.23% smaller |
+| This QSRT model | 2,909,352,104 | 2.7095 | 4.6177 | 71.14% smaller |
 
-Raw reports are published under `evaluation/`. The W4A8 result shows that the
-activation-quantized decode path remains close to the frozen BF16 graph on this
-diagnostic. It does not establish that QSRT dominates SIQ on model quality.
+The whole-model rates include 611,183,872 non-routed parameters retained in
+BF16. Isolating the 4,429,185,024 routed-expert weights gives:
 
-## Decode benchmark
+| Routed-expert format | Stored bytes | Nominal path bpw | Effective stored bpw |
+|---|---:|---:|---:|
+| BF16 | 8,858,370,048 | 16.0000 | 16.0000 |
+| Prior SIQ mixed (1,856 K3 / 960 K4 experts) | 1,879,717,272 | 3.3409 | 3.3951 |
+| QSRT P24/P33 atoms | 1,686,953,224 | 3.0000 | 3.0470 |
 
-Measured on one NVIDIA GeForce RTX 5090 (32,607 MiB, driver 610.57.04), TP1,
-eager execution, `max_model_len=1024`, `max_num_seqs=1`, and NVFP4 MLA KV
-cache. Four prompts were issued sequentially with 700 output tokens each; all
-hit the length cap.
+QSRT is therefore 10.25% smaller than SIQ on the routed-expert component and
+6.21% smaller on the compared tensor files. Package-level totals are not used
+for the comparison because tokenizer, card, and optional evaluation files are
+not model weights. The previous card's 7,593,020,594-byte BF16 row was not the
+complete BF16 tensor set and has been removed.
 
-| Mode | Steady vLLM decode | Mean client time, warm 700-token requests |
-|---|---:|---:|
-| QSRT W4A8 | 38.0-38.5 tok/s | 18.373 s |
-| QSRT W4A16 | 28.3-29.1 tok/s | 24.349 s |
+W4A8 and W4A16 use the same stored weights, so their loader weight storage is
+identical; W4A8 changes the decode execution path, not the checkpoint size.
 
-W4A8 reduced warm request time by 24.5%, equivalent to a 1.325x throughput
-speedup, under this single-request configuration. These are observed serving
-measurements, not a standardized benchmark.
+### Hugging Face repository-size audit
+
+The Hugging Face model API with `blobs=true` reported the following immutable
+snapshot on 2026-08-08. `Repository bytes` sums every sibling's reported size;
+`Safetensors bytes` sums only `*.safetensors`. These are observed repository
+payloads, not parameter-count estimates.
+
+| Artifact | Revision | Repository bytes | Safetensors bytes |
+|---|---|---:|---:|
+| [Fruit QSRT (pre-adjacent-rate-evidence publication)](https://huggingface.co/malaiwah/GLM-5.2-QSRT-Fruit/tree/c1a0c62d220602fdd8b7940dcba716671fb0033c) | `c1a0c62d` | 2,963,027,998 | 2,909,352,104 |
+| [Fruit BF16](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit-bf16/tree/ff1178d233fddc644dc053c723d58839eb921334) | `ff1178d2` | 10,102,776,679 | 10,081,800,232 |
+| [Fruit prior mixed SIQ](https://huggingface.co/malaiwah/GLM-5.2-SIQ-Fruit/tree/c1798e3676fa16b4a874381171adab1e3033fbd5) | `c1798e36` | 3,125,527,019 | 3,102,116,152 |
+| [Full GLM-5.2 BF16](https://huggingface.co/zai-org/GLM-5.2/tree/b4734de4facf877f85769a911abafc5283eab3d9) | `b4734de4` | 1,506,693,036,946 | 1,506,667,387,408 |
+| [Full GLM-5.2 FP8](https://huggingface.co/zai-org/GLM-5.2-FP8/tree/ba978f7d347eaf65d22f1a86833408afdb953541) | `ba978f7d` | 755,663,676,164 | 755,632,050,320 |
+| [Full GLM-5.2 NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4/tree/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa) | `aec724e8` | 464,874,323,992 | 464,823,042,096 |
+
+The three full-model rows ground real download/storage scale only. They are not
+used for Fruit percentage claims because Fruit has 5.04B parameters while the
+production model has roughly 754B. The apples-to-apples Fruit tensor
+comparison above remains the codec-size result.
+
+__RATE_SWEEP_SECTION__
+
+## Evidence boundary
+
+The completion seal covers every top-level package file and every regular file
+under `evaluation/`. The sealed adjacent-rate report measures local routed
+expert reconstruction on authenticated, document-disjoint calibration rows.
+It does not establish chat quality, broad downstream task quality, or general
+serving throughput.
 
 ## Reproducible runtime
 
@@ -165,18 +174,18 @@ The model requires the matching experimental branches until the pull requests
 merge:
 
 - KQuant encoder: [`local-inference-lab/kquant#4`](https://github.com/local-inference-lab/kquant/pull/4),
-  tested head `6854ed89642bad4653d0b107dc8b8a950ba824ab`.
+  encoded with KQuant revision `__KQUANT_REVISION__`.
 - B12X kernels: [`local-inference-lab/b12x#129`](https://github.com/local-inference-lab/b12x/pull/129),
-  tested head `5fefb62b64d7f544a977d47dedf33bfc65f2f392`.
+  tested revision `__B12X_REVISION__`.
 - vLLM loader: [`local-inference-lab/vllm#269`](https://github.com/local-inference-lab/vllm/pull/269),
-  tested head `e353fa8d27241705772007f0f2c6aa82973470e0`.
+  tested revision `__VLLM_REVISION__`.
 
 ```bash
 git clone --branch feat/fruit-qsrt-runtime https://github.com/malaiwah/sparkinfer.git b12x-fruit
-git -C b12x-fruit checkout 5fefb62b64d7f544a977d47dedf33bfc65f2f392
+git -C b12x-fruit checkout __B12X_REVISION__
 
 git clone --branch feat/fruit-qsrt-runtime https://github.com/malaiwah/vllm-voipmonitor.git vllm-fruit
-git -C vllm-fruit checkout e353fa8d27241705772007f0f2c6aa82973470e0
+git -C vllm-fruit checkout __VLLM_REVISION__
 
 hf download malaiwah/GLM-5.2-QSRT-Fruit --local-dir GLM-5.2-QSRT-Fruit
 
@@ -200,32 +209,30 @@ activation modes, metadata, or incomplete manifests fail closed.
 
 ## Provenance and integrity
 
-- Frozen Fruit checkpoint SHA-256:
-  `98ac7cb4f7799194424782b505d622069fecf4dbca5f5acb2658f2a66c3631f6`.
+- Authenticated encoder source (`__SOURCE_KIND__`) SHA-256:
+  `__SOURCE_SHA256__`.
 - Calibration capture ID:
-  `cc686d28f505d62653763cdb746e830374207137d103d3c26ebbcec070059053`.
+  `__CALIBRATION_CAPTURE_ID__`.
 - Calibration manifest SHA-256:
-  `77fd947235b89e67549fa264a08dc1436d3913ba8646d58da558d78e75d892cde`.
-- The encoder authenticated 256 documents / 46,223 tokens from disjoint fit,
-  confirmation, and validation splits.
-- Full encoding: 2,816 experts, 1,399.72 GPU-seconds, 2.537 GiB peak CUDA
-  allocation.
+  `__CALIBRATION_MANIFEST_SHA256__`.
+- The encoder authenticated __CALIBRATION_DOCUMENTS__ documents /
+  __CALIBRATION_TOKENS__ tokens from disjoint fit, confirmation, and validation
+  splits.
+- Full encoding: __ENCODED_EXPERTS__ experts, __ENCODE_SECONDS__ GPU-seconds,
+  __PEAK_GIB__ GiB peak CUDA allocation.
 - `MANIFEST.sha256`, `qsrt-manifest.json`, `.qsrt-source-evidence.json`,
   `qsrt-calibration-evidence.json`, and `QSRT_COMPLETE.json` bind the published
   package to the source and encoder fingerprints.
 
 ## Known limitations
 
-- **Not chat-quality.** In a four-prompt instruction battery, all W4A8 and W4A16
-  generations reached the 700-token cap; responses were often repetitive or
-  unrelated to the instruction. Do not deploy this checkpoint as a user-facing
-  assistant.
-- The KL result covers six positions, not a representative corpus.
-- TP2 atom ownership was prepared and unit-tested, but only TP1 physical
-  serving was run because the validation host had one RTX 5090.
+- **Not chat-quality.** An informal four-prompt instruction battery produced
+  incoherent answers. No representative downstream instruction/chat
+  evaluation is sealed by the builder, so no task-quality claim is made and
+  this checkpoint must not be deployed as a user-facing assistant.
+- TP2 atom ownership is unit-tested, but only TP1 physical serving has been
+  qualified for this Fruit package.
 - The current sparse-attention prefill backend requires `max_num_seqs=1`.
-- CUDA graphs were not used for the reported benchmark; correctness and
-  throughput were validated in eager mode.
 - This release qualifies the QSRT codec, storage, loader, and kernels. It does
   not establish broad downstream task quality.
 
@@ -238,6 +245,8 @@ _SOURCE_EVIDENCE_NAME = ".qsrt-source-evidence.json"
 _SOURCE_EVIDENCE_SHA_NAME = ".qsrt-source-evidence.sha256"
 _CALIBRATION_EVIDENCE_NAME = "qsrt-calibration-evidence.json"
 
+_RATE_SWEEP_SCHEMA = "kquant_fruit_uniform_rate_sweep_v1"
+_RATE_SWEEP_NAME = "evaluation/fruit-uniform-rate-sweep.json"
 _DTYPE_BYTES = {
     "BOOL": 1,
     "U8": 1,
@@ -265,17 +274,57 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _git_revision(root: Path) -> str:
+    try:
+        result = subprocess.run(
+            ("git", "-C", str(root), "rev-parse", "HEAD"),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"cannot resolve source revision: {root}") from exc
+    revision = result.stdout.strip()
+    if len(revision) != 40 or any(
+        character not in "0123456789abcdef" for character in revision
+    ):
+        raise ValueError(f"source revision is not a commit digest: {root}")
+    return revision
+
+
+def _require_clean_source(root: Path, pathspec: str) -> None:
+    _git_revision(root)
+    try:
+        result = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(root),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                pathspec,
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"cannot inspect source tree: {root}") from exc
+    if result.stdout:
+        raise ValueError(f"source tree has uncommitted files under {root / pathspec}")
+
+
 def _source_tree_sha256(root: Path) -> str:
     if not root.is_dir():
         raise FileNotFoundError(root)
+    entries = tuple(path for path in root.rglob("*") if "__pycache__" not in path.parts)
+    for path in entries:
+        if path.is_symlink():
+            raise ValueError(f"source tree must not contain symbolic links: {path}")
     files = sorted(
-        (
-            path
-            for path in root.rglob("*")
-            if path.is_file()
-            and path.suffix in _SOURCE_SUFFIXES
-            and "__pycache__" not in path.parts
-        ),
+        (path for path in entries if path.is_file()),
         key=lambda path: path.relative_to(root).as_posix(),
     )
     if not files:
@@ -291,17 +340,15 @@ def _source_tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _producer_provenance(
+def current_encoder_provenance(
     *,
     exllamav3_root: Path,
-    b12x_root: Path,
-    vllm_root: Path,
     calibration: FruitCalibrationStore,
-    output: Path,
 ) -> dict[str, object]:
-    kquant_root = Path(__file__).resolve().parents[1] / "kquant"
-    current_encoder = {
-        "kquant_revision": KQUANT_REVISION,
+    kquant_checkout = Path(__file__).resolve().parents[1]
+    kquant_root = kquant_checkout / "kquant"
+    encoder: dict[str, object] = {
+        "kquant_revision": _git_revision(kquant_checkout),
         "kquant_source_sha256": _source_tree_sha256(kquant_root),
         "exllamav3_revision": EXLLAMAV3_REVISION,
         "exllamav3_source_sha256": _source_tree_sha256(exllamav3_root / "exllamav3"),
@@ -309,14 +356,27 @@ def _producer_provenance(
         "calibration_capture_id": calibration.capture_id,
         "calibration_manifest_sha256": calibration.manifest_sha256,
     }
-    current_encoder["fingerprint"] = hashlib.sha256(
-        _canonical_json(current_encoder).encode("utf-8")
+    encoder["fingerprint"] = hashlib.sha256(
+        _canonical_json(encoder).encode("utf-8")
     ).hexdigest()
-    encoder = _historical_encoder_provenance(output, current_encoder)
+    return encoder
+
+
+def _producer_provenance(
+    *,
+    exllamav3_root: Path,
+    b12x_root: Path,
+    vllm_root: Path,
+    calibration: FruitCalibrationStore,
+) -> dict[str, object]:
+    encoder = current_encoder_provenance(
+        exllamav3_root=exllamav3_root,
+        calibration=calibration,
+    )
     runtime = {
-        "b12x_revision": B12X_REVISION,
+        "b12x_revision": _git_revision(b12x_root),
         "b12x_source_sha256": _source_tree_sha256(b12x_root / "b12x"),
-        "vllm_revision": VLLM_REVISION,
+        "vllm_revision": _git_revision(vllm_root),
         "vllm_source_sha256": _source_tree_sha256(vllm_root / "vllm"),
     }
     provenance: dict[str, object] = {
@@ -334,48 +394,306 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n"
 
 
-def _historical_encoder_provenance(
-    output: Path,
-    current: dict[str, object],
-) -> dict[str, object]:
-    """Reuse authenticated encoded parts across storage/runtime-only rebuilds."""
-
-    manifest_path = output / "qsrt-manifest.json"
-    if not manifest_path.is_file():
-        return current
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        candidate = manifest["producer"]["encoder"]
-    except (KeyError, OSError, json.JSONDecodeError, TypeError):
-        return current
-    if not isinstance(candidate, dict) or set(candidate) != set(current):
-        return current
-    fingerprint = candidate.get("fingerprint")
-    unsigned = {name: value for name, value in candidate.items() if name != "fingerprint"}
+def _rate_number(value: object, *, name: str, positive: bool = False) -> float:
     if (
-        not isinstance(fingerprint, str)
-        or hashlib.sha256(_canonical_json(unsigned).encode("utf-8")).hexdigest()
-        != fingerprint
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < 0
+        or (positive and float(value) <= 0)
     ):
-        return current
-    stable_fields = set(current) - {"fingerprint", "kquant_source_sha256"}
-    if any(candidate.get(name) != current.get(name) for name in stable_fields):
-        return current
-    for layer in LAYERS:
-        for expert in range(EXPERTS):
-            tensor_path, part_manifest_path = _part_paths(output, layer, expert)
-            if not tensor_path.is_file() or not part_manifest_path.is_file():
-                return current
-            try:
-                part = json.loads(part_manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                return current
-            if (
-                not isinstance(part, dict)
-                or part.get("encoder_fingerprint") != fingerprint
+        raise ValueError(f"Fruit rate-sweep {name} is invalid")
+    return float(value)
+
+
+def _validate_rate_sweep(
+    path: Path,
+    *,
+    source_evidence: dict[str, object],
+    calibration: FruitCalibrationStore,
+    producer: dict[str, object],
+) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read Fruit rate sweep: {path}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != _RATE_SWEEP_SCHEMA
+        or payload.get("complete") is not True
+    ):
+        raise ValueError("Fruit rate sweep is incomplete or has the wrong schema")
+    signature = payload.get("signature")
+    results = payload.get("results")
+    if not isinstance(signature, dict) or not isinstance(results, dict):
+        raise TypeError("Fruit rate sweep omits its signature or results")
+    expected_calibration = {
+        "capture_id": calibration.capture_id,
+        "fingerprint": calibration.fingerprint,
+        "manifest_sha256": calibration.manifest_sha256,
+    }
+    if (
+        signature.get("schema") != _RATE_SWEEP_SCHEMA
+        or signature.get("source") != source_evidence
+        or signature.get("calibration") != expected_calibration
+        or signature.get("encoder") != producer.get("encoder")
+        or signature.get("rates") != [2, 3, 4]
+    ):
+        raise ValueError("Fruit rate-sweep provenance does not match this build")
+    assignments = signature.get("assignments")
+    if not isinstance(assignments, list) or not assignments:
+        raise ValueError("Fruit rate sweep has no assignments")
+    assignment_keys: list[str] = []
+    for assignment in assignments:
+        if (
+            not isinstance(assignment, list)
+            or len(assignment) != 2
+            or any(type(value) is not int for value in assignment)
+        ):
+            raise TypeError("Fruit rate-sweep assignment is malformed")
+        layer, expert = assignment
+        if layer not in LAYERS or not 0 <= expert < EXPERTS:
+            raise ValueError("Fruit rate-sweep assignment is outside model geometry")
+        assignment_keys.append(f"{layer}:{expert}")
+    if len(set(assignment_keys)) != len(assignment_keys):
+        raise ValueError("Fruit rate-sweep assignments are not unique")
+    if set(results) != set(assignment_keys):
+        raise ValueError("Fruit rate-sweep results do not cover every assignment")
+    measured = 0
+    for key in assignment_keys:
+        result = results[key]
+        if not isinstance(result, dict):
+            raise TypeError(f"Fruit rate-sweep result {key} is malformed")
+        status = result.get("status")
+        if status == "skipped":
+            if not isinstance(result.get("reason"), str) or not isinstance(
+                result.get("support"), dict
             ):
-                return current
-    return candidate
+                raise ValueError(f"Fruit rate-sweep skip {key} lacks evidence")
+            continue
+        if status != "measured":
+            raise ValueError(f"Fruit rate-sweep result {key} has invalid status")
+        measured += 1
+        rates = result.get("rates")
+        if not isinstance(rates, dict) or set(rates) != {"K2", "K3", "K4"}:
+            raise ValueError(f"Fruit rate-sweep result {key} omits rate endpoints")
+    if measured == 0:
+        raise ValueError("Fruit rate sweep contains no measured assignments")
+    return payload
+
+
+def _rate_sweep_section(payload: dict[str, object]) -> str:
+    results = payload.get("results")
+    signature = payload.get("signature")
+    if not isinstance(results, dict) or not isinstance(signature, dict):
+        raise TypeError("Fruit rate-sweep summary input is malformed")
+    measured = [
+        value
+        for value in results.values()
+        if isinstance(value, dict) and value.get("status") == "measured"
+    ]
+    assignments = signature.get("assignments")
+    if not isinstance(assignments, list) or not measured:
+        raise ValueError("Fruit rate-sweep summary has no measured assignments")
+
+    summaries: dict[str, dict[str, float]] = {}
+    for rate_name, bits in (("K2", 2), ("K3", 3), ("K4", 4)):
+        weight_error = 0.0
+        weight_reference = 0.0
+        h_error = 0.0
+        h_reference = 0.0
+        validation_error = 0.0
+        validation_reference = 0.0
+        endpoint_bytes = 0.0
+        endpoint_bpw = 0.0
+        for index, result in enumerate(measured):
+            rates = result.get("rates")
+            if not isinstance(rates, dict):
+                raise TypeError("Fruit measured rate result is malformed")
+            endpoint = rates.get(rate_name)
+            if not isinstance(endpoint, dict) or endpoint.get("bits") != bits:
+                raise ValueError(f"Fruit {rate_name} endpoint is malformed")
+            aggregate = endpoint.get("aggregate")
+            matrices = endpoint.get("matrices")
+            routed = endpoint.get("routed_function")
+            if (
+                not isinstance(aggregate, dict)
+                or not isinstance(matrices, list)
+                or len(matrices) != 3
+                or not isinstance(routed, dict)
+            ):
+                raise TypeError(f"Fruit {rate_name} metric evidence is malformed")
+            matrix_names = {
+                matrix.get("matrix") for matrix in matrices if isinstance(matrix, dict)
+            }
+            if matrix_names != {"w1", "w3", "w2"}:
+                raise ValueError(f"Fruit {rate_name} matrix evidence is incomplete")
+            for matrix in matrices:
+                assert isinstance(matrix, dict)
+                weight_error += _rate_number(
+                    matrix.get("weight_squared_error"),
+                    name=f"{rate_name}.weight_squared_error",
+                )
+                weight_reference += _rate_number(
+                    matrix.get("weight_reference_energy"),
+                    name=f"{rate_name}.weight_reference_energy",
+                    positive=True,
+                )
+                h_error += _rate_number(
+                    matrix.get("captured_dense_h_numerator"),
+                    name=f"{rate_name}.captured_dense_h_numerator",
+                )
+                h_reference += _rate_number(
+                    matrix.get("captured_dense_h_denominator"),
+                    name=f"{rate_name}.captured_dense_h_denominator",
+                    positive=True,
+                )
+            validation = routed.get("validation")
+            if not isinstance(validation, dict):
+                raise TypeError(f"Fruit {rate_name} validation evidence is malformed")
+            validation_error += _rate_number(
+                validation.get("routed_sse"),
+                name=f"{rate_name}.validation.routed_sse",
+            )
+            validation_reference += _rate_number(
+                validation.get("reference_energy"),
+                name=f"{rate_name}.validation.reference_energy",
+                positive=True,
+            )
+            endpoint_bytes += _rate_number(
+                aggregate.get("bytes_before_layer_deduplication"),
+                name=f"{rate_name}.bytes",
+                positive=True,
+            )
+            endpoint_bpw += _rate_number(
+                aggregate.get("bpw_before_layer_deduplication"),
+                name=f"{rate_name}.bpw",
+                positive=True,
+            )
+        summaries[rate_name] = {
+            "weight_nmse": weight_error / weight_reference,
+            "captured_h_nmse": h_error / h_reference,
+            "validation_nmse": validation_error / validation_reference,
+            "mean_bytes": endpoint_bytes / len(measured),
+            "mean_bpw": endpoint_bpw / len(measured),
+        }
+
+    k2 = summaries["K2"]
+    k3 = summaries["K3"]
+    k4 = summaries["K4"]
+    rows = "\n".join(
+        "| {rate} | {mean_bpw:.4f} | {mean_bytes:,.0f} | {weight_nmse:.6f} | "
+        "{captured_h_nmse:.6f} | {validation_nmse:.6f} |".format(
+            rate=rate,
+            **summaries[rate],
+        )
+        for rate in ("K2", "K3", "K4")
+    )
+    skipped = len(assignments) - len(measured)
+    return f"""## Adjacent-rate evidence
+
+`{_RATE_SWEEP_NAME}` re-encodes the same authenticated expert sample at uniform
+K2, K3, and K4, with fresh per-endpoint FP16 scales. It measured
+{len(measured)} of {len(assignments)} predeclared assignments; {skipped} lacked
+the minimum routed calibration support and were skipped rather than imputed.
+These are pre-layer-deduplication expert-local endpoints, not package sizes.
+
+| Endpoint | Mean bpw | Mean bytes/expert | Weight NMSE | Captured-H NMSE | Validation routed NMSE |
+|---|---:|---:|---:|---:|---:|
+{rows}
+
+Relative to K3, K2 is {k2["weight_nmse"] / k3["weight_nmse"]:.3f}x /
+{k2["captured_h_nmse"] / k3["captured_h_nmse"]:.3f}x /
+{k2["validation_nmse"] / k3["validation_nmse"]:.3f}x on weight,
+captured-H, and validation-routed NMSE. K4 is
+{k4["weight_nmse"] / k3["weight_nmse"]:.3f}x /
+{k4["captured_h_nmse"] / k3["captured_h_nmse"]:.3f}x /
+{k4["validation_nmse"] / k3["validation_nmse"]:.3f}x on the same metrics.
+"""
+
+
+def _render_model_card(
+    *,
+    source_evidence: dict[str, object],
+    calibration: FruitCalibrationStore,
+    producer: dict[str, object],
+    rate_sweep: dict[str, object],
+    layers: dict[str, dict[str, object]],
+) -> str:
+    format_counts: Counter[str] = Counter()
+    elapsed_seconds = 0.0
+    peak_cuda_bytes = 0
+    encoded_experts = 0
+    for layer in layers.values():
+        counts = layer.get("format_counts")
+        experts = layer.get("experts")
+        if not isinstance(counts, dict) or not isinstance(experts, list):
+            raise TypeError("Fruit layer evidence cannot render the model card")
+        for name, count in counts.items():
+            if not isinstance(name, str) or type(count) is not int or count < 0:
+                raise TypeError("Fruit allocation evidence is malformed")
+            format_counts[name] += count
+        for expert in experts:
+            if not isinstance(expert, dict):
+                raise TypeError("Fruit expert evidence is malformed")
+            elapsed = expert.get("encode_elapsed_seconds")
+            peak = expert.get("peak_cuda_bytes")
+            if (
+                not isinstance(elapsed, (int, float))
+                or isinstance(elapsed, bool)
+                or not math.isfinite(float(elapsed))
+                or float(elapsed) < 0
+                or type(peak) is not int
+                or peak < 0
+            ):
+                raise ValueError("Fruit encoding telemetry is malformed")
+            elapsed_seconds += float(elapsed)
+            peak_cuda_bytes = max(peak_cuda_bytes, peak)
+            encoded_experts += 1
+    expected_experts = len(LAYERS) * EXPERTS
+    if (
+        encoded_experts != expected_experts
+        or sum(format_counts.values()) != expected_experts
+    ):
+        raise ValueError("Fruit model-card expert evidence is incomplete")
+
+    documents = calibration.manifest.get("documents")
+    if not isinstance(documents, list) or not all(
+        isinstance(document, dict)
+        and type(document.get("tokens")) is int
+        and int(document["tokens"]) > 0
+        for document in documents
+    ):
+        raise TypeError("Fruit calibration document evidence is malformed")
+    calibration_tokens = sum(int(document["tokens"]) for document in documents)
+    encoder = producer.get("encoder")
+    runtime = producer.get("runtime")
+    if not isinstance(encoder, dict) or not isinstance(runtime, dict):
+        raise TypeError("Fruit producer evidence is malformed")
+    replacements = {
+        "__ALLOCATION_ROWS__": "\n".join(
+            f"| `{name}` | {count:,} |" for name, count in sorted(format_counts.items())
+        ),
+        "__RATE_SWEEP_SECTION__": _rate_sweep_section(rate_sweep),
+        "__KQUANT_REVISION__": str(encoder["kquant_revision"]),
+        "__B12X_REVISION__": str(runtime["b12x_revision"]),
+        "__VLLM_REVISION__": str(runtime["vllm_revision"]),
+        "__SOURCE_KIND__": str(source_evidence["source_kind"]),
+        "__SOURCE_SHA256__": str(source_evidence["source_sha256"]),
+        "__CALIBRATION_CAPTURE_ID__": calibration.capture_id,
+        "__CALIBRATION_MANIFEST_SHA256__": calibration.manifest_sha256,
+        "__CALIBRATION_DOCUMENTS__": f"{len(documents):,}",
+        "__CALIBRATION_TOKENS__": f"{calibration_tokens:,}",
+        "__ENCODED_EXPERTS__": f"{encoded_experts:,}",
+        "__ENCODE_SECONDS__": f"{elapsed_seconds:,.2f}",
+        "__PEAK_GIB__": f"{peak_cuda_bytes / (1 << 30):.3f}",
+    }
+    card = MODEL_CARD_TEMPLATE
+    for marker, value in replacements.items():
+        if marker not in card:
+            raise ValueError(f"Fruit model-card marker is missing: {marker}")
+        card = card.replace(marker, value)
+    return card
 
 
 def _atomic_text(path: Path, content: str) -> None:
@@ -599,15 +917,17 @@ def _validate_part(
     expert: int,
     source_sha256: str,
     encoder_fingerprint: str,
+    repair: bool = True,
 ) -> dict[str, object] | None:
     if not tensor_path.exists() and not manifest_path.exists():
         return None
     if not tensor_path.is_file() or not manifest_path.is_file():
-        for path in (tensor_path, manifest_path):
-            if path.is_file():
-                path.unlink()
-            elif path.exists():
-                raise ValueError(f"unexpected Fruit QSRT part path: {path}")
+        if repair:
+            for path in (tensor_path, manifest_path):
+                if path.is_file():
+                    path.unlink()
+                elif path.exists():
+                    raise ValueError(f"unexpected Fruit QSRT part path: {path}")
         return None
     try:
         value = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -631,9 +951,11 @@ def _validate_part(
         if value.get(name) != expected_value
     }
     if mismatches:
-        if mismatches == {"encoder_fingerprint"}:
+        if mismatches == {"encoder_fingerprint"} and repair:
             tensor_path.unlink()
             manifest_path.unlink()
+            return None
+        if not repair:
             return None
         raise ValueError(f"Fruit QSRT part identity mismatch: {manifest_path}")
     if value.get("safetensors_bytes") != tensor_path.stat().st_size:
@@ -655,8 +977,9 @@ def _validate_part(
     ):
         if metadata.get(name) != expected_value:
             raise ValueError(f"Fruit QSRT part metadata mismatch: {tensor_path}")
-    metadata_fingerprint = metadata.get("encoder_fingerprint")
-    if metadata_fingerprint not in (None, encoder_fingerprint):
+    if metadata.get("encoder_fingerprint") != encoder_fingerprint:
+        if not repair:
+            return None
         raise ValueError(f"Fruit QSRT part producer mismatch: {tensor_path}")
     return value
 
@@ -718,20 +1041,36 @@ def _seed_parts(
             source_manifest = seed / f"layer-{layer:03d}" / f"expert-{expert:03d}.json"
             if not source_tensor.is_file() and not source_manifest.is_file():
                 continue
-            _validate_part(
-                source_tensor,
-                source_manifest,
-                layer=layer,
-                expert=expert,
-                source_sha256=source_sha256,
-                encoder_fingerprint=encoder_fingerprint,
-            )
             target_tensor, target_manifest = _part_paths(output, layer, expert)
             if target_tensor.exists() or target_manifest.exists():
                 continue
+            if not source_tensor.is_file() or not source_manifest.is_file():
+                continue
+            try:
+                valid = _validate_part(
+                    source_tensor,
+                    source_manifest,
+                    layer=layer,
+                    expert=expert,
+                    source_sha256=source_sha256,
+                    encoder_fingerprint=encoder_fingerprint,
+                    repair=False,
+                )
+            except (OSError, TypeError, ValueError):
+                valid = None
+            if valid is None:
+                continue
             target_tensor.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_tensor, target_tensor)
-            shutil.copy2(source_manifest, target_manifest)
+            try:
+                shutil.copy2(source_tensor, target_tensor)
+                shutil.copy2(source_manifest, target_manifest)
+            except OSError:
+                for target in (target_tensor, target_manifest):
+                    if target.is_file():
+                        target.unlink()
+                    elif target.exists():
+                        raise ValueError(f"unexpected Fruit QSRT part path: {target}")
+                continue
             copied += 1
     return copied
 
@@ -766,13 +1105,34 @@ def _parts_need_encoder(
 def _validate_source_evidence(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise TypeError("sealed Fruit source evidence must be a JSON object")
-    expected = {
+    expected: dict[str, object] = {
         "kind": "kquant-fruit-source-preflight",
         "version": 1,
         "status": "pass",
         "model_id": FRUIT_ANNEALED_SPEC.model_id,
-        "checkpoint_sha256": FRUIT_ANNEALED_SPEC.checkpoint_sha256,
     }
+    if value.get("source_container") == "hf_bf16_safetensors":
+        expected.update(
+            {
+                "checkpoint_sha256": BASE_MANIFEST_SHA256,
+                "checkpoint_sha256_provenance": ("safetensors_manifest_authenticated"),
+                "source_sha256": BASE_MANIFEST_SHA256,
+                "source_kind": "safetensors_manifest",
+                "expected_checkpoint_sha256": (FRUIT_ANNEALED_SPEC.checkpoint_sha256),
+                "safetensors_manifest_sha256": BASE_MANIFEST_SHA256,
+            }
+        )
+    elif value.get("source_container") in ("model", "state_dict"):
+        expected.update(
+            {
+                "checkpoint_sha256": FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+                "checkpoint_sha256_provenance": "checkpoint_file_authenticated",
+                "source_sha256": FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+                "source_kind": "torch_checkpoint",
+            }
+        )
+    else:
+        raise ValueError("sealed Fruit source evidence has an unsupported container")
     for name, expected_value in expected.items():
         if value.get(name) != expected_value:
             raise ValueError(
@@ -1254,9 +1614,15 @@ def _materialize_base_model(base_model: Path, output: Path) -> None:
         source = base_model / filename
         target = output / filename
         if filename.startswith("model-layer-"):
-            layer = int(
-                filename.removeprefix("model-layer-").removesuffix(".safetensors")
+            layer_text = filename.removeprefix("model-layer-").removesuffix(
+                ".safetensors"
             )
+            try:
+                layer = int(layer_text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid Fruit BF16 model layer shard filename: {filename}"
+                ) from exc
         else:
             layer = -1
         if layer in LAYERS:
@@ -1300,6 +1666,7 @@ def _write_config(
     base_model: Path,
     output: Path,
     producer: dict[str, object],
+    source_evidence: dict[str, object],
 ) -> None:
     config = json.loads((base_model / "config.json").read_text(encoding="utf-8"))
     config["quantization_config"] = {
@@ -1313,13 +1680,39 @@ def _write_config(
             "storage_format": FRUIT_QSRT_ATOM_STORAGE,
             "encoding": "qsrt_sqg_e4m3",
             "codebook": FRUIT_QSRT_CODEBOOK,
+            "profile_id": FRUIT_QSRT_PROFILE_ID,
             "artifact_manifest": "qsrt-manifest.json",
             "producer_fingerprint": producer["fingerprint"],
             "encoder_fingerprint": producer["encoder"]["fingerprint"],
+            "source_kind": source_evidence["source_kind"],
+            "source_sha256": source_evidence["source_sha256"],
             "runtime": "w4a8",
         },
     }
     _atomic_text(output / "config.json", _canonical_json(config))
+
+
+def _package_files(output: Path) -> dict[str, Path]:
+    files: dict[str, Path] = {}
+    for path in output.iterdir():
+        if path.is_symlink():
+            raise ValueError(f"Fruit package path must not be a symbolic link: {path}")
+        if path.is_file() and path.name not in {
+            "MANIFEST.sha256",
+            _COMPLETE_MARKER_NAME,
+        }:
+            files[path.name] = path
+    evaluation = output / "evaluation"
+    if evaluation.is_dir():
+        for path in evaluation.rglob("*"):
+            if path.is_symlink():
+                raise ValueError(
+                    f"Fruit evaluation path must not be a symbolic link: {path}"
+                )
+            if path.is_file():
+                relative = path.relative_to(output).as_posix()
+                files[relative] = path
+    return dict(sorted(files.items()))
 
 
 def _write_package_manifests(
@@ -1328,8 +1721,16 @@ def _write_package_manifests(
     source_evidence: dict[str, object],
     base_provenance: dict[str, object],
     producer: dict[str, object],
+    calibration: FruitCalibrationStore,
+    rate_sweep: dict[str, object],
     layers: dict[str, dict[str, object]],
 ) -> None:
+    evaluation = output / "evaluation"
+    if evaluation.exists():
+        shutil.rmtree(evaluation)
+    evaluation.mkdir()
+    rate_sweep_path = output / _RATE_SWEEP_NAME
+    _atomic_text(rate_sweep_path, _canonical_json(rate_sweep))
     manifest_layers = {
         layer: {
             "qsrt_atoms": value["safetensors_file"],
@@ -1366,34 +1767,49 @@ def _write_package_manifests(
         "base_model": base_provenance,
         "producer": producer,
         "source": source_evidence,
+        "evaluation": {
+            "uniform_rate_sweep": {
+                "file": _RATE_SWEEP_NAME,
+                "sha256": _sha256(rate_sweep_path),
+            }
+        },
         "layers": manifest_layers,
         "complete": True,
     }
     _atomic_text(output / "qsrt-manifest.json", _canonical_json(manifest))
-    _atomic_text(output / "README.md", MODEL_CARD)
-    entries: list[str] = []
-    for path in sorted(output.iterdir(), key=lambda value: value.name):
-        if (
-            path.name in {"MANIFEST.sha256", _COMPLETE_MARKER_NAME}
-            or not path.is_file()
-        ):
-            continue
-        entries.append(f"{_sha256(path)}  {path.name}")
+    _atomic_text(
+        output / "README.md",
+        _render_model_card(
+            source_evidence=source_evidence,
+            calibration=calibration,
+            producer=producer,
+            rate_sweep=rate_sweep,
+            layers=layers,
+        ),
+    )
+    entries = [
+        f"{_sha256(path)}  {relative}"
+        for relative, path in _package_files(output).items()
+    ]
     _atomic_text(output / "MANIFEST.sha256", "\n".join(entries) + "\n")
 
 
 def _completion_record(
     output: Path,
     *,
+    source_evidence: dict[str, object],
     base_provenance: dict[str, object],
     producer: dict[str, object],
 ) -> dict[str, object]:
     return {
-        "schema": "kquant_qsrt_complete_v1",
+        "schema": "kquant_qsrt_complete_v2",
         "package_manifest_sha256": _sha256(output / "qsrt-manifest.json"),
         "checksum_manifest_sha256": _sha256(output / "MANIFEST.sha256"),
         "model_index_sha256": _sha256(output / "model.safetensors.index.json"),
-        "source_checkpoint_sha256": FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+        "source": {
+            "kind": source_evidence["source_kind"],
+            "sha256": source_evidence["source_sha256"],
+        },
         "base_manifest_sha256": base_provenance["manifest_sha256"],
         "producer_fingerprint": producer["fingerprint"],
         "encoder_fingerprint": producer["encoder"]["fingerprint"],
@@ -1404,24 +1820,21 @@ def _validate_checksum_manifest(output: Path) -> None:
     manifest_path = output / "MANIFEST.sha256"
     entries: dict[str, str] = {}
     for line in manifest_path.read_text(encoding="utf-8").splitlines():
-        fields = line.split()
-        if len(fields) != 2:
-            raise ValueError(f"malformed package checksum line: {line!r}")
-        digest, filename = fields
+        digest, separator, filename = line.partition("  ")
+        relative = Path(filename)
         if (
-            len(digest) != 64
+            separator != "  "
+            or len(digest) != 64
             or any(character not in "0123456789abcdef" for character in digest)
-            or Path(filename).name != filename
+            or not filename
+            or relative.is_absolute()
+            or relative.as_posix() != filename
+            or ".." in relative.parts
             or filename in entries
         ):
             raise ValueError(f"invalid package checksum line: {line!r}")
         entries[filename] = digest
-    expected_files = {
-        path.name
-        for path in output.iterdir()
-        if path.is_file()
-        and path.name not in {"MANIFEST.sha256", _COMPLETE_MARKER_NAME}
-    }
+    expected_files = set(_package_files(output))
     if set(entries) != expected_files:
         raise ValueError("package checksum inventory mismatch")
     for filename, expected_sha256 in entries.items():
@@ -1439,6 +1852,7 @@ def _validate_output_package(
     source_evidence: dict[str, object],
     base_provenance: dict[str, object],
     producer: dict[str, object],
+    rate_sweep: dict[str, object],
     require_complete: bool,
 ) -> None:
     manifest_path = output / "qsrt-manifest.json"
@@ -1471,6 +1885,12 @@ def _validate_output_package(
         "base_model": base_provenance,
         "producer": producer,
         "source": source_evidence,
+        "evaluation": {
+            "uniform_rate_sweep": {
+                "file": _RATE_SWEEP_NAME,
+                "sha256": _sha256(output / _RATE_SWEEP_NAME),
+            }
+        },
         "complete": True,
     }
     if any(manifest.get(name) != value for name, value in expected_identity.items()):
@@ -1478,6 +1898,11 @@ def _validate_output_package(
     sealed_source = _read_source_evidence_seal(output, producer)
     if sealed_source != source_evidence:
         raise ValueError("Fruit QSRT package and sealed source evidence disagree")
+    sealed_rate_sweep = json.loads(
+        (output / _RATE_SWEEP_NAME).read_text(encoding="utf-8")
+    )
+    if sealed_rate_sweep != rate_sweep:
+        raise ValueError("Fruit QSRT package and sealed rate sweep disagree")
     config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     quantization = config.get("quantization_config")
     if not isinstance(quantization, dict):
@@ -1490,9 +1915,12 @@ def _validate_output_package(
             ("storage_format", FRUIT_QSRT_ATOM_STORAGE),
             ("encoding", "qsrt_sqg_e4m3"),
             ("codebook", FRUIT_QSRT_CODEBOOK),
+            ("profile_id", FRUIT_QSRT_PROFILE_ID),
             ("runtime", "w4a8"),
             ("producer_fingerprint", producer["fingerprint"]),
             ("encoder_fingerprint", producer["encoder"]["fingerprint"]),
+            ("source_kind", source_evidence["source_kind"]),
+            ("source_sha256", source_evidence["source_sha256"]),
         )
     ):
         raise ValueError("Fruit QSRT output config identity mismatch")
@@ -1523,7 +1951,7 @@ def _validate_output_package(
             tensor_path,
             layer_manifest_path,
             layer=layer,
-            source_sha256=FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+            source_sha256=str(source_evidence["source_sha256"]),
             encoder_fingerprint=encoder_fingerprint,
         )
         if value is None:
@@ -1547,6 +1975,7 @@ def _validate_output_package(
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
         if marker != _completion_record(
             output,
+            source_evidence=source_evidence,
             base_provenance=base_provenance,
             producer=producer,
         ):
@@ -1558,6 +1987,7 @@ def _validate_output_package(
 def _write_complete_marker(
     output: Path,
     *,
+    source_evidence: dict[str, object],
     base_provenance: dict[str, object],
     producer: dict[str, object],
 ) -> None:
@@ -1566,6 +1996,7 @@ def _write_complete_marker(
         _canonical_json(
             _completion_record(
                 output,
+                source_evidence=source_evidence,
                 base_provenance=base_provenance,
                 producer=producer,
             )
@@ -1582,6 +2013,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--b12x-root", required=True, type=Path)
     parser.add_argument("--vllm-root", required=True, type=Path)
     parser.add_argument("--calibration", required=True, type=Path)
+    parser.add_argument("--rate-sweep", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed-cache", type=Path)
     return parser.parse_args()
@@ -1596,12 +2028,21 @@ def main() -> None:
         raise FileNotFoundError(args.base_model)
     if args.output.resolve() == args.base_model.resolve():
         raise ValueError("output must not alias base_model")
+    source_roots = (
+        (Path(__file__).resolve().parents[1], "kquant"),
+        (args.exllamav3_root, "exllamav3"),
+        (args.b12x_root, "b12x"),
+        (args.vllm_root, "vllm"),
+    )
+    for source_root, pathspec in source_roots:
+        _require_clean_source(source_root, pathspec)
     calibration = FruitCalibrationStore(args.calibration)
+    if _git_revision(args.exllamav3_root) != EXLLAMAV3_REVISION:
+        raise ValueError("ExLlamaV3 source revision does not match the pinned encoder")
     producer = _producer_provenance(
         exllamav3_root=args.exllamav3_root,
         b12x_root=args.b12x_root,
         vllm_root=args.vllm_root,
-        output=args.output,
         calibration=calibration,
     )
     encoder_fingerprint = producer["encoder"]["fingerprint"]
@@ -1609,11 +2050,38 @@ def main() -> None:
         raise TypeError("Fruit QSRT encoder fingerprint must be a string")
     print("authenticating pinned Fruit BF16 base model", flush=True)
     base_provenance = _authenticate_base_model(args.base_model)
+    try:
+        store = FruitCheckpointStore(
+            args.checkpoint,
+            spec=FRUIT_ANNEALED_SPEC,
+            expected_sha256=FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+        )
+    except (FileNotFoundError, ValueError):
+        print(
+            "checkpoint unavailable or changed; authenticating pinned BF16 "
+            "expert source",
+            flush=True,
+        )
+        store = FruitSafetensorsStore(
+            args.base_model,
+            spec=FRUIT_ANNEALED_SPEC,
+            expected_manifest_sha256=BASE_MANIFEST_SHA256,
+        )
+    source_evidence = _validate_source_evidence(store.evidence)
+    source_sha256 = source_evidence.get("source_sha256")
+    if not isinstance(source_sha256, str):
+        raise TypeError("Fruit source evidence has no authenticated source digest")
+    rate_sweep = _validate_rate_sweep(
+        args.rate_sweep,
+        source_evidence=source_evidence,
+        calibration=calibration,
+        producer=producer,
+    )
     torch.cuda.set_device(device)
     torch.empty(0, device=device)
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / _COMPLETE_MARKER_NAME).unlink(missing_ok=True)
-    source_sha256 = FRUIT_ANNEALED_SPEC.checkpoint_sha256
+    _write_source_evidence_seal(args.output, source_evidence, producer)
     seeded = _seed_parts(
         args.output,
         args.seed_cache,
@@ -1627,46 +2095,6 @@ def main() -> None:
         source_sha256=source_sha256,
         encoder_fingerprint=encoder_fingerprint,
     )
-    store = None
-    try:
-        store = FruitCheckpointStore(
-            args.checkpoint,
-            spec=FRUIT_ANNEALED_SPEC,
-            expected_sha256=source_sha256,
-        )
-    except (FileNotFoundError, ValueError):
-        source_evidence = None
-        if not needs_encoder:
-            for evidence_root in (args.output, args.seed_cache):
-                try:
-                    source_evidence = _read_source_evidence_seal(
-                        evidence_root, producer
-                    )
-                except ValueError:
-                    source_evidence = None
-                if source_evidence is not None:
-                    break
-        if source_evidence is not None:
-            print(
-                "checkpoint unavailable or changed; using sealed source evidence",
-                flush=True,
-            )
-        else:
-            print(
-                "checkpoint unavailable or changed; authenticating pinned BF16 "
-                "expert source",
-                flush=True,
-            )
-            store = FruitSafetensorsStore(
-                args.base_model,
-                spec=FRUIT_ANNEALED_SPEC,
-                expected_manifest_sha256=BASE_MANIFEST_SHA256,
-            )
-            source_evidence = store.evidence
-            _write_source_evidence_seal(args.output, source_evidence, producer)
-    else:
-        source_evidence = store.evidence
-        _write_source_evidence_seal(args.output, source_evidence, producer)
     quantizer_module = None
     if needs_encoder:
         quantizer_module = load_qsrt_encoder(args.exllamav3_root)
@@ -1686,7 +2114,7 @@ def main() -> None:
         encoder_fingerprint=encoder_fingerprint,
     )
     _materialize_base_model(args.base_model, args.output)
-    _write_config(args.base_model, args.output, producer)
+    _write_config(args.base_model, args.output, producer, source_evidence)
     _write_source_evidence_seal(args.output, source_evidence, producer)
     _write_calibration_evidence(args.output, calibration, producer)
     _write_package_manifests(
@@ -1694,6 +2122,8 @@ def main() -> None:
         source_evidence=source_evidence,
         base_provenance=base_provenance,
         producer=producer,
+        calibration=calibration,
+        rate_sweep=rate_sweep,
         layers=layers,
     )
     _validate_output_package(
@@ -1701,10 +2131,12 @@ def main() -> None:
         source_evidence=source_evidence,
         base_provenance=base_provenance,
         producer=producer,
+        rate_sweep=rate_sweep,
         require_complete=False,
     )
     _write_complete_marker(
         args.output,
+        source_evidence=source_evidence,
         base_provenance=base_provenance,
         producer=producer,
     )
@@ -1713,6 +2145,7 @@ def main() -> None:
     )
     if marker != _completion_record(
         args.output,
+        source_evidence=source_evidence,
         base_provenance=base_provenance,
         producer=producer,
     ):

@@ -54,6 +54,7 @@ FRUIT_QSRT_SCHEMA = "kquant_fruit_qsrt_pairs_v1"
 FRUIT_QSRT_PROFILE_ID = 1
 FRUIT_QSRT_CODEBOOK = CODEBOOK_SQG_XOR_CHEB_T12
 FRUIT_QSRT_MATRICES: tuple[MatrixName, ...] = ("w1", "w3", "w2")
+FRUIT_QSRT_DECODE_CLOSURE_RELATIVE_L2_TOLERANCE = 1e-6
 FRUIT_CALIBRATION_MIN_FIT_EFFECTIVE_ROWS = 32.0
 FRUIT_QSRT_RECORD_CHANNELS = FRUIT_QSRT_GEOMETRY.record_channels
 FRUIT_QSRT_RECORD_TILES = FRUIT_QSRT_RECORD_CHANNELS // 16
@@ -605,12 +606,12 @@ def unpack_fruit_matrix_atoms(
         for side in range(2):
             bits = rates[2 * pair + side]
             side_words_per_atom = hidden_tiles * 16 * bits
-            side = source.narrow(1, source_cursor, side_words_per_atom)
+            side_payload = source.narrow(1, source_cursor, side_words_per_atom)
             if fc1:
-                side = side.reshape(
+                side_payload = side_payload.reshape(
                     FRUIT_QSRT_ATOMS_PER_PAIR, hidden_tiles, 16 * bits
                 ).permute(1, 0, 2)
-            pieces.append(side.contiguous().reshape(-1))
+            pieces.append(side_payload.contiguous().reshape(-1))
             source_cursor += side_words_per_atom
         if source_cursor != words_per_atom:
             raise AssertionError("Fruit atom unpacker did not consume one atom")
@@ -1003,13 +1004,22 @@ def _finalize_candidate(
     stored_metrics = comparison_metrics(expected_physical, decoded_physical)
     if not all(math.isfinite(value) for value in stored_metrics.values()):
         raise ValueError("Fruit stored decode produced non-finite comparison metrics")
+    if stored_metrics["relative_l2"] > FRUIT_QSRT_DECODE_CLOSURE_RELATIVE_L2_TOLERANCE:
+        raise ValueError("Fruit stored decode exceeded the closure tolerance")
 
     reconstruction = _canonical_reconstruction(
         decoded_physical, source, matrix, physical_permutation
     )
     canonical_metrics = comparison_metrics(candidate.reconstruction, reconstruction)
     if not all(math.isfinite(value) for value in canonical_metrics.values()):
-        raise ValueError("Fruit canonical reconstruction did not close")
+        raise ValueError("Fruit canonical reconstruction produced non-finite metrics")
+    if (
+        canonical_metrics["relative_l2"]
+        > FRUIT_QSRT_DECODE_CLOSURE_RELATIVE_L2_TOLERANCE
+    ):
+        raise ValueError(
+            "Fruit canonical reconstruction exceeded the closure tolerance"
+        )
     coding = {
         "mode": candidate.mode.name,
         "mode_id": candidate.mode.transfer,

@@ -29,7 +29,11 @@ from kquant import constants as C
 from kquant.capture import LayerSamples, load_layer_hessians, load_layer_samples
 from kquant.exl3_loader import load_qsrt_encoder
 from kquant.exl3_reference import decode_exl3_weight
-from kquant.expert_activation import ExpertActivation, expert_middle
+from kquant.expert_activation import (
+    EXPERT_ACTIVATIONS,
+    ExpertActivation,
+    expert_middle,
+)
 from kquant.ldlq import SIGMA_REG, make_shared_h
 from kquant.pack.qsrt_encoder import plan_qsrt_matrix
 from kquant.qsrt import RATE_TRANSFER_MODES, unpack_trellis_states
@@ -524,7 +528,7 @@ def _document_improvement(
     def table(metric: Mapping[str, object]) -> dict[str, float]:
         rows = metric.get("request_contributions")
         if not isinstance(rows, list):
-            raise ValueError("functional metric lacks request contributions")
+            raise TypeError("functional metric lacks request contributions")
         result: dict[str, float] = {}
         for row in rows:
             if not isinstance(row, Mapping):
@@ -931,7 +935,7 @@ def run(
             "support": support,
             "covariance": covariance,
             "context": {
-                "basis": "official_source_post_situ_fit_documents",
+                "basis": f"official_source_post_{activation}_fit_documents",
                 "score_min": float(block_scores.min()),
                 "score_median": float(block_scores.median()),
                 "score_max": float(block_scores.max()),
@@ -1001,6 +1005,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda:11")
     parser.add_argument(
+        "--activation",
+        choices=EXPERT_ACTIVATIONS,
+        default="situ",
+        help="expert-middle activation used for contexts and routed scoring",
+    )
+    parser.add_argument(
         "--exllamav3-root",
         type=Path,
         default=Path("/home/luke/projects/exllamav3"),
@@ -1035,7 +1045,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    payload = run(args)
+    payload = run(args, activation=args.activation)
     print(
         json.dumps(
             {

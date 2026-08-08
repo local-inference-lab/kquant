@@ -17,6 +17,7 @@ from typing import Any
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+from torch.torch_version import TorchVersion
 from transformers import AutoTokenizer
 
 from kquant.candidate_hessian import weighted_covariance
@@ -569,7 +570,8 @@ def _verify_source_closure(
     reference_sha256 = _sha256(reference_path)
     if reference_sha256 != FRUIT_CALIBRATION_REFERENCE_SHA256:
         raise ValueError("Fruit calibration closure reference identity mismatch")
-    reference = torch.load(reference_path, map_location="cpu", weights_only=False)
+    with torch.serialization.safe_globals([TorchVersion]):
+        reference = torch.load(reference_path, map_location="cpu", weights_only=True)
     if (
         not isinstance(reference, dict)
         or reference.get("kind") != "fruit_full_vocabulary_kld_reference"

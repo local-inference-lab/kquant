@@ -15,6 +15,7 @@ import torch
 from safetensors.torch import save_file
 
 from kquant.exl3_loader import load_qsrt_encoder
+from kquant.fruit_calibration import FruitCalibrationStore
 from kquant.fruit_qsrt import (
     FRUIT_QSRT_CODEBOOK,
     FRUIT_QSRT_PROFILE_ID,
@@ -23,6 +24,7 @@ from kquant.fruit_qsrt import (
 )
 from kquant.fruit_source import FRUIT_ANNEALED_SPEC, FruitCheckpointStore
 from kquant.sqg_quantizer import install_sqg_quantizer
+from scripts.build_fruit_qsrt_model import current_encoder_provenance
 
 SAMPLED_ASSIGNMENTS: tuple[tuple[int, int], ...] = (
     (3, 0),
@@ -104,6 +106,7 @@ def _resume_evidence(
     layer: int,
     expert: int,
     source_sha256: str,
+    encoder_fingerprint: str,
 ) -> dict[str, object] | None:
     if not tensor_path.exists() and not manifest_path.exists():
         return None
@@ -117,11 +120,13 @@ def _resume_evidence(
         raise ValueError(f"malformed Fruit QSRT manifest: {manifest_path}") from exc
     expected = {
         "schema": FRUIT_QSRT_SCHEMA,
+        "version": 1,
         "profile_id": FRUIT_QSRT_PROFILE_ID,
         "codebook": FRUIT_QSRT_CODEBOOK,
         "layer": layer,
         "expert": expert,
         "source_sha256": source_sha256,
+        "encoder_fingerprint": encoder_fingerprint,
     }
     if not isinstance(value, dict) or any(
         value.get(key) != item for key, item in expected.items()
@@ -142,6 +147,7 @@ def _write_encoding(
     encoding,
     *,
     source_sha256: str,
+    encoder_fingerprint: str,
     elapsed_seconds: float,
     peak_cuda_bytes: int,
 ) -> dict[str, object]:
@@ -159,6 +165,7 @@ def _write_encoding(
             "layer": str(encoding.layer),
             "expert": str(encoding.expert),
             "source_sha256": source_sha256,
+            "encoder_fingerprint": encoder_fingerprint,
         },
     )
     with temporary.open("rb") as handle:
@@ -166,7 +173,9 @@ def _write_encoding(
     os.replace(temporary, tensor_path)
     manifest = {
         **encoding.manifest(),
+        "version": 1,
         "source_sha256": source_sha256,
+        "encoder_fingerprint": encoder_fingerprint,
         "safetensors_file": tensor_path.name,
         "safetensors_bytes": tensor_path.stat().st_size,
         "safetensors_sha256": _sha256(tensor_path),
@@ -200,6 +209,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--exllamav3-root", required=True, type=Path)
+    parser.add_argument("--calibration", required=True, type=Path)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -229,12 +239,20 @@ def main() -> None:
         spec=FRUIT_ANNEALED_SPEC,
         expected_sha256=FRUIT_ANNEALED_SPEC.checkpoint_sha256,
     )
+    calibration_store = FruitCalibrationStore(args.calibration)
     quantizer_module = load_qsrt_encoder(args.exllamav3_root)
     install_sqg_quantizer(quantizer_module)
     source_sha256 = FRUIT_ANNEALED_SPEC.checkpoint_sha256
+    encoder = current_encoder_provenance(
+        exllamav3_root=args.exllamav3_root,
+        calibration=calibration_store,
+    )
+    encoder_fingerprint = str(encoder["fingerprint"])
     args.output.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, object]] = []
     started = time.perf_counter()
+    calibration_layer = None
+    calibration_layer_id = None
     for index, (layer, expert) in enumerate(assignments, start=1):
         tensor_path, manifest_path = _artifact_paths(args.output, layer, expert)
         previous = (
@@ -244,6 +262,7 @@ def main() -> None:
                 layer=layer,
                 expert=expert,
                 source_sha256=source_sha256,
+                encoder_fingerprint=encoder_fingerprint,
             )
             if args.resume
             else None
@@ -259,11 +278,16 @@ def main() -> None:
 
         torch.cuda.reset_peak_memory_stats(device)
         item_started = time.perf_counter()
+        if calibration_layer_id != layer:
+            calibration_layer = calibration_store.load_layer(layer)
+            calibration_layer_id = layer
+        assert calibration_layer is not None
         encoding = encode_fruit_expert(
             store,
             layer=layer,
             expert=expert,
             device=device,
+            calibration=calibration_layer.expert_rows(expert),
             quantizer_module=quantizer_module,
         )
         torch.cuda.synchronize(device)
@@ -273,6 +297,7 @@ def main() -> None:
             args.output,
             encoding,
             source_sha256=source_sha256,
+            encoder_fingerprint=encoder_fingerprint,
             elapsed_seconds=elapsed,
             peak_cuda_bytes=peak,
         )
@@ -293,6 +318,7 @@ def main() -> None:
         "profile_id": FRUIT_QSRT_PROFILE_ID,
         "codebook": FRUIT_QSRT_CODEBOOK,
         "source": store.evidence,
+        "encoder": encoder,
         "selection": (
             "frozen_19_assignment_sample"
             if args.sample

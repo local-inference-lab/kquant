@@ -209,6 +209,14 @@ def test_per_expert_wrapper_maps_w3_to_up_proj(tmp_path: Path) -> None:
 
     assert store.representation == "per_expert"
     assert store.evidence["source_container"] == "model"
+    assert store.evidence["source_sha256"] == spec.checkpoint_sha256
+    assert store.evidence["source_kind"] == "torch_checkpoint"
+    assert (
+        store.evidence["checkpoint_sha256_provenance"]
+        == "checkpoint_file_authenticated"
+    )
+    assert store.evidence["checkpoint_filename"] == path.name
+    assert store.evidence["checkpoint_bytes"] == path.stat().st_size
     torch.testing.assert_close(
         result,
         state["layers.4.mlp.experts.0.up_proj.weight"].float(),
@@ -231,6 +239,10 @@ def test_safetensors_store_authenticates_and_maps_mtp_matrix(
     result = store.load_matrix(13, 2, "w3")
 
     assert store.evidence["source_container"] == "hf_bf16_safetensors"
+    assert store.evidence["source_sha256"] == manifest_sha256
+    assert store.evidence["source_kind"] == "safetensors_manifest"
+    assert store.evidence["checkpoint_filename"] == "MANIFEST.sha256"
+    assert store.evidence["checkpoint_bytes"] > 0
     assert result.dtype == torch.float32
     assert result.is_contiguous()
     torch.testing.assert_close(
@@ -277,6 +289,9 @@ def test_preflight_is_json_serializable_and_pins_legacy_theta(tmp_path: Path) ->
     json.dumps(evidence, allow_nan=False, sort_keys=True)
     assert evidence["status"] == "pass"
     assert evidence["checkpoint_sha256"] == spec.checkpoint_sha256
+    assert evidence["source_sha256"] == spec.checkpoint_sha256
+    assert evidence["checkpoint_filename"] == path.name
+    assert evidence["checkpoint_bytes"] == path.stat().st_size
     assert evidence["expert_inventory"]["matrices"] == ["w1", "w3", "w2"]
     assert evidence["conventions"] == {
         "kind": "legacy",
