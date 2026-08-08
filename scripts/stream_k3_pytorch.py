@@ -73,7 +73,7 @@ from kquant.teacher_proxy_suite import (
     load_teacher_proxy_suite,
     parse_layer_list,
 )
-from kquant.x4t import X4T_DATA_OFFSET, X4TLayerReader, x4t_layer_path
+from kquant.x4t import X4T_LAYER_FIXED_BYTES, X4TLayerReader, x4t_layer_path
 
 DEFAULT_CHECKPOINT = Path(
     "/home/luke/.cache/huggingface/hub/"
@@ -137,7 +137,7 @@ class QSRTArtifact:
             raise ValueError(f"{manifest_path}: noncanonical atom inventory")
         actual_atom_files = {
             path.name
-            for path in root.glob(f"{LAYER_PREFIX}*.atoms")
+            for path in root.glob(f"{LAYER_PREFIX}*.safetensors")
             if path.is_file()
         }
         if actual_atom_files != expected_atom_files:
@@ -156,7 +156,9 @@ class QSRTArtifact:
         if expected_x4t_files != canonical_x4t_files:
             raise ValueError(f"{manifest_path}: noncanonical X4T inventory")
         actual_x4t_files = {
-            path.name for path in root.glob("x4t-layer-*.bin") if path.is_file()
+            path.name
+            for path in root.glob("x4t-layer-*.safetensors")
+            if path.is_file()
         }
         if actual_x4t_files != expected_x4t_files:
             raise ValueError(
@@ -815,7 +817,7 @@ class QSRTStagedExperts:
                 LAYER_HEADER_BYTES
                 + FORMAT_SECTION_BYTES
                 + SHARED_SCALE_SECTION_BYTES
-                + X4T_DATA_OFFSET
+                + X4T_LAYER_FIXED_BYTES
             )
         )
         self._handles: list[Any] = []
@@ -877,13 +879,14 @@ class QSRTStagedExperts:
             format_spec = self.reader.format_specs[expert_id]
             if format_spec.is_x4t:
                 self.stats.kept_expert_ids.append(expert_id)
+                self.stats.packed_bytes += 28
             else:
                 self.stats.exl3_expert_ids.append(expert_id)
             for matrix in EXPERT_MATRICES:
                 expected = tuple(getattr(expert, matrix).weight.shape)
                 if format_spec.is_x4t:
                     packed = self.x4t_reader.read(expert_id, matrix)
-                    self.stats.packed_bytes += self.x4t_reader.record_bytes(
+                    self.stats.packed_bytes += self.x4t_reader.matrix_payload_bytes(
                         expert_id, matrix
                     )
                     dense = self.compressor.decompress(

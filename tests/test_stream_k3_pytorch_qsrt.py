@@ -24,7 +24,7 @@ from kquant.pack.qsrt_materialize import (
 )
 from kquant.pack.qsrt_atoms import layer_filename
 from kquant.source_weights import PackedMXFP4Matrix
-from kquant.x4t import X4T_DATA_OFFSET, x4t_layer_path
+from kquant.x4t import X4T_LAYER_FIXED_BYTES, x4t_layer_path
 
 
 def _artifact_tree(root: Path) -> None:
@@ -157,7 +157,7 @@ def test_qsrt_stager_classifies_tiers_and_releases_to_meta(
             )
 
         @staticmethod
-        def record_bytes(expert_id: int, matrix: str) -> int:
+        def matrix_payload_bytes(expert_id: int, matrix: str) -> int:
             assert expert_id == 1
             return torch.empty(matrix_shapes[matrix], dtype=torch.uint8).nbytes + 1
 
@@ -212,13 +212,13 @@ def test_qsrt_stager_classifies_tiers_and_releases_to_meta(
         LAYER_HEADER_BYTES
         + FORMAT_SECTION_BYTES
         + SHARED_SCALE_SECTION_BYTES
-        + X4T_DATA_OFFSET
+        + X4T_LAYER_FIXED_BYTES
     )
     expected_kept = sum(
         torch.empty(shape, dtype=torch.uint8).nbytes + 1
         for shape in matrix_shapes.values()
     )
-    assert stager.stats.packed_bytes == expected_metadata + 3 * 5 + expected_kept
+    assert stager.stats.packed_bytes == expected_metadata + 28 + 3 * 5 + expected_kept
     with pytest.raises(RuntimeError, match="staged more than once"):
         stager._stage(experts, torch.tensor([0]))
 

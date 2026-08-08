@@ -74,16 +74,6 @@ E2M1_LUT = (
 )
 MXFP4_BITS_EFFECTIVE = 4.25  # 4b code + 8b scale / 32
 
-# ---------------------------------------------------------------------------
-# NF3 target format ("nf3_2p1", must match b12x
-# sparkinfer/moe/_shared/kernels/w4a16/prepare.py)
-# ---------------------------------------------------------------------------
-NF3_CODEBOOK = (-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0)
-NF3_BLOCK = 32
-NF3_SCALE_FLOOR = 2.0**-10  # b12x _NF3_SCALE_FLOOR
-NF3_SCALE_MANTISSA_BITS = 3  # scales rounded to 3 mantissa bits (E4M3-style)
-NF3_BITS_EFFECTIVE = 3.25  # 3b code + 8b scale / 32
-
 # NF2 contingency: 4-level sign-magnitude codebook (refittable).
 NF2_CODEBOOK = (-1.0, -0.3563, 0.3563, 1.0)
 NF2_BITS_EFFECTIVE = 2.25

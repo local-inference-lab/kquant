@@ -1,102 +1,27 @@
 from __future__ import annotations
 
-import struct
-
 import pytest
 import torch
+from safetensors import safe_open
 
 from kquant.x4t import (
-    X4TMatrix,
+    X4T_LAYER_FIXED_BYTES,
+    X4T_MATRIX_ORDER,
+    X4T_SAFETENSORS_SCHEMA,
     X4TLayerReader,
     X4TLayerWriter,
-    pack_x4t_matrix_record,
+    X4TMatrix,
+    pack_x4t_scale_components,
     partition_x4t_components,
-    unpack_x4t_matrix_record,
-    x4t_matrix_storage_bytes,
-    x4t_record_bpw,
+    x4t_expert_storage_bytes,
+    x4t_layer_path,
     x4t_scale_storage_bytes,
 )
 
 
-def _matrix(rows: int = 16, scale_columns: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(123)
-    packed = torch.randint(
-        0,
-        256,
-        (rows, scale_columns * 16),
-        dtype=torch.uint8,
-        generator=generator,
-    )
-    scale = torch.full((rows, scale_columns), 120, dtype=torch.uint8)
-    scale[:, 1::2] = 121
-    scale[0, 0] = 123
-    return packed, scale
-
-
-def test_x4t_matrix_record_is_exact_and_deterministic() -> None:
-    packed, scale = _matrix()
-
-    payload = pack_x4t_matrix_record(
-        "w1", packed, scale, production_shape=False
-    )
-    decoded = unpack_x4t_matrix_record(
-        payload, expected_matrix="w1", production_shape=False
-    )
-
-    assert torch.equal(decoded.packed, packed)
-    assert torch.equal(decoded.scale, scale)
-    assert payload == pack_x4t_matrix_record(
-        "w1", packed.clone(), scale.clone(), production_shape=False
-    )
-    assert x4t_record_bpw(payload) > 4.0
-
-
-def test_x4t_record_rejects_matrix_slot_mismatch() -> None:
-    packed, scale = _matrix()
-    payload = pack_x4t_matrix_record(
-        "w1", packed, scale, production_shape=False
-    )
-
-    with pytest.raises(ValueError, match="directory slot"):
-        unpack_x4t_matrix_record(
-            payload, expected_matrix="w2", production_shape=False
-        )
-
-
-def test_x4t_record_rejects_noncanonical_reserved_bytes() -> None:
-    packed, scale = _matrix()
-    payload = bytearray(
-        pack_x4t_matrix_record("w1", packed, scale, production_shape=False)
-    )
-    payload[63] = 1
-
-    with pytest.raises(ValueError, match="noncanonical"):
-        unpack_x4t_matrix_record(bytes(payload), production_shape=False)
-
-
-def test_x4t_layer_round_trip_and_sparse_lookup(tmp_path) -> None:
-    packed, scale = _matrix()
-    destination = tmp_path / "x4t-layer.bin"
-    with X4TLayerWriter(destination, layer=24) as writer:
-        # Canonical matrix order is w1, w3, w2.
-        writer.add(6, "w1", *_production_matrix("w1", packed_seed=1))
-        writer.add(6, "w3", *_production_matrix("w3", packed_seed=2))
-        writer.add(6, "w2", *_production_matrix("w2", packed_seed=3))
-
-    reader = X4TLayerReader(destination)
-    assert reader.layer == 24
-    assert reader.record_count == 3
-    assert not reader.has(5, "w1")
-    assert reader.has(6, "w2")
-    with pytest.raises(KeyError):
-        reader.read(5, "w1")
-    decoded = reader.read(6, "w1")
-    expected_packed, expected_scale = _production_matrix("w1", packed_seed=1)
-    assert torch.equal(decoded.packed, expected_packed)
-    assert torch.equal(decoded.scale, expected_scale)
-
-
-def _production_matrix(matrix: str, *, packed_seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _production_matrix(
+    matrix: str, *, packed_seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     from kquant import constants as C
 
     out_features, in_features = C.EXPERT_SHAPES[matrix]
@@ -108,7 +33,6 @@ def _production_matrix(matrix: str, *, packed_seed: int) -> tuple[torch.Tensor, 
         dtype=torch.uint8,
         generator=generator,
     )
-    # Keep the fixture compressible while exercising both adjacent palettes.
     scale = torch.full(
         (out_features, in_features // C.MXFP4_BLOCK), 120, dtype=torch.uint8
     )
@@ -117,52 +41,85 @@ def _production_matrix(matrix: str, *, packed_seed: int) -> tuple[torch.Tensor, 
     return packed, scale
 
 
-def test_x4t_layer_rejects_directory_corruption(tmp_path) -> None:
-    destination = tmp_path / "x4t-layer.bin"
+def test_x4t_layer_is_canonical_safetensors_and_round_trips(tmp_path) -> None:
+    destination = x4t_layer_path(tmp_path, 24)
+    source = {
+        matrix: _production_matrix(matrix, packed_seed=index + 1)
+        for index, matrix in enumerate(X4T_MATRIX_ORDER)
+    }
+    with X4TLayerWriter(destination, layer=24) as writer:
+        for matrix in X4T_MATRIX_ORDER:
+            writer.add(6, matrix, *source[matrix])
+
+    assert destination.suffix == ".safetensors"
+    with safe_open(destination, framework="pt", device="cpu") as handle:
+        assert handle.metadata()["schema"] == X4T_SAFETENSORS_SCHEMA
+        assert tuple(handle.get_tensor("expert_ids").tolist()) == (6,)
+        assert set(handle.keys()) == {
+            "expert_ids",
+            *{
+                f"{matrix}.{part}"
+                for matrix in X4T_MATRIX_ORDER
+                for part in (
+                    "packed",
+                    "scale_fixed",
+                    "scale_exceptions",
+                    "scale_exception_offsets",
+                )
+            },
+        }
+
+    reader = X4TLayerReader(destination)
+    assert reader.layer == 24
+    assert reader.matrix_count == 3
+    assert not reader.has(5, "w1")
+    assert reader.has(6, "w2")
+    with pytest.raises(KeyError):
+        reader.read(5, "w1")
+    for matrix in X4T_MATRIX_ORDER:
+        decoded = reader.read(6, matrix)
+        assert torch.equal(decoded.packed, source[matrix][0])
+        assert torch.equal(decoded.scale, source[matrix][1])
+
+    expected = X4T_LAYER_FIXED_BYTES + x4t_expert_storage_bytes(
+        {matrix: source[matrix][1] for matrix in X4T_MATRIX_ORDER}
+    )
+    assert destination.stat().st_size == expected
+
+
+def test_x4t_empty_layer_is_valid_safetensors(tmp_path) -> None:
+    destination = x4t_layer_path(tmp_path, 1)
     with X4TLayerWriter(destination, layer=1):
         pass
-    payload = bytearray(destination.read_bytes())
-    payload[4096] = 1
-    destination.write_bytes(payload)
-
-    with pytest.raises(ValueError, match="directory checksum"):
-        X4TLayerReader(destination)
+    reader = X4TLayerReader(destination)
+    assert reader.expert_ids == ()
+    assert reader.file_bytes == X4T_LAYER_FIXED_BYTES
 
 
-def test_x4t_layer_rejects_record_corruption(tmp_path) -> None:
-    destination = tmp_path / "x4t-layer.bin"
-    packed, scale = _production_matrix("w1", packed_seed=4)
-    with X4TLayerWriter(destination, layer=1) as writer:
-        entry = writer.add(0, "w1", packed, scale)
+def test_x4t_layer_rejects_corrupt_safetensors_header(tmp_path) -> None:
+    destination = x4t_layer_path(tmp_path, 1)
+    with X4TLayerWriter(destination, layer=1):
+        pass
     with destination.open("r+b") as handle:
-        handle.seek(entry.offset + entry.length - 1)
-        byte = handle.read(1)
-        handle.seek(entry.offset + entry.length - 1)
-        handle.write(bytes([byte[0] ^ 1]))
-
-    with pytest.raises(ValueError, match="record checksum"):
+        handle.seek(8)
+        handle.write(b"!")
+    with pytest.raises(Exception):
         X4TLayerReader(destination)
 
 
-def test_x4t_scale_only_accounting_matches_written_record() -> None:
-    packed, scale = _production_matrix("w2", packed_seed=9)
-    record = pack_x4t_matrix_record("w2", packed, scale)
-
-    # The record contains a fixed 64-byte matrix header and the unchanged
-    # packed nibble plane before the X4T scale payload.
-    assert x4t_scale_storage_bytes(scale) == len(record) - 64 - packed.numel()
-    assert x4t_matrix_storage_bytes("w2", scale) == (
-        (len(record) + 4095) // 4096 * 4096
-    )
+def test_x4t_scale_accounting_matches_safetensors_components() -> None:
+    _, scale = _production_matrix("w2", packed_seed=9)
+    fixed, exceptions = pack_x4t_scale_components(scale)
+    assert x4t_scale_storage_bytes(scale) == fixed.numel() + 4 * exceptions.numel()
 
 
-def test_x4t_layer_writer_requires_canonical_order(tmp_path) -> None:
-    destination = tmp_path / "x4t-layer.bin"
+def test_x4t_layer_writer_requires_complete_canonical_triplets(tmp_path) -> None:
+    destination = x4t_layer_path(tmp_path, 1)
     packed, scale = _production_matrix("w1", packed_seed=5)
-    with pytest.raises(ValueError, match="canonical order"):
+    with pytest.raises(ValueError, match="w1, w3, and w2"):
         with X4TLayerWriter(destination, layer=1) as writer:
-            writer.add(1, "w1", packed, scale)
             writer.add(0, "w1", packed, scale)
+            writer.add(1, "w1", packed, scale)
 
 
 @pytest.mark.parametrize("matrix", ("w1", "w2"))

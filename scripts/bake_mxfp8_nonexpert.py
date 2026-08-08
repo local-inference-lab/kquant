@@ -29,7 +29,7 @@ from safetensors.torch import save_file
 
 from kquant.mxfp8 import MXFP8_BLOCK_SIZE, mxfp8_quantize_cpu
 
-SRC = "/models/Kimi-K3-NF3R-Uniform-3p25-serve"
+SRC = "/models/Kimi-K3-EXL3-3p09"
 DEST = "/models/Kimi-K3-mxfp8-nonexpert"
 BLOCK = MXFP8_BLOCK_SIZE
 

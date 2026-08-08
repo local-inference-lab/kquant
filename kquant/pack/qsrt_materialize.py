@@ -56,7 +56,12 @@ from kquant.qsrt import (
 )
 from kquant.qsrt_storage import QSRTLayerLayout
 from kquant.source_weights import OfficialMXFP4Store
-from kquant.x4t import X4T_DATA_OFFSET, X4T_MATRIX_ORDER, X4TLayerReader, x4t_layer_path
+from kquant.x4t import (
+    X4T_LAYER_FIXED_BYTES,
+    X4T_MATRIX_ORDER,
+    X4TLayerReader,
+    x4t_layer_path,
+)
 
 
 QSRT_ARTIFACT_KIND = "kquant_kimi_k3_qsrt_artifact"
@@ -303,7 +308,7 @@ def validate_qsrt_materialization_allocation(
         mask[row, list(x4t)] = True
         layout = QSRTLayerLayout(len(compressed), len(x4t))
         expected_atoms = qsrt_trellis_layer_bytes(len(x4t))
-        expected_x4t = X4T_DATA_OFFSET + int(
+        expected_x4t = X4T_LAYER_FIXED_BYTES + int(
             x4t_index.expert_storage_bytes[row, mask[row]].sum()
         )
         if expected_atoms != layout.disk_bytes:
@@ -403,9 +408,9 @@ def validate_qsrt_layer_pair(
     x4t = X4TLayerReader(x4t_path)
     if x4t.layer != spec.layer or x4t.file_bytes != expected_x4t_bytes:
         raise ValueError("QSRT X4T layer disagrees with its materialization plan")
-    expected_records = len(spec.x4t) * len(X4T_MATRIX_ORDER)
-    if x4t.record_count != expected_records:
-        raise ValueError("QSRT X4T record count disagrees with its tier")
+    expected_matrices = len(spec.x4t) * len(X4T_MATRIX_ORDER)
+    if x4t.matrix_count != expected_matrices:
+        raise ValueError("QSRT X4T matrix count disagrees with its tier")
     exact = set(spec.x4t)
     for expert in range(C.NUM_EXPERTS):
         for matrix in X4T_MATRIX_ORDER:

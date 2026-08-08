@@ -56,12 +56,13 @@ def _fixtures(tmp_path: Path) -> tuple[QSRTCandidatePool, X4TCostIndex]:
         codebook=CODEBOOK_SQG_XOR_CHEB_T12,
     )
     matrix_costs = np.full((*shape, 3), 5_566_464, dtype=np.int64)
-    expert_costs = matrix_costs.sum(axis=2)
+    expert_costs = matrix_costs.sum(axis=2) + 28
     index = X4TCostIndex(
         root=(tmp_path / "x4t").resolve(),
         manifest={"source_revision": C.REVISION},
         matrix_storage_bytes=matrix_costs,
         expert_storage_bytes=expert_costs,
+        matrix_exception_counts=np.zeros_like(matrix_costs),
         content_sha256="cd" * 32,
     )
     return pool, index

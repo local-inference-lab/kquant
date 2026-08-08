@@ -50,7 +50,7 @@ from kquant.qsrt_storage import (
 
 
 LAYER_PREFIX = "qsrt-layer-"
-LAYER_SUFFIX = ".atoms"
+LAYER_SUFFIX = ".safetensors"
 
 
 def layer_filename(layer: int) -> str:

@@ -13,17 +13,18 @@ import numpy as np
 from kquant import constants as C
 from kquant.source_weights import OfficialMXFP4Store
 from kquant.x4t import (
-    X4T_DATA_OFFSET,
     X4T_EXPERTS_PER_LAYER,
+    X4T_LAYER_FIXED_BYTES,
     X4T_MATRIX_ORDER,
-    X4T_RECORD_ALIGNMENT,
+    X4T_SAFETENSORS_SCHEMA,
     X4T_VERSION,
-    x4t_matrix_storage_bytes,
+    x4t_matrix_storage_bytes_from_exception_count,
+    x4t_scale_exception_count,
 )
 
 
 X4T_COST_INDEX_KIND = "kquant_kimi_k3_qsrt_x4t_cost_index"
-X4T_COST_INDEX_SCHEMA_VERSION = 1
+X4T_COST_INDEX_SCHEMA_VERSION = 2
 X4T_COST_LAYER_KIND = "kquant_kimi_k3_qsrt_x4t_cost_layer"
 X4T_COST_COMPLETION_KIND = "kquant_kimi_k3_qsrt_x4t_cost_completion"
 X4T_COST_MANIFEST_FILENAME = "x4t-cost-manifest.json"
@@ -59,8 +60,10 @@ def x4t_cost_manifest(store: OfficialMXFP4Store) -> dict:
             "matrix_order": list(X4T_MATRIX_ORDER),
             "scale_codec": "x4t-adjacent-pair-fixed-stream-v1",
             "scale_tile_rows": 16,
-            "record_alignment_bytes": X4T_RECORD_ALIGNMENT,
-            "layer_fixed_bytes": X4T_DATA_OFFSET,
+            "container": "safetensors",
+            "container_schema": X4T_SAFETENSORS_SCHEMA,
+            "layer_fixed_bytes": X4T_LAYER_FIXED_BYTES,
+            "per_expert_index_bytes": 28,
             "exact_mxfp4_reconstruction": True,
         },
         "layers": list(C.MOE_LAYERS),
@@ -92,14 +95,15 @@ def build_x4t_cost_layer(
     store: OfficialMXFP4Store,
     layer: int,
 ) -> dict:
-    """Scan only scale tensors and return exact aligned X4T record costs."""
+    """Scan scale tensors and return exact additive safetensors costs."""
 
     if layer not in C.MOE_LAYERS:
         raise ValueError("X4T cost layer must be a Kimi-K3 MoE layer")
-    costs = np.empty(
+    matrix_costs = np.empty(
         (X4T_EXPERTS_PER_LAYER, len(X4T_MATRIX_ORDER)), dtype=np.int64
     )
-    seen = np.zeros_like(costs, dtype=np.bool_)
+    exception_counts = np.empty_like(matrix_costs)
+    seen = np.zeros_like(matrix_costs, dtype=np.bool_)
     matrix_ids = {matrix: index for index, matrix in enumerate(X4T_MATRIX_ORDER)}
     for expert, matrix, scale in store.iter_layer_scale_planes(
         layer, matrices=X4T_MATRIX_ORDER
@@ -109,7 +113,11 @@ def build_x4t_cost_layer(
             raise ValueError(
                 f"duplicate X4T cost source for layer {layer} expert {expert} {matrix}"
             )
-        costs[expert, matrix_id] = x4t_matrix_storage_bytes(matrix, scale)
+        exception_count = x4t_scale_exception_count(scale)
+        exception_counts[expert, matrix_id] = exception_count
+        matrix_costs[expert, matrix_id] = (
+            x4t_matrix_storage_bytes_from_exception_count(matrix, exception_count)
+        )
         seen[expert, matrix_id] = True
     if not bool(seen.all()):
         missing = np.argwhere(~seen)[0]
@@ -118,8 +126,8 @@ def build_x4t_cost_layer(
             f"{layer} expert {int(missing[0])} "
             f"{X4T_MATRIX_ORDER[int(missing[1])]}"
         )
-    matrix_bytes = costs.tolist()
-    expert_bytes = costs.sum(axis=1).tolist()
+    matrix_bytes = matrix_costs.tolist()
+    expert_bytes = (matrix_costs.sum(axis=1) + 28).tolist()
     document = {
         "kind": X4T_COST_LAYER_KIND,
         "schema_version": X4T_COST_INDEX_SCHEMA_VERSION,
@@ -127,8 +135,9 @@ def build_x4t_cost_layer(
         "layer": layer,
         "matrix_order": list(X4T_MATRIX_ORDER),
         "matrix_storage_bytes": matrix_bytes,
+        "matrix_exception_counts": exception_counts.tolist(),
         "expert_storage_bytes": expert_bytes,
-        "all_x4t_sidecar_bytes": X4T_DATA_OFFSET + sum(expert_bytes),
+        "all_x4t_sidecar_bytes": X4T_LAYER_FIXED_BYTES + sum(expert_bytes),
     }
     validate_x4t_cost_layer(document, source_revision=store.revision)
     return document
@@ -138,7 +147,7 @@ def validate_x4t_cost_layer(
     document: dict,
     *,
     source_revision: str,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if document.get("kind") != X4T_COST_LAYER_KIND:
         raise ValueError("X4T cost layer kind is invalid")
     if document.get("schema_version") != X4T_COST_INDEX_SCHEMA_VERSION:
@@ -151,18 +160,27 @@ def validate_x4t_cost_layer(
     if document.get("matrix_order") != list(X4T_MATRIX_ORDER):
         raise ValueError("X4T cost matrix order is invalid")
     matrix = np.asarray(document.get("matrix_storage_bytes"), dtype=np.int64)
+    exceptions = np.asarray(document.get("matrix_exception_counts"), dtype=np.int64)
     expert = np.asarray(document.get("expert_storage_bytes"), dtype=np.int64)
     if matrix.shape != (X4T_EXPERTS_PER_LAYER, len(X4T_MATRIX_ORDER)):
         raise ValueError("X4T matrix cost array has the wrong shape")
     if expert.shape != (X4T_EXPERTS_PER_LAYER,):
         raise ValueError("X4T expert cost array has the wrong shape")
-    if np.any(matrix <= 0) or np.any(matrix % X4T_RECORD_ALIGNMENT):
-        raise ValueError("X4T matrix costs must be positive aligned byte counts")
-    if not np.array_equal(expert, matrix.sum(axis=1)):
+    if exceptions.shape != matrix.shape or np.any(exceptions < 0):
+        raise ValueError("X4T exception count array has the wrong shape or values")
+    expected_matrix = np.empty_like(matrix)
+    for matrix_id, matrix_name in enumerate(X4T_MATRIX_ORDER):
+        expected_matrix[:, matrix_id] = [
+            x4t_matrix_storage_bytes_from_exception_count(matrix_name, int(value))
+            for value in exceptions[:, matrix_id]
+        ]
+    if np.any(matrix <= 0) or not np.array_equal(matrix, expected_matrix):
+        raise ValueError("X4T matrix costs do not close against exception counts")
+    if not np.array_equal(expert, matrix.sum(axis=1) + 28):
         raise ValueError("X4T expert costs do not close against matrix costs")
-    if document.get("all_x4t_sidecar_bytes") != X4T_DATA_OFFSET + int(expert.sum()):
+    if document.get("all_x4t_sidecar_bytes") != X4T_LAYER_FIXED_BYTES + int(expert.sum()):
         raise ValueError("X4T layer sidecar byte accounting does not close")
-    return matrix, expert
+    return matrix, expert, exceptions
 
 
 def write_x4t_cost_layer(destination: str | Path, document: dict) -> Path:
@@ -179,6 +197,7 @@ class X4TCostIndex:
     manifest: dict
     matrix_storage_bytes: np.ndarray
     expert_storage_bytes: np.ndarray
+    matrix_exception_counts: np.ndarray
     content_sha256: str
 
     def __post_init__(self) -> None:
@@ -193,6 +212,8 @@ class X4TCostIndex:
             C.NUM_EXPERTS,
         ):
             raise ValueError("X4T expert cost index shape is invalid")
+        if self.matrix_exception_counts.shape != self.matrix_storage_bytes.shape:
+            raise ValueError("X4T exception count index shape is invalid")
 
 
 def finalize_x4t_cost_index(destination: str | Path) -> dict:
@@ -205,13 +226,13 @@ def finalize_x4t_cost_index(destination: str | Path) -> dict:
     for layer in C.MOE_LAYERS:
         path = destination / x4t_cost_layer_filename(layer)
         document = json.loads(path.read_text())
-        _, expert = validate_x4t_cost_layer(
+        _, expert, _ = validate_x4t_cost_layer(
             document,
             source_revision=str(manifest["source_revision"]),
         )
         raw = _canonical_json(document)
         layer_hashes[str(layer)] = hashlib.sha256(raw).hexdigest()
-        total += X4T_DATA_OFFSET + int(expert.sum())
+        total += X4T_LAYER_FIXED_BYTES + int(expert.sum())
     digest = hashlib.sha256(_canonical_json(layer_hashes)).hexdigest()
     completion = {
         "kind": X4T_COST_COMPLETION_KIND,
@@ -245,13 +266,14 @@ def load_x4t_cost_index(destination: str | Path) -> X4TCostIndex:
         dtype=np.int64,
     )
     experts = np.empty((C.NUM_MOE_LAYERS, C.NUM_EXPERTS), dtype=np.int64)
+    exception_counts = np.empty_like(matrices)
     layer_hashes: dict[str, str] = {}
     total = 0
     for row, layer in enumerate(C.MOE_LAYERS):
         document = json.loads(
             (destination / x4t_cost_layer_filename(layer)).read_text()
         )
-        matrix, expert = validate_x4t_cost_layer(
+        matrix, expert, exceptions = validate_x4t_cost_layer(
             document,
             source_revision=str(manifest["source_revision"]),
         )
@@ -259,10 +281,11 @@ def load_x4t_cost_index(destination: str | Path) -> X4TCostIndex:
             raise ValueError("X4T cost layer filename and payload disagree")
         matrices[row] = matrix
         experts[row] = expert
+        exception_counts[row] = exceptions
         layer_hashes[str(layer)] = hashlib.sha256(
             _canonical_json(document)
         ).hexdigest()
-        total += X4T_DATA_OFFSET + int(expert.sum())
+        total += X4T_LAYER_FIXED_BYTES + int(expert.sum())
     digest = hashlib.sha256(_canonical_json(layer_hashes)).hexdigest()
     if completion.get("layers") != layer_hashes or completion.get("content_sha256") != digest:
         raise ValueError("X4T cost index content digest does not close")
@@ -273,5 +296,6 @@ def load_x4t_cost_index(destination: str | Path) -> X4TCostIndex:
         manifest=manifest,
         matrix_storage_bytes=matrices,
         expert_storage_bytes=experts,
+        matrix_exception_counts=exception_counts,
         content_sha256=digest,
     )

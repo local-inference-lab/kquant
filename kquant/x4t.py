@@ -1,7 +1,9 @@
 """GPU-tile-friendly exact coding for MXFP4 UE8M0 scale planes.
 
-X4T keeps the E2M1 nibble plane unchanged.  It represents each 16-row scale
-slab with one adjacent two-value palette per row and a fixed-stride selector
+X4T keeps the E2M1 nibble plane unchanged. FC1 nibbles are serialized in their
+natural output-row order; FC2 nibbles are serialized by 32-channel input groups
+so any tensor-parallel whole-atom extent is contiguous on disk. It represents
+each 16-row scale slab with one adjacent two-value palette per row and a fixed-stride selector
 bitmap.  Values outside that adjacent pair are carried by a sorted uint32
 exception stream::
 
@@ -15,53 +17,35 @@ needs no variable tile offsets, prefix sums, or exception searches.
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import shutil
 import struct
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
+from safetensors import safe_open
 
 from kquant import constants as C
 
 
-X4T_MAGIC = b"KQX4T\0\0\0"
-X4T_VERSION = 1
+X4T_VERSION = 2
 X4T_TILE_ROWS = 16
 X4T_POSITION_BITS = 24
 X4T_POSITION_MASK = (1 << X4T_POSITION_BITS) - 1
 
-X4T_LAYER_MAGIC = b"KQX4TLY\0"
-X4T_RECORD_MAGIC = b"KQ4T"
-X4T_LAYER_HEADER_BYTES = 4096
-X4T_DIRECTORY_BYTES = 65536
-X4T_DIRECTORY_ENTRY_BYTES = 24
-X4T_DATA_OFFSET = X4T_LAYER_HEADER_BYTES + X4T_DIRECTORY_BYTES
-X4T_RECORD_ALIGNMENT = 4096
+X4T_SAFETENSORS_SCHEMA = "kquant_x4t_layer_v1"
+X4T_SAFETENSORS_HEADER_BYTES = 4096
+# Three exception-offset vectors each contain one leading int64. The remaining
+# 28 bytes per expert are charged in x4t_expert_storage_bytes(). Keeping the
+# standards-valid safetensors JSON header padded to 4 KiB makes exact allocation
+# additive without reintroducing a private container or record format.
+X4T_LAYER_FIXED_BYTES = 8 + X4T_SAFETENSORS_HEADER_BYTES + 3 * 8
 X4T_EXPERTS_PER_LAYER = 896
 X4T_MATRIX_ORDER = ("w1", "w3", "w2")
-
-_HEADER = struct.Struct("<8sBBH I H H I I Q Q 20s")
-_LAYER_HEADER = struct.Struct("<8sHHIHHHHQQQQIIII")
-_DIRECTORY_ENTRY = struct.Struct("<QQII")
-_RECORD_HEADER = struct.Struct("<4sHHBBHIIQQ28s")
-
-if _HEADER.size != 64:
-    raise AssertionError("X4T header layout drifted")
-if _DIRECTORY_ENTRY.size != X4T_DIRECTORY_ENTRY_BYTES:
-    raise AssertionError("X4T directory entry layout drifted")
-if _RECORD_HEADER.size != 64:
-    raise AssertionError("X4T record header layout drifted")
-if (
-    X4T_EXPERTS_PER_LAYER
-    * len(X4T_MATRIX_ORDER)
-    * X4T_DIRECTORY_ENTRY_BYTES
-    > X4T_DIRECTORY_BYTES
-):
-    raise AssertionError("X4T fixed directory is too small")
 
 
 def _validate_scale(scale: torch.Tensor) -> tuple[int, int]:
@@ -71,7 +55,9 @@ def _validate_scale(scale: torch.Tensor) -> tuple[int, int]:
         or scale.device.type != "cpu"
         or not scale.is_contiguous()
     ):
-        raise ValueError("X4T scale must be a contiguous two-dimensional CPU uint8 tensor")
+        raise ValueError(
+            "X4T scale must be a contiguous two-dimensional CPU uint8 tensor"
+        )
     rows, columns = map(int, scale.shape)
     if not rows or rows % X4T_TILE_ROWS:
         raise ValueError("X4T scale rows must be a nonzero multiple of 16")
@@ -106,9 +92,9 @@ def pack_x4t_scale_components(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return X4T's GPU-facing fixed stream and exception words.
 
-    This is the payload behind the 64-byte standalone scale header. Exposing
-    it directly lets checkpoint preparation preserve X4T all the way to the
-    GPU instead of reconstructing a dense scale plane at model load.
+    These tensors are stored directly in the canonical X4T safetensors layer,
+    so checkpoint preparation can preserve X4T all the way to the GPU instead
+    of reconstructing a dense scale plane at model load.
     """
 
     rows, columns = _validate_scale(scale)
@@ -144,155 +130,12 @@ def pack_x4t_scale_components(
     )
 
 
-def pack_x4t_scale_plane(scale: torch.Tensor) -> bytes:
-    """Pack an exact UE8M0 scale plane into the fixed-stream X4T format."""
-
-    rows, columns = _validate_scale(scale)
-    selector_bytes = math.ceil(columns / 8)
-    tile_count = rows // X4T_TILE_ROWS
-    tile_bytes = X4T_TILE_ROWS + X4T_TILE_ROWS * selector_bytes
-    fixed, exceptions = pack_x4t_scale_components(scale)
-    fixed_payload = fixed.numpy().tobytes()
-    exception_payload = exceptions.numpy().astype("<u4", copy=False).tobytes()
-
-    header = _HEADER.pack(
-        X4T_MAGIC,
-        X4T_VERSION,
-        X4T_TILE_ROWS,
-        0,
-        rows,
-        columns,
-        selector_bytes,
-        tile_bytes,
-        tile_count,
-        len(fixed_payload),
-        int(exceptions.numel()),
-        bytes(20),
-    )
-    return header + fixed_payload + exception_payload
-
-
-def _parse_header(payload: bytes) -> tuple[int, int, int, int, int, int]:
-    if len(payload) < _HEADER.size:
-        raise ValueError("X4T payload is truncated before its header")
-    (
-        magic,
-        version,
-        tile_rows,
-        flags,
-        rows,
-        columns,
-        selector_bytes,
-        tile_bytes,
-        tile_count,
-        fixed_bytes,
-        exception_count,
-        reserved,
-    ) = _HEADER.unpack_from(payload)
-    if magic != X4T_MAGIC or version != X4T_VERSION:
-        raise ValueError("X4T payload has an unsupported magic or version")
-    if tile_rows != X4T_TILE_ROWS or flags or any(reserved):
-        raise ValueError("X4T payload header is noncanonical")
-    if not rows or rows % X4T_TILE_ROWS or not 1 <= columns <= 255:
-        raise ValueError("X4T payload dimensions are invalid")
-    if rows * columns > X4T_POSITION_MASK:
-        raise ValueError("X4T payload exceeds its 24-bit position field")
-    expected_selector_bytes = math.ceil(columns / 8)
-    expected_tile_count = rows // X4T_TILE_ROWS
-    expected_tile_bytes = X4T_TILE_ROWS * (1 + expected_selector_bytes)
-    expected_fixed_bytes = expected_tile_count * expected_tile_bytes
-    if (
-        selector_bytes != expected_selector_bytes
-        or tile_count != expected_tile_count
-        or tile_bytes != expected_tile_bytes
-        or fixed_bytes != expected_fixed_bytes
-    ):
-        raise ValueError("X4T fixed-stream geometry is noncanonical")
-    expected_length = _HEADER.size + fixed_bytes + 4 * exception_count
-    if len(payload) != expected_length:
-        raise ValueError("X4T component lengths disagree with its total length")
-    return rows, columns, selector_bytes, tile_bytes, fixed_bytes, exception_count
-
-
-def unpack_x4t_scale_plane(payload: bytes) -> torch.Tensor:
-    """Decode and fully validate an exact X4T scale plane."""
-
-    rows, columns, selector_bytes, tile_bytes, fixed_bytes, exception_count = (
-        _parse_header(payload)
-    )
-    fixed_start = _HEADER.size
-    fixed = torch.frombuffer(
-        bytearray(payload[fixed_start : fixed_start + fixed_bytes]),
-        dtype=torch.uint8,
-    ).reshape(rows // X4T_TILE_ROWS, tile_bytes)
-    bases = fixed[:, :X4T_TILE_ROWS].reshape(rows)
-    selectors = fixed[:, X4T_TILE_ROWS:].reshape(rows, selector_bytes)
-    column = torch.arange(columns, dtype=torch.int64)
-    selected = (
-        selectors[:, column // 8].to(torch.int16)
-        >> (column % 8).to(torch.int16)
-    ) & 1
-    result = (bases.to(torch.int16)[:, None] + selected).to(torch.uint8)
-    if columns % 8 and bool((selectors[:, -1] >> (columns % 8)).any()):
-        raise ValueError("X4T selector has nonzero padding bits")
-
-    exception_start = fixed_start + fixed_bytes
-    entries = (
-        struct.unpack_from(f"<{exception_count}I", payload, exception_start)
-        if exception_count
-        else ()
-    )
-    previous = -1
-    flat = result.view(-1)
-    for entry in entries:
-        position = entry & X4T_POSITION_MASK
-        value = entry >> X4T_POSITION_BITS
-        if position >= flat.numel() or position <= previous:
-            raise ValueError("X4T exception positions must be valid and strictly increasing")
-        previous = position
-        row = position // columns
-        base = int(bases[row])
-        if value in (base, base + 1):
-            raise ValueError("X4T exception redundantly names an adjacent-palette value")
-        flat[position] = value
-
-    # This catches non-optimal bases, redundant exceptions, and alternate tie
-    # breaks, keeping one byte representation for every scale plane.
-    if pack_x4t_scale_plane(result.contiguous()) != payload:
-        raise ValueError("X4T payload is not canonical")
-    return result
-
-
-def x4t_scale_components(payload: bytes) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-    """Return validated fixed bytes and uint32 exceptions for GPU upload."""
-
-    reconstructed = unpack_x4t_scale_plane(payload)
-    rows, columns, _, _, fixed_bytes, exception_count = _parse_header(payload)
-    fixed_start = _HEADER.size
-    fixed = torch.frombuffer(
-        bytearray(payload[fixed_start : fixed_start + fixed_bytes]),
-        dtype=torch.uint8,
-    ).contiguous()
-    exception_start = fixed_start + fixed_bytes
-    exceptions = torch.frombuffer(
-        bytearray(payload[exception_start:]), dtype=torch.uint32
-    ).contiguous()
-    if int(exceptions.numel()) != exception_count:
-        raise AssertionError("validated X4T exception accounting drifted")
-    del reconstructed
-    return fixed, exceptions, rows, columns
-
-
-def effective_x4t_bpw(scale: torch.Tensor, payload: bytes) -> float:
-    """Return nibble plane plus X4T scale bytes in bits per weight."""
+def effective_x4t_bpw(scale: torch.Tensor) -> float:
+    """Return nibble plane plus X4T scale-tensor bytes in bits per weight."""
 
     rows, columns = _validate_scale(scale)
     weights = rows * columns * 32
-    return 4.0 + len(payload) * 8 / weights
-
-
-def _align_up(value: int, alignment: int = X4T_RECORD_ALIGNMENT) -> int:
-    return (value + alignment - 1) // alignment * alignment
+    return 4.0 + x4t_scale_storage_bytes(scale) * 8 / weights
 
 
 def _matrix_id(matrix: str) -> int:
@@ -355,154 +198,8 @@ class X4TMatrix:
         )
 
 
-@dataclass(frozen=True)
-class X4TDirectoryEntry:
-    offset: int = 0
-    length: int = 0
-    crc32: int = 0
-    flags: int = 0
-
-    @property
-    def present(self) -> bool:
-        return bool(self.flags & 1)
-
-    def to_bytes(self) -> bytes:
-        return _DIRECTORY_ENTRY.pack(self.offset, self.length, self.crc32, self.flags)
-
-    @classmethod
-    def from_bytes(cls, payload: bytes | memoryview) -> "X4TDirectoryEntry":
-        if len(payload) != _DIRECTORY_ENTRY.size:
-            raise ValueError("X4T directory entry has the wrong length")
-        return cls(*_DIRECTORY_ENTRY.unpack(payload))
-
-
-def pack_x4t_matrix_record(
-    matrix: str,
-    packed: torch.Tensor,
-    scale: torch.Tensor,
-    *,
-    production_shape: bool = True,
-) -> bytes:
-    """Encode one exact MXFP4 matrix as an independently decodable X4T record."""
-
-    matrix_id = _matrix_id(matrix)
-    _validate_matrix_tensors(
-        matrix,
-        packed,
-        scale,
-        production_shape=production_shape,
-    )
-    out_features = int(packed.shape[0])
-    in_features = int(packed.shape[1]) * 2
-    packed_payload = memoryview(packed.numpy()).cast("B").tobytes()
-    scale_payload = pack_x4t_scale_plane(scale)
-    header = _RECORD_HEADER.pack(
-        X4T_RECORD_MAGIC,
-        X4T_VERSION,
-        _RECORD_HEADER.size,
-        matrix_id,
-        X4T_TILE_ROWS,
-        0,
-        out_features,
-        in_features,
-        len(packed_payload),
-        len(scale_payload),
-        bytes(28),
-    )
-    return header + packed_payload + scale_payload
-
-
-def unpack_x4t_matrix_record(
-    payload: bytes,
-    *,
-    expected_matrix: str | None = None,
-    production_shape: bool = True,
-) -> X4TMatrix:
-    """Decode one X4T record with canonicality and exact-byte validation."""
-
-    if len(payload) < _RECORD_HEADER.size:
-        raise ValueError("X4T record is truncated before its header")
-    (
-        magic,
-        version,
-        header_bytes,
-        matrix_id,
-        tile_rows,
-        flags,
-        out_features,
-        in_features,
-        packed_bytes,
-        scale_bytes,
-        reserved,
-    ) = _RECORD_HEADER.unpack_from(payload)
-    if magic != X4T_RECORD_MAGIC or version != X4T_VERSION:
-        raise ValueError("X4T record has an unsupported magic or version")
-    if header_bytes != _RECORD_HEADER.size or flags or any(reserved):
-        raise ValueError("X4T record header is noncanonical")
-    if matrix_id >= len(X4T_MATRIX_ORDER):
-        raise ValueError("X4T record matrix ID is invalid")
-    matrix = X4T_MATRIX_ORDER[matrix_id]
-    if expected_matrix is not None and matrix != expected_matrix:
-        raise ValueError("X4T record matrix ID disagrees with its directory slot")
-    if tile_rows != X4T_TILE_ROWS:
-        raise ValueError("X4T record uses an unsupported scale tile height")
-    if not out_features or not in_features or in_features % (2 * C.MXFP4_BLOCK):
-        raise ValueError("X4T record dimensions are invalid")
-    expected_packed_bytes = out_features * in_features // 2
-    if packed_bytes != expected_packed_bytes:
-        raise ValueError("X4T record packed payload length disagrees with its shape")
-    if len(payload) != header_bytes + packed_bytes + scale_bytes:
-        raise ValueError("X4T record component lengths disagree with its total length")
-
-    packed_start = header_bytes
-    scale_start = packed_start + packed_bytes
-    packed = torch.frombuffer(
-        bytearray(payload[packed_start:scale_start]), dtype=torch.uint8
-    ).reshape(out_features, in_features // 2)
-    scale_payload = payload[scale_start:]
-    scale = unpack_x4t_scale_plane(scale_payload)
-    if tuple(scale.shape) != (out_features, in_features // C.MXFP4_BLOCK):
-        raise ValueError("X4T record scale payload shape disagrees with its matrix shape")
-    if pack_x4t_scale_plane(scale) != scale_payload:
-        raise ValueError("X4T record scale payload is not canonical")
-    _validate_matrix_tensors(
-        matrix,
-        packed,
-        scale,
-        production_shape=production_shape,
-    )
-    return X4TMatrix(matrix=matrix, packed=packed, scale=scale)
-
-
-def x4t_record_bpw(record: bytes, *, alignment: bool = False) -> float:
-    """Return record-only storage in bits per represented matrix weight."""
-
-    decoded = unpack_x4t_matrix_record(record, production_shape=False)
-    weights = int(decoded.packed.numel()) * 2
-    stored = _align_up(len(record)) if alignment else len(record)
-    return stored * 8 / weights
-
-
-def x4t_matrix_storage_bytes(matrix: str, scale: torch.Tensor) -> int:
-    """Return exact aligned X4T record bytes without reading the nibble plane."""
-
-    expected_packed, expected_scale = _matrix_shapes(matrix)
-    if (
-        scale.dtype != torch.uint8
-        or scale.device.type != "cpu"
-        or not scale.is_contiguous()
-        or tuple(scale.shape) != expected_scale
-    ):
-        raise ValueError(
-            f"X4T {matrix} scale must be contiguous CPU uint8 {expected_scale}"
-        )
-    packed_bytes = expected_packed[0] * expected_packed[1]
-    scale_bytes = x4t_scale_storage_bytes(scale)
-    return _align_up(_RECORD_HEADER.size + packed_bytes + scale_bytes)
-
-
 def x4t_scale_storage_bytes(scale: torch.Tensor) -> int:
-    """Return the exact X4T scale payload size without serializing it.
+    """Return fixed-stream plus exception bytes without serializing them.
 
     The fixed stream length depends only on the plane geometry.  Every value
     outside its row's best adjacent pair contributes one uint32 exception, so
@@ -520,15 +217,71 @@ def x4t_scale_storage_bytes(scale: torch.Tensor) -> int:
         source_i16 == bases[:, None] + 1
     )
     exception_count = int(np.count_nonzero(~covered))
-    return _HEADER.size + fixed_bytes + 4 * exception_count
+    return fixed_bytes + 4 * exception_count
+
+
+def x4t_scale_exception_count(scale: torch.Tensor) -> int:
+    """Return the exact number of uint32 exceptions in a scale plane."""
+
+    rows, columns = _validate_scale(scale)
+    del rows, columns
+    source = scale.numpy()
+    bases = _adjacent_bases_numpy(source).astype(np.int16)
+    source_i16 = source.astype(np.int16)
+    covered = (source_i16 == bases[:, None]) | (
+        source_i16 == bases[:, None] + 1
+    )
+    return int(np.count_nonzero(~covered))
+
+
+def _scale_fixed_bytes(shape: tuple[int, int]) -> int:
+    rows, columns = shape
+    selector_bytes = math.ceil(columns / 8)
+    return (rows // X4T_TILE_ROWS) * X4T_TILE_ROWS * (1 + selector_bytes)
+
+
+def x4t_matrix_storage_bytes(matrix: str, scale: torch.Tensor) -> int:
+    """Return one matrix's additive safetensors data contribution."""
+
+    expected_packed, expected_scale = _matrix_shapes(matrix)
+    if (
+        scale.dtype != torch.uint8
+        or scale.device.type != "cpu"
+        or not scale.is_contiguous()
+        or tuple(scale.shape) != expected_scale
+    ):
+        raise ValueError(
+            f"X4T {matrix} scale must be contiguous CPU uint8 {expected_scale}"
+        )
+    return x4t_matrix_storage_bytes_from_exception_count(
+        matrix, x4t_scale_exception_count(scale)
+    )
+
+
+def x4t_matrix_storage_bytes_from_exception_count(
+    matrix: str, exception_count: int
+) -> int:
+    """Return additive matrix bytes from an already-counted scale stream."""
+
+    expected_packed, expected_scale = _matrix_shapes(matrix)
+    if isinstance(exception_count, bool) or not isinstance(exception_count, int):
+        raise TypeError("X4T exception count must be an integer")
+    if exception_count < 0:
+        raise ValueError("X4T exception count must be non-negative")
+    return (
+        math.prod(expected_packed)
+        + _scale_fixed_bytes(expected_scale)
+        + 4 * exception_count
+    )
 
 
 def x4t_expert_storage_bytes(scales: dict[str, torch.Tensor]) -> int:
-    """Return the exact sum of the three aligned X4T matrix records."""
+    """Return one expert's exact additive safetensors contribution."""
 
     if set(scales) != set(X4T_MATRIX_ORDER):
         raise ValueError(f"X4T expert scales must contain {X4T_MATRIX_ORDER}")
-    return sum(
+    # Three int64 offset entries plus one int32 expert ID.
+    return 28 + sum(
         x4t_matrix_storage_bytes(matrix, scales[matrix])
         for matrix in X4T_MATRIX_ORDER
     )
@@ -595,47 +348,184 @@ def partition_x4t_components(
     return packed, scale
 
 
-def _entry_index(expert: int, matrix: str) -> int:
+def _validate_expert(expert: int) -> None:
     if isinstance(expert, bool) or not isinstance(expert, int):
         raise TypeError("X4T expert ID must be an integer")
     if not 0 <= expert < X4T_EXPERTS_PER_LAYER:
         raise ValueError(
             f"X4T expert ID must be in 0..{X4T_EXPERTS_PER_LAYER - 1}"
         )
-    return expert * len(X4T_MATRIX_ORDER) + _matrix_id(matrix)
 
 
-def _canonical_layer_header(
+def _tensor_name(matrix: str, part: str) -> str:
+    _matrix_id(matrix)
+    return f"{matrix}.{part}"
+
+
+def _packed_storage_shape(matrix: str, experts: int) -> tuple[int, ...]:
+    packed, _ = _matrix_shapes(matrix)
+    if matrix == "w2":
+        out_features, packed_columns = packed
+        return (
+            experts,
+            packed_columns * 2 // C.MXFP4_BLOCK,
+            out_features,
+            C.MXFP4_BLOCK // 2,
+        )
+    return (experts, *packed)
+
+
+def _x4t_tensor_layout(
     *,
     layer: int,
-    file_bytes: int,
-    record_count: int,
-    directory_crc32: int,
-    header_crc32: int,
-) -> bytes:
-    prefix = _LAYER_HEADER.pack(
-        X4T_LAYER_MAGIC,
-        X4T_VERSION,
-        X4T_LAYER_HEADER_BYTES,
-        layer,
-        X4T_EXPERTS_PER_LAYER,
-        len(X4T_MATRIX_ORDER),
-        X4T_DIRECTORY_ENTRY_BYTES,
-        0,
-        X4T_LAYER_HEADER_BYTES,
-        X4T_DIRECTORY_BYTES,
-        X4T_DATA_OFFSET,
-        file_bytes,
-        record_count,
-        directory_crc32,
-        header_crc32,
-        0,
-    )
-    return prefix + bytes(X4T_LAYER_HEADER_BYTES - len(prefix))
+    experts: int,
+    exception_counts: dict[str, int],
+) -> tuple[bytes, tuple[tuple[str, str, tuple[int, ...], int], ...], int]:
+    """Build the canonical fixed-header safetensors layout."""
+
+    if layer not in C.MOE_LAYERS:
+        raise ValueError("X4T safetensors layer must be a Kimi-K3 MoE layer")
+    if not 0 <= experts <= X4T_EXPERTS_PER_LAYER:
+        raise ValueError("X4T safetensors expert count is invalid")
+    if set(exception_counts) != set(X4T_MATRIX_ORDER):
+        raise ValueError("X4T exception inventory is incomplete")
+    if any(value < 0 for value in exception_counts.values()):
+        raise ValueError("X4T exception counts must be non-negative")
+
+    specs: list[tuple[str, str, tuple[int, ...], int]] = []
+    for matrix in X4T_MATRIX_ORDER:
+        specs.append(
+            (
+                _tensor_name(matrix, "scale_exception_offsets"),
+                "I64",
+                (experts + 1,),
+                8 * (experts + 1),
+            )
+        )
+    specs.append(("expert_ids", "I32", (experts,), 4 * experts))
+    for matrix in X4T_MATRIX_ORDER:
+        _, scale_shape = _matrix_shapes(matrix)
+        specs.extend(
+            (
+                (
+                    _tensor_name(matrix, "packed"),
+                    "U8",
+                    _packed_storage_shape(matrix, experts),
+                    math.prod(_packed_storage_shape(matrix, experts)),
+                ),
+                (
+                    _tensor_name(matrix, "scale_fixed"),
+                    "U8",
+                    (experts, _scale_fixed_bytes(scale_shape)),
+                    experts * _scale_fixed_bytes(scale_shape),
+                ),
+                (
+                    _tensor_name(matrix, "scale_exceptions"),
+                    "U8",
+                    (4 * exception_counts[matrix],),
+                    4 * exception_counts[matrix],
+                ),
+            )
+        )
+
+    metadata = {
+        "format": "pt",
+        "schema": X4T_SAFETENSORS_SCHEMA,
+        "version": str(X4T_VERSION),
+        "layer": str(layer),
+        "experts": str(experts),
+        "expert_capacity": str(X4T_EXPERTS_PER_LAYER),
+        "matrix_order": ",".join(X4T_MATRIX_ORDER),
+        "scale_codec": "x4t-adjacent-pair-fixed-stream-v1",
+        "w2_packed_layout": "group-major-32-channel-v1",
+        "exact_mxfp4_reconstruction": "true",
+    }
+    header: dict[str, object] = {"__metadata__": metadata}
+    offset = 0
+    for name, dtype, shape, size in specs:
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+    raw = json.dumps(header, separators=(",", ":")).encode()
+    if len(raw) > X4T_SAFETENSORS_HEADER_BYTES:
+        raise ValueError("X4T safetensors tensor directory exceeds its 4 KiB header")
+    padded = raw + bytes([32]) * (X4T_SAFETENSORS_HEADER_BYTES - len(raw))
+    return struct.pack("<Q", len(padded)) + padded, tuple(specs), offset
+
+
+def x4t_layer_storage_bytes(
+    layer: int,
+    expert_storage_bytes: np.ndarray | list[int] | tuple[int, ...],
+) -> int:
+    """Return exact layer bytes from additive per-expert costs."""
+
+    if layer not in C.MOE_LAYERS:
+        raise ValueError("X4T safetensors layer must be a Kimi-K3 MoE layer")
+    costs = np.asarray(expert_storage_bytes, dtype=np.int64)
+    if (
+        costs.ndim != 1
+        or costs.size > X4T_EXPERTS_PER_LAYER
+        or np.any(costs <= 0)
+    ):
+        raise ValueError("X4T layer expert costs must be a positive vector")
+    return X4T_LAYER_FIXED_BYTES + int(costs.sum())
+
+
+def _decode_scale_components(
+    fixed: torch.Tensor,
+    exceptions: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+) -> torch.Tensor:
+    selector_bytes = math.ceil(columns / 8)
+    tile_bytes = X4T_TILE_ROWS * (1 + selector_bytes)
+    if (
+        fixed.dtype != torch.uint8
+        or fixed.numel() != (rows // X4T_TILE_ROWS) * tile_bytes
+    ):
+        raise ValueError("X4T fixed scale tensor has invalid geometry")
+    if exceptions.dtype != torch.uint32 or exceptions.ndim != 1:
+        raise ValueError("X4T exception tensor must be one-dimensional uint32")
+    fixed = fixed.reshape(rows // X4T_TILE_ROWS, tile_bytes)
+    bases = fixed[:, :X4T_TILE_ROWS].reshape(rows)
+    selectors = fixed[:, X4T_TILE_ROWS:].reshape(rows, selector_bytes)
+    column = torch.arange(columns, dtype=torch.int64)
+    selected = (
+        selectors[:, column // 8].to(torch.int16)
+        >> (column % 8).to(torch.int16)
+    ) & 1
+    result = (bases.to(torch.int16)[:, None] + selected).to(torch.uint8)
+    if columns % 8 and bool((selectors[:, -1] >> (columns % 8)).any()):
+        raise ValueError("X4T selector has nonzero padding bits")
+    previous = -1
+    flat = result.view(-1)
+    for entry in exceptions.tolist():
+        position = entry & X4T_POSITION_MASK
+        value = entry >> X4T_POSITION_BITS
+        if position >= flat.numel() or position <= previous:
+            raise ValueError(
+                "X4T exception positions must be valid and strictly increasing"
+            )
+        previous = position
+        row = position // columns
+        base = int(bases[row])
+        if value in (base, base + 1):
+            raise ValueError("X4T exception redundantly names an adjacent-palette value")
+        flat[position] = value
+    expected_fixed, expected_exceptions = pack_x4t_scale_components(result.contiguous())
+    if not torch.equal(expected_fixed, fixed.reshape(-1)) or not torch.equal(
+        expected_exceptions, exceptions
+    ):
+        raise ValueError("X4T safetensors scale stream is not canonical")
+    return result
 
 
 class X4TLayerWriter:
-    """Atomic streaming writer for one sparse X4T MoE-layer sidecar."""
+    """Atomic streaming writer for one sparse X4T safetensors layer."""
 
     def __init__(self, destination: str | Path, *, layer: int) -> None:
         if layer not in C.MOE_LAYERS:
@@ -648,14 +538,22 @@ class X4TLayerWriter:
         if self.partial.exists():
             raise FileExistsError(self.partial)
         self.layer = layer
-        self._file = self.partial.open("x+b")
-        self._file.write(bytes(X4T_DATA_OFFSET))
-        self._entries = [
-            X4TDirectoryEntry()
-            for _ in range(X4T_EXPERTS_PER_LAYER * len(X4T_MATRIX_ORDER))
-        ]
-        self._cursor = X4T_DATA_OFFSET
+        self._spool_paths = {
+            (matrix, part): self.destination.with_name(
+                f".{self.destination.name}.{matrix}.{part}.partial"
+            )
+            for matrix in X4T_MATRIX_ORDER
+            for part in ("packed", "scale_fixed", "scale_exceptions")
+        }
+        if any(path.exists() for path in self._spool_paths.values()):
+            raise FileExistsError("an X4T safetensors spool file already exists")
+        self._spools = {
+            key: path.open("xb") for key, path in self._spool_paths.items()
+        }
+        self._experts: list[int] = []
+        self._exception_offsets = {matrix: [0] for matrix in X4T_MATRIX_ORDER}
         self._last_index = -1
+        self._adds = 0
         self._closed = False
 
     def add(
@@ -664,67 +562,100 @@ class X4TLayerWriter:
         matrix: str,
         packed: torch.Tensor,
         scale: torch.Tensor,
-    ) -> X4TDirectoryEntry:
+    ) -> None:
         if self._closed:
             raise RuntimeError("X4T layer writer is already closed")
-        index = _entry_index(expert, matrix)
+        _validate_expert(expert)
+        matrix_id = _matrix_id(matrix)
+        index = expert * len(X4T_MATRIX_ORDER) + matrix_id
         if index <= self._last_index:
-            raise ValueError("X4T records must be added in expert-major canonical order")
-        record = pack_x4t_matrix_record(matrix, packed, scale)
-        if self._cursor % X4T_RECORD_ALIGNMENT:
-            raise AssertionError("X4T writer cursor lost record alignment")
-        self._file.seek(self._cursor)
-        self._file.write(record)
-        padded_end = _align_up(self._cursor + len(record))
-        self._file.write(bytes(padded_end - self._cursor - len(record)))
-        entry = X4TDirectoryEntry(
-            offset=self._cursor,
-            length=len(record),
-            crc32=zlib.crc32(record),
-            flags=1,
+            raise ValueError("X4T tensors must be added in expert-major canonical order")
+        expected_matrix_id = self._adds % len(X4T_MATRIX_ORDER)
+        if matrix_id != expected_matrix_id:
+            raise ValueError("every X4T expert must contain w1, w3, and w2 in order")
+        if matrix_id == 0:
+            self._experts.append(expert)
+        elif not self._experts or self._experts[-1] != expert:
+            raise ValueError("X4T matrix triplets must belong to one expert")
+        _validate_matrix_tensors(matrix, packed, scale, production_shape=True)
+        if matrix == "w2":
+            out_features, in_features = C.EXPERT_SHAPES[matrix]
+            packed_storage = (
+                packed.reshape(
+                    out_features,
+                    in_features // C.MXFP4_BLOCK,
+                    C.MXFP4_BLOCK // 2,
+                )
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+        else:
+            packed_storage = packed
+        fixed, exceptions = pack_x4t_scale_components(scale)
+        self._spools[(matrix, "packed")].write(packed_storage.numpy().tobytes())
+        self._spools[(matrix, "scale_fixed")].write(fixed.numpy().tobytes())
+        self._spools[(matrix, "scale_exceptions")].write(
+            exceptions.numpy().astype("<u4", copy=False).tobytes()
         )
-        self._entries[index] = entry
-        self._cursor = padded_end
+        self._exception_offsets[matrix].append(
+            self._exception_offsets[matrix][-1] + int(exceptions.numel())
+        )
         self._last_index = index
-        return entry
+        self._adds += 1
 
     def close(self) -> None:
         if self._closed:
             return
-        directory_entries = b"".join(entry.to_bytes() for entry in self._entries)
-        directory = directory_entries + bytes(
-            X4T_DIRECTORY_BYTES - len(directory_entries)
-        )
-        directory_crc32 = zlib.crc32(directory)
-        record_count = sum(entry.present for entry in self._entries)
-        header_zero_crc = _canonical_layer_header(
+        if self._adds % len(X4T_MATRIX_ORDER):
+            raise ValueError("X4T safetensors layer ends with an incomplete expert")
+        for handle in self._spools.values():
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+        counts = {
+            matrix: self._exception_offsets[matrix][-1]
+            for matrix in X4T_MATRIX_ORDER
+        }
+        header, specs, data_bytes = _x4t_tensor_layout(
             layer=self.layer,
-            file_bytes=self._cursor,
-            record_count=record_count,
-            directory_crc32=directory_crc32,
-            header_crc32=0,
+            experts=len(self._experts),
+            exception_counts=counts,
         )
-        header = _canonical_layer_header(
-            layer=self.layer,
-            file_bytes=self._cursor,
-            record_count=record_count,
-            directory_crc32=directory_crc32,
-            header_crc32=zlib.crc32(header_zero_crc),
-        )
-        self._file.seek(0)
-        self._file.write(header)
-        self._file.write(directory)
-        self._file.truncate(self._cursor)
-        self._file.flush()
-        os.fsync(self._file.fileno())
-        self._file.close()
+        with self.partial.open("xb") as output:
+            output.write(header)
+            for name, _, _, expected_bytes in specs:
+                if name.endswith("scale_exception_offsets"):
+                    matrix = name.split(".", 1)[0]
+                    payload = np.asarray(
+                        self._exception_offsets[matrix], dtype="<i8"
+                    ).tobytes()
+                    output.write(payload)
+                elif name == "expert_ids":
+                    output.write(np.asarray(self._experts, dtype="<i4").tobytes())
+                else:
+                    matrix, part = name.split(".", 1)
+                    path = self._spool_paths[(matrix, part)]
+                    if path.stat().st_size != expected_bytes:
+                        raise AssertionError(f"X4T spool byte count drifted for {name}")
+                    with path.open("rb") as source:
+                        shutil.copyfileobj(source, output, length=8 << 20)
+            if output.tell() != len(header) + data_bytes:
+                raise AssertionError("X4T safetensors byte accounting drifted")
+            output.flush()
+            os.fsync(output.fileno())
         os.replace(self.partial, self.destination)
+        for path in self._spool_paths.values():
+            path.unlink(missing_ok=True)
         self._closed = True
 
     def abort(self) -> None:
         if self._closed:
             return
-        self._file.close()
+        for handle in self._spools.values():
+            if not handle.closed:
+                handle.close()
+        for path in self._spool_paths.values():
+            path.unlink(missing_ok=True)
         self.partial.unlink(missing_ok=True)
         self._closed = True
 
@@ -733,154 +664,157 @@ class X4TLayerWriter:
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         if exc_type is None:
-            self.close()
+            try:
+                self.close()
+            except BaseException:
+                self.abort()
+                raise
         else:
             self.abort()
 
 
 class X4TLayerReader:
-    """Validated random-access reader for one X4T MoE-layer sidecar."""
+    """Validated random-access reader for one X4T safetensors layer."""
 
-    def __init__(self, path: str | Path, *, verify_payloads: bool = True) -> None:
+    def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        with self.path.open("rb") as handle:
-            header = handle.read(X4T_LAYER_HEADER_BYTES)
-            directory = handle.read(X4T_DIRECTORY_BYTES)
-        if len(header) != X4T_LAYER_HEADER_BYTES or len(directory) != X4T_DIRECTORY_BYTES:
-            raise ValueError("X4T layer sidecar is truncated before its data section")
-        (
-            magic,
-            version,
-            header_bytes,
-            layer,
-            experts,
-            matrices,
-            entry_bytes,
-            flags,
-            directory_offset,
-            directory_bytes,
-            data_offset,
-            file_bytes,
-            record_count,
-            directory_crc32,
-            header_crc32,
-            reserved,
-        ) = _LAYER_HEADER.unpack_from(header)
-        if magic != X4T_LAYER_MAGIC or version != X4T_VERSION:
-            raise ValueError("X4T layer sidecar has an unsupported magic or version")
-        if (
-            header_bytes != X4T_LAYER_HEADER_BYTES
-            or experts != X4T_EXPERTS_PER_LAYER
-            or matrices != len(X4T_MATRIX_ORDER)
-            or entry_bytes != X4T_DIRECTORY_ENTRY_BYTES
-            or flags
-            or directory_offset != X4T_LAYER_HEADER_BYTES
-            or directory_bytes != X4T_DIRECTORY_BYTES
-            or data_offset != X4T_DATA_OFFSET
-            or reserved
-        ):
-            raise ValueError("X4T layer header is noncanonical")
-        if layer not in C.MOE_LAYERS:
-            raise ValueError("X4T layer ID is invalid")
-        if file_bytes != self.path.stat().st_size or file_bytes < data_offset:
-            raise ValueError("X4T layer file length disagrees with its header")
-        canonical_zero_crc = _canonical_layer_header(
-            layer=layer,
-            file_bytes=file_bytes,
-            record_count=record_count,
-            directory_crc32=directory_crc32,
-            header_crc32=0,
-        )
-        canonical_header = _canonical_layer_header(
-            layer=layer,
-            file_bytes=file_bytes,
-            record_count=record_count,
-            directory_crc32=directory_crc32,
-            header_crc32=header_crc32,
-        )
-        if header != canonical_header or zlib.crc32(canonical_zero_crc) != header_crc32:
-            raise ValueError("X4T layer header checksum or padding is invalid")
-        if zlib.crc32(directory) != directory_crc32:
-            raise ValueError("X4T layer directory checksum is invalid")
-
-        entry_count = X4T_EXPERTS_PER_LAYER * len(X4T_MATRIX_ORDER)
-        used_directory = entry_count * X4T_DIRECTORY_ENTRY_BYTES
-        if any(directory[used_directory:]):
-            raise ValueError("X4T layer directory padding is nonzero")
-        self.entries = tuple(
-            X4TDirectoryEntry.from_bytes(
-                memoryview(directory)[
-                    index * X4T_DIRECTORY_ENTRY_BYTES : (index + 1)
-                    * X4T_DIRECTORY_ENTRY_BYTES
-                ]
-            )
-            for index in range(entry_count)
-        )
-        if sum(entry.present for entry in self.entries) != record_count:
-            raise ValueError("X4T layer record count disagrees with its directory")
-        cursor = data_offset
-        handle = self.path.open("rb") if verify_payloads else None
-        try:
-            for entry in self.entries:
-                if not entry.present:
-                    if entry != X4TDirectoryEntry():
-                        raise ValueError("absent X4T directory entry is noncanonical")
-                    continue
-                if (
-                    entry.flags != 1
-                    or entry.offset != cursor
-                    or entry.length < _RECORD_HEADER.size
+        with safe_open(self.path, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+            if metadata is None or metadata.get("schema") != X4T_SAFETENSORS_SCHEMA:
+                raise ValueError("X4T safetensors schema is unsupported")
+            if metadata.get("version") != str(X4T_VERSION):
+                raise ValueError("X4T safetensors version is unsupported")
+            try:
+                layer = int(metadata["layer"])
+                experts = int(metadata["experts"])
+            except (KeyError, ValueError) as exc:
+                raise ValueError("X4T safetensors metadata is invalid") from exc
+            if layer not in C.MOE_LAYERS or not 0 <= experts <= X4T_EXPERTS_PER_LAYER:
+                raise ValueError("X4T safetensors layer or expert count is invalid")
+            if (
+                metadata.get("expert_capacity") != str(X4T_EXPERTS_PER_LAYER)
+                or metadata.get("matrix_order") != ",".join(X4T_MATRIX_ORDER)
+                or metadata.get("scale_codec") != "x4t-adjacent-pair-fixed-stream-v1"
+                or metadata.get("w2_packed_layout") != "group-major-32-channel-v1"
+                or metadata.get("exact_mxfp4_reconstruction") != "true"
+            ):
+                raise ValueError("X4T safetensors metadata is noncanonical")
+            expected_keys = {"expert_ids"}
+            for matrix in X4T_MATRIX_ORDER:
+                expected_keys.update(
+                    _tensor_name(matrix, part)
+                    for part in (
+                        "packed",
+                        "scale_fixed",
+                        "scale_exceptions",
+                        "scale_exception_offsets",
+                    )
+                )
+            if set(handle.keys()) != expected_keys:
+                raise ValueError("X4T safetensors tensor inventory is noncanonical")
+            expert_ids_tensor = handle.get_tensor("expert_ids")
+            if expert_ids_tensor.dtype != torch.int32 or tuple(
+                expert_ids_tensor.shape
+            ) != (experts,):
+                raise ValueError("X4T expert_ids tensor is invalid")
+            expert_ids = tuple(map(int, expert_ids_tensor.tolist()))
+            if expert_ids != tuple(sorted(expert_ids)) or len(set(expert_ids)) != experts:
+                raise ValueError("X4T expert IDs must be unique and sorted")
+            if any(not 0 <= expert < X4T_EXPERTS_PER_LAYER for expert in expert_ids):
+                raise ValueError("X4T expert ID lies outside the layer capacity")
+            self._offsets: dict[str, tuple[int, ...]] = {}
+            for matrix in X4T_MATRIX_ORDER:
+                offsets = handle.get_tensor(
+                    _tensor_name(matrix, "scale_exception_offsets")
+                )
+                values = tuple(map(int, offsets.tolist()))
+                if offsets.dtype != torch.int64 or tuple(offsets.shape) != (
+                    experts + 1,
                 ):
-                    raise ValueError("present X4T directory entry is noncanonical")
-                end = entry.offset + entry.length
-                padded_end = _align_up(end)
-                if padded_end > file_bytes:
-                    raise ValueError("X4T directory entry extends beyond the layer file")
-                if handle is not None:
-                    handle.seek(entry.offset)
-                    record = handle.read(entry.length)
-                    padding = handle.read(padded_end - end)
-                    if (
-                        len(record) != entry.length
-                        or zlib.crc32(record) != entry.crc32
-                    ):
-                        raise ValueError("X4T matrix record checksum is invalid")
-                    if any(padding):
-                        raise ValueError("X4T matrix record padding is nonzero")
-                cursor = padded_end
-        finally:
-            if handle is not None:
-                handle.close()
-        if cursor != file_bytes:
-            raise ValueError("X4T layer data section has unreferenced trailing bytes")
+                    raise ValueError("X4T exception offsets tensor is invalid")
+                if (
+                    not values
+                    or values[0] != 0
+                    or any(a > b for a, b in zip(values, values[1:]))
+                ):
+                    raise ValueError("X4T exception offsets are noncanonical")
+                exception_shape = tuple(
+                    handle.get_slice(
+                        _tensor_name(matrix, "scale_exceptions")
+                    ).get_shape()
+                )
+                if exception_shape != (4 * values[-1],):
+                    raise ValueError("X4T exception bytes disagree with their offsets")
+                _, scale_shape = _matrix_shapes(matrix)
+                if tuple(
+                    handle.get_slice(_tensor_name(matrix, "packed")).get_shape()
+                ) != _packed_storage_shape(matrix, experts):
+                    raise ValueError("X4T packed tensor shape is invalid")
+                if tuple(
+                    handle.get_slice(_tensor_name(matrix, "scale_fixed")).get_shape()
+                ) != (experts, _scale_fixed_bytes(scale_shape)):
+                    raise ValueError("X4T fixed scale tensor shape is invalid")
+                self._offsets[matrix] = values
         self.layer = layer
-        self.file_bytes = file_bytes
-        self.record_count = record_count
+        self.file_bytes = self.path.stat().st_size
+        self.expert_ids = expert_ids
+        self._expert_to_slot = {expert: slot for slot, expert in enumerate(expert_ids)}
+        self.matrix_count = experts * len(X4T_MATRIX_ORDER)
 
     def has(self, expert: int, matrix: str) -> bool:
-        return self.entries[_entry_index(expert, matrix)].present
+        _validate_expert(expert)
+        _matrix_id(matrix)
+        return expert in self._expert_to_slot
 
-    def record_bytes(self, expert: int, matrix: str) -> int:
-        """Return the serialized record length, excluding alignment padding."""
+    def matrix_payload_bytes(self, expert: int, matrix: str) -> int:
+        """Return matrix tensor bytes attributable to one expert."""
 
-        entry = self.entries[_entry_index(expert, matrix)]
-        if not entry.present:
+        if not self.has(expert, matrix):
             raise KeyError((expert, matrix))
-        return entry.length
+        slot = self._expert_to_slot[expert]
+        packed_shape, scale_shape = _matrix_shapes(matrix)
+        return (
+            math.prod(packed_shape)
+            + _scale_fixed_bytes(scale_shape)
+            + 4 * (self._offsets[matrix][slot + 1] - self._offsets[matrix][slot])
+        )
 
     def read(self, expert: int, matrix: str) -> X4TMatrix:
-        entry = self.entries[_entry_index(expert, matrix)]
-        if not entry.present:
+        if not self.has(expert, matrix):
             raise KeyError((expert, matrix))
-        with self.path.open("rb") as handle:
-            handle.seek(entry.offset)
-            payload = handle.read(entry.length)
-        if len(payload) != entry.length or zlib.crc32(payload) != entry.crc32:
-            raise ValueError("X4T matrix record changed after layer validation")
-        return unpack_x4t_matrix_record(payload, expected_matrix=matrix)
+        slot = self._expert_to_slot[expert]
+        with safe_open(self.path, framework="pt", device="cpu") as handle:
+            packed_storage = handle.get_slice(_tensor_name(matrix, "packed"))[
+                slot
+            ].contiguous()
+            fixed = handle.get_slice(_tensor_name(matrix, "scale_fixed"))[
+                slot
+            ].contiguous()
+            first = self._offsets[matrix][slot]
+            end = self._offsets[matrix][slot + 1]
+            exception_bytes = handle.get_slice(_tensor_name(matrix, "scale_exceptions"))[
+                4 * first : 4 * end
+            ].contiguous()
+        exceptions = exception_bytes.view(torch.uint32)
+        out_features, in_features = C.EXPERT_SHAPES[matrix]
+        if matrix == "w2":
+            packed = (
+                packed_storage.permute(1, 0, 2)
+                .reshape(out_features, in_features // 2)
+                .contiguous()
+            )
+        else:
+            packed = packed_storage
+        scale = _decode_scale_components(
+            fixed,
+            exceptions,
+            rows=out_features,
+            columns=in_features // C.MXFP4_BLOCK,
+        )
+        return X4TMatrix(matrix=matrix, packed=packed, scale=scale)
 
 
 def x4t_layer_path(root: str | Path, layer: int) -> Path:
     if layer not in C.MOE_LAYERS:
         raise ValueError("X4T sidecar layer must be a Kimi-K3 MoE layer")
-    return Path(root) / f"x4t-layer-{layer:05d}.bin"
+    return Path(root) / f"x4t-layer-{layer:05d}.safetensors"

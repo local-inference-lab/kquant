@@ -325,9 +325,12 @@ atom-major:
 [96 physical atom slots, compressed experts, 129216 bytes]
 ```
 
-Each physical-slot row is padded once to a 4 KiB boundary. The padding is at
-most 4,095 bytes per slot per layer, not per expert. Header, expert format
-table, and the three shared hidden-side scale vectors precede this tensor.
+The layer file is a standards-valid safetensors container. Its tensors are the
+atom slab above, a 4 KiB expert-format section, and a 24 KiB shared-scale
+section. The safetensors header itself occupies a fixed 4 KiB. Each physical
+atom row is padded once to a 4 KiB boundary, at most 4,095 bytes per slot per
+layer rather than per expert. These fixed offsets permit direct range loading
+of physical atom rows without parsing or copying unrelated payload bytes.
 
 ### Shard views
 
@@ -359,8 +362,9 @@ a consequence of the canonical layout, not a serialized TP12 contract.
 
 ### Load preparation
 
-The loader reads the small layer metadata and one atom range, then performs
-one GPU preparation pass that removes slot padding and transposes atom-major
+The loader reads the small layer metadata and uses InstantTensor to transfer
+only its atom-row range. It then performs one GPU preparation pass that removes
+slot padding and transposes atom-major
 storage into the fused-MoE operand layout. It also derives P24/P33 work queues
 from `(layer, expert, physical_slot, r13, r2)`. Rate metadata is per
 expert/atom during preparation; the fused coefficient loop has no TP-dependent
@@ -410,19 +414,25 @@ weights, or 4.25 bpw. X4T changes no represented value:
 The selector stream is directly indexable and needs no tile offset table,
 prefix sum, or exception search.  X4T is therefore the high-quality
 endpoint; uniform K4 remains lossy and is not treated as a substitute for the
-official weights.  The all-expert X4T index records exact aligned bytes for
-each expert rather than relying on a nominal bpw estimate.
+official weights. The all-expert X4T index stores each expert's exact tensor
+payload contribution rather than relying on a nominal bpw estimate.
 
-The canonical X4T layer is TP-independent and stores each promoted expert's
-three complete, independently authenticated matrix records:
+The canonical X4T layer is a TP-independent safetensors file. It contains:
 
 ```text
-4 KiB canonical header
-fixed expert/matrix directory
-aligned complete nibble and X4T scale records
-CRC32 for metadata and every matrix record
-strict zero padding and canonical re-encode validation
+expert_ids: int32[E]
+w1/w3.packed: uint8[E, output_rows, input_columns / 2]
+w2.packed: uint8[E, 32-channel input groups, output_rows, 16]
+matrix.scale_fixed: uint8[E, fixed_stream_bytes]
+matrix.scale_exceptions: uint8[concatenated exception bytes]
+matrix.scale_exception_offsets: int64[E + 1]
 ```
+
+The safetensors JSON directory is padded to 4 KiB, which makes storage exactly
+additive: each layer has 4,128 fixed bytes, and each expert contributes its
+three matrix tensor payloads plus 28 bytes for its ID and exception-offset
+entries. Artifact SHA-256 closure receipts authenticate the complete files;
+there is no private record header, directory, CRC, or padding convention.
 
 The stored matrix is the source of truth; rank-local W4A16 tensors are a
 load-time cache. `w1`/`w3` partition on 32-row groups and `w2` on 32-column
@@ -475,7 +485,7 @@ Rate shifting and high-tier selection solve different problems.
    `(r13,r2)` at the same three-bit trellis payload.
 2. X4T then competes against that selected lossy candidate.  Promoting an
    expert removes its measured routed damage and incurs that expert's exact X4T
-   record bytes rather than a fixed nominal four-bit cost.
+   safetensors payload bytes rather than a fixed nominal four-bit cost.
 
 The comparison byte cap inherited from the validated 3p09 allocation is:
 
@@ -492,7 +502,7 @@ sum_e D_e(choice_e) + lambda * sum_e bytes_e(choice_e)
 ```
 
 and sweeps `lambda` to meet the checkpoint budget. Its endpoint alphabet is
-`qsrt_all` and `x4t_all`; exact trellis, X4T-record, and alignment bytes are
+`qsrt_all` and `x4t_all`; exact trellis and X4T safetensors bytes are
 charged by the same optimizer. Since X4T sizes vary by expert, candidate
 generation and X4T cost indexing remain reusable when the target budget
 changes.
@@ -663,8 +673,8 @@ the rate modes under the current graph and staircase.
 - [x] Complete and seal the all-82,432-expert R44 SQG candidate pool.
 - [x] Freeze and unit-test the exact X4T numerical representation.
 - [x] Add exact X4T load-time reconstruction and TP12 W4A16 preparation.
-- [x] Implement exact fixed-stride X4T records and the one-launch, graph-safe
-      routed TP12 W4A16 scale predecoder.
+- [x] Store exact X4T layers as TP-independent safetensors and implement the
+      one-launch, graph-safe routed W4A16 scale predecoder.
 - [x] Benchmark X4T inside the complete routed W4A16 path across M=1/2/4 and
       1/2/4/8/16 active-expert densities.
 - [ ] Build and seal the all-expert X4T byte-cost index.

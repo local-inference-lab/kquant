@@ -248,7 +248,7 @@ def test_atom_layer_materialization_has_tp_free_bytes_and_direct_views(tmp_path)
         format_spec=format_spec,
         tensors=nested,
     )
-    destination = tmp_path / "layer.atoms"
+    destination = tmp_path / "layer.safetensors"
     materialize_atom_layer(
         candidate_root,
         destination,

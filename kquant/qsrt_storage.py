@@ -12,6 +12,7 @@ never split, decode, or repack a trellis stream while loading a checkpoint.
 
 from __future__ import annotations
 
+import json
 import struct
 from dataclasses import dataclass
 
@@ -41,11 +42,13 @@ from kquant.qsrt import (
 
 
 SCHEMA = "kquant_kimi_k3_qsrt_atoms_v1"
-MAGIC = b"KQSRTA1\0"
 VERSION = 1
 ENCODING_QSRT_SQG_E4M3 = "qsrt_sqg_e4m3"
 PROFILE_ID_QSRT_SQG_E4M3 = 1
-_HEADER = struct.Struct("<8s14I4Q")
+_SAFETENSORS_HEADER_LENGTH = struct.Struct("<Q")
+_FORMAT_TENSOR_NAME = "_qsrt_format_section"
+_SHARED_SCALE_TENSOR_NAME = "_qsrt_shared_scale_section"
+_ATOM_TENSOR_NAME = "qsrt_atoms"
 
 ATOM_SIDE_CHANNELS = TILE_CHANNELS
 ATOM_CHANNELS = 2 * ATOM_SIDE_CHANNELS
@@ -518,7 +521,7 @@ class QSRTLayerLayout:
 
 @dataclass(frozen=True)
 class QSRTLayerHeader:
-    """Canonical TP-free header for one atom-major compressed layer."""
+    """Canonical TP-free safetensors header for one atom-major layer."""
 
     layer: int
     layout: QSRTLayerLayout
@@ -532,97 +535,100 @@ class QSRTLayerHeader:
         if self.profile_id != PROFILE_ID_QSRT_SQG_E4M3:
             raise ValueError("unsupported QSRT reconstruction profile")
 
+    def _document(self) -> dict[str, object]:
+        atom_data_bytes = ATOMS_PER_EXPERT * self.layout.atom_slot_stride_bytes
+        return {
+            "__metadata__": {
+                "format": "pt",
+                "schema": SCHEMA,
+                "version": str(VERSION),
+                "encoding": ENCODING_QSRT_SQG_E4M3,
+                "layer": str(self.layer),
+                "profile_id": str(self.profile_id),
+                "experts": str(EXPERTS_PER_LAYER),
+                "compressed_experts": str(self.layout.compressed_experts),
+                "x4t_experts": str(self.layout.x4t_experts),
+                "intermediate_channels": str(INTERMEDIATE_CHANNELS),
+                "latent_channels": str(LATENT_CHANNELS),
+                "atom_channels": str(ATOM_CHANNELS),
+                "atom_slots": str(ATOMS_PER_EXPERT),
+                "atom_bundle_bytes": str(ATOM_BUNDLE_BYTES),
+                "atom_slot_payload_bytes": str(
+                    self.layout.atom_slot_payload_bytes
+                ),
+                "atom_slot_stride_bytes": str(self.layout.atom_slot_stride_bytes),
+                "alignment_bytes": str(STORAGE_ALIGNMENT),
+            },
+            _FORMAT_TENSOR_NAME: {
+                "dtype": "U8",
+                "shape": [FORMAT_SECTION_BYTES],
+                "data_offsets": [0, FORMAT_SECTION_BYTES],
+            },
+            _SHARED_SCALE_TENSOR_NAME: {
+                "dtype": "U8",
+                "shape": [SHARED_SCALE_SECTION_BYTES],
+                "data_offsets": [
+                    FORMAT_SECTION_BYTES,
+                    FORMAT_SECTION_BYTES + SHARED_SCALE_SECTION_BYTES,
+                ],
+            },
+            _ATOM_TENSOR_NAME: {
+                "dtype": "U8",
+                "shape": [
+                    ATOMS_PER_EXPERT,
+                    self.layout.atom_slot_stride_bytes,
+                ],
+                "data_offsets": [
+                    FORMAT_SECTION_BYTES + SHARED_SCALE_SECTION_BYTES,
+                    FORMAT_SECTION_BYTES
+                    + SHARED_SCALE_SECTION_BYTES
+                    + atom_data_bytes,
+                ],
+            },
+        }
+
     def to_bytes(self) -> bytes:
-        header = _HEADER.pack(
-            MAGIC,
-            VERSION,
-            self.layer,
-            self.profile_id,
-            EXPERTS_PER_LAYER,
-            self.layout.compressed_experts,
-            self.layout.x4t_experts,
-            INTERMEDIATE_CHANNELS,
-            LATENT_CHANNELS,
-            ATOM_CHANNELS,
-            ATOMS_PER_EXPERT,
-            ATOM_BUNDLE_BYTES,
-            STORAGE_ALIGNMENT,
-            FORMAT_SECTION_BYTES,
-            SHARED_SCALE_SECTION_BYTES,
-            ATOM_SLAB_OFFSET,
-            self.layout.atom_slot_payload_bytes,
-            self.layout.atom_slot_stride_bytes,
-            self.layout.disk_bytes,
+        capacity = LAYER_HEADER_BYTES - _SAFETENSORS_HEADER_LENGTH.size
+        document = json.dumps(
+            self._document(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(document) > capacity:
+            raise AssertionError("QSRT safetensors header exceeds its 4 KiB budget")
+        return (
+            _SAFETENSORS_HEADER_LENGTH.pack(capacity)
+            + document
+            + b" " * (capacity - len(document))
         )
-        return header + bytes(LAYER_HEADER_BYTES - len(header))
 
     @classmethod
     def from_bytes(cls, payload: bytes) -> "QSRTLayerHeader":
         if len(payload) != LAYER_HEADER_BYTES:
             raise ValueError(f"QSRT layer header must contain {LAYER_HEADER_BYTES} bytes")
-        fields = _HEADER.unpack_from(payload)
-        if any(payload[_HEADER.size:]):
-            raise ValueError("QSRT layer header padding must be zero")
-        (
-            magic,
-            version,
-            layer,
-            profile_id,
-            experts,
-            compressed,
-            x4t,
-            intermediate,
-            latent,
-            atom_channels,
-            atom_slots,
-            atom_bundle_bytes,
-            alignment,
-            format_section_bytes,
-            shared_scale_section_bytes,
-            atom_slab_offset,
-            slot_payload_bytes,
-            slot_stride_bytes,
-            disk_bytes,
-        ) = fields
-        expected_scalars = {
-            "magic": (magic, MAGIC),
-            "version": (version, VERSION),
-            "experts": (experts, EXPERTS_PER_LAYER),
-            "intermediate": (intermediate, INTERMEDIATE_CHANNELS),
-            "latent": (latent, LATENT_CHANNELS),
-            "atom_channels": (atom_channels, ATOM_CHANNELS),
-            "atom_slots": (atom_slots, ATOMS_PER_EXPERT),
-            "atom_bundle_bytes": (atom_bundle_bytes, ATOM_BUNDLE_BYTES),
-            "alignment": (alignment, STORAGE_ALIGNMENT),
-            "format_section_bytes": (format_section_bytes, FORMAT_SECTION_BYTES),
-            "shared_scale_section_bytes": (
-                shared_scale_section_bytes,
-                SHARED_SCALE_SECTION_BYTES,
-            ),
-            "atom_slab_offset": (atom_slab_offset, ATOM_SLAB_OFFSET),
-        }
-        for name, (actual, expected) in expected_scalars.items():
-            if actual != expected:
-                raise ValueError(f"QSRT layer header {name} is {actual!r}, expected {expected!r}")
-        result = cls(
-            layer=layer,
-            layout=QSRTLayerLayout(compressed, x4t),
-            profile_id=profile_id,
-        )
-        expected_layout = {
-            "atom_slot_payload_bytes": (
-                slot_payload_bytes,
-                result.layout.atom_slot_payload_bytes,
-            ),
-            "atom_slot_stride_bytes": (
-                slot_stride_bytes,
-                result.layout.atom_slot_stride_bytes,
-            ),
-            "disk_bytes": (disk_bytes, result.layout.disk_bytes),
-        }
-        for name, (actual, expected) in expected_layout.items():
-            if actual != expected:
-                raise ValueError(f"QSRT layer header {name} is {actual}, expected {expected}")
+        header_length = _SAFETENSORS_HEADER_LENGTH.unpack_from(payload)[0]
+        if header_length != LAYER_HEADER_BYTES - _SAFETENSORS_HEADER_LENGTH.size:
+            raise ValueError("QSRT safetensors header must occupy exactly 4 KiB")
+        try:
+            document = json.loads(payload[8:].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("QSRT safetensors header is invalid JSON") from exc
+        if not isinstance(document, dict):
+            raise ValueError("QSRT safetensors header must be a JSON object")
+        metadata = document.get("__metadata__")
+        if not isinstance(metadata, dict):
+            raise ValueError("QSRT safetensors header omits metadata")
+        try:
+            result = cls(
+                layer=int(metadata["layer"]),
+                layout=QSRTLayerLayout(
+                    int(metadata["compressed_experts"]),
+                    int(metadata["x4t_experts"]),
+                ),
+                profile_id=int(metadata["profile_id"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("QSRT safetensors metadata is malformed") from exc
+        if document != result._document():
+            raise ValueError("QSRT safetensors header is noncanonical")
         return result
 
 

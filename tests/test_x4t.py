@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import struct
-
 import pytest
 import torch
 
 from kquant.x4t import (
     X4T_POSITION_BITS,
     effective_x4t_bpw,
-    pack_x4t_scale_plane,
-    unpack_x4t_scale_plane,
-    x4t_scale_components,
+    pack_x4t_scale_components,
+    x4t_scale_storage_bytes,
 )
 
 
@@ -26,41 +23,27 @@ def _scale(rows: int = 32, columns: int = 17) -> torch.Tensor:
     return result.contiguous()
 
 
-def test_x4t_round_trip_is_exact_and_deterministic() -> None:
+def test_x4t_components_are_exact_and_deterministic() -> None:
     scale = _scale()
-    payload = pack_x4t_scale_plane(scale)
+    fixed, exceptions = pack_x4t_scale_components(scale)
+    repeated = pack_x4t_scale_components(scale.clone())
 
-    assert torch.equal(unpack_x4t_scale_plane(payload), scale)
-    assert payload == pack_x4t_scale_plane(scale.clone())
-    assert effective_x4t_bpw(scale, payload) < 4.25
+    assert torch.equal(fixed, repeated[0])
+    assert torch.equal(exceptions, repeated[1])
+    assert x4t_scale_storage_bytes(scale) == fixed.numel() + 4 * exceptions.numel()
+    assert effective_x4t_bpw(scale) < 4.25
 
 
 def test_x4t_components_close_over_fixed_and_exception_streams() -> None:
     scale = _scale(columns=8)
-    payload = pack_x4t_scale_plane(scale)
+    fixed, exceptions = pack_x4t_scale_components(scale)
 
-    fixed, exceptions, rows, columns = x4t_scale_components(payload)
-
-    assert (rows, columns) == tuple(scale.shape)
     assert fixed.dtype == torch.uint8
     assert exceptions.dtype == torch.uint32
     assert int(exceptions.numel()) == 2
     assert int(exceptions[0]) & ((1 << X4T_POSITION_BITS) - 1) == 0
 
 
-def test_x4t_rejects_redundant_exception() -> None:
-    payload = bytearray(pack_x4t_scale_plane(_scale(columns=8)))
-    # The first exception is the final eight bytes; replace its value with the
-    # row's adjacent-palette base while retaining its logical position.
-    entry_offset = len(payload) - 8
-    entry = struct.unpack_from("<I", payload, entry_offset)[0]
-    position = entry & ((1 << X4T_POSITION_BITS) - 1)
-    struct.pack_into("<I", payload, entry_offset, position | (110 << X4T_POSITION_BITS))
-
-    with pytest.raises(ValueError, match="redundantly"):
-        unpack_x4t_scale_plane(bytes(payload))
-
-
 def test_x4t_requires_complete_16_row_tiles() -> None:
     with pytest.raises(ValueError, match="multiple of 16"):
-        pack_x4t_scale_plane(torch.zeros((15, 8), dtype=torch.uint8))
+        pack_x4t_scale_components(torch.zeros((15, 8), dtype=torch.uint8))

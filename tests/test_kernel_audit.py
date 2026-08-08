@@ -27,7 +27,7 @@ def test_stock_w4a16_audit_rejects_hybrid_trellis() -> None:
             "target=some.module.W4A16FusedMoeKernel",
             "attrs={'weight_layout': 'packed'}",
             "repeat implementation=w4a16",
-            "quantization=nvfp4_nf3_hybrid",
+            "quantization=kquant_hybrid",
             "weight_layout=trellis3_t256",
         )
     )
@@ -44,7 +44,7 @@ def test_stock_w4a16_audit_rejects_hybrid_trellis() -> None:
 def test_hybrid_audit_requires_exl3_trellis_evidence() -> None:
     log = "\n".join(
         (
-            "quantization=nvfp4_nf3_hybrid",
+            "quantization=kquant_hybrid",
             "allocated w13_exl3_trellis",
             "target=some.module.W4A16FusedMoeKernel",
             "weight_layout=trellis3_t256",
@@ -58,7 +58,7 @@ def test_hybrid_audit_requires_exl3_trellis_evidence() -> None:
 def test_qsrt_audit_requires_canonical_atom_reader() -> None:
     log = "\n".join(
         (
-            "quantization=nvfp4_nf3_hybrid",
+            "quantization=kquant_hybrid",
             "Loaded QSRT atom layer 1 shard 0: 800 compressed, 96 X4T",
             "target=some.module.W4A16FusedMoeKernel",
             "repeat implementation=w4a16",

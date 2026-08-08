@@ -15,7 +15,7 @@ from kquant.qsrt import FORMAT_X4T, ExpertFormatSpec
 from kquant.qsrt_storage import QSRTLayerLayout
 from kquant.pack.qsrt_pool import QSRTCandidatePool
 from kquant.pack.x4t_index import X4TCostIndex
-from kquant.x4t import X4T_DATA_OFFSET
+from kquant.x4t import X4T_LAYER_FIXED_BYTES
 
 
 QSRT_ALLOCATION_KIND = "kquant_kimi_k3_qsrt_allocation"
@@ -76,7 +76,7 @@ def qsrt_total_container_bytes(
     for row in range(C.NUM_MOE_LAYERS):
         count = int(x4t_mask[row].sum())
         total += qsrt_trellis_layer_bytes(count)
-        total += X4T_DATA_OFFSET + int(costs[row, x4t_mask[row]].sum())
+        total += X4T_LAYER_FIXED_BYTES + int(costs[row, x4t_mask[row]].sum())
     return total
 
 
@@ -99,7 +99,7 @@ def _choose_layer_lagrangian(
     for count in range(C.NUM_EXPERTS + 1):
         stored_bytes = (
             qsrt_trellis_layer_bytes(count)
-            + X4T_DATA_OFFSET
+            + X4T_LAYER_FIXED_BYTES
             + int(x4t_prefix[count])
         )
         remaining = total_damage - float(avoided[count])
@@ -262,7 +262,7 @@ def qsrt_allocation_document(
             "compressed": compressed,
             "format_codes": format_codes,
             "qsrt_atom_layer_bytes": qsrt_trellis_layer_bytes(len(x4t)),
-            "x4t_layer_bytes": X4T_DATA_OFFSET
+            "x4t_layer_bytes": X4T_LAYER_FIXED_BYTES
             + int(x4t_index.expert_storage_bytes[row, mask[row]].sum()),
         }
     parameters = C.NUM_MOE_LAYERS * C.NUM_EXPERTS * 3 * 3072 * 3584
