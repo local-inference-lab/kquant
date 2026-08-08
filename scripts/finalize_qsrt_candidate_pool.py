@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hash and seal a complete TP12 QSRT candidate pool."""
+"""Hash and seal a complete QSRT candidate pool."""
 
 from __future__ import annotations
 

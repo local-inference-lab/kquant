@@ -701,7 +701,6 @@ def _signature(
         "tailbite_context": args.tailbite_context,
         "compact": args.compact,
         "sqg_rank_lut": dict(sqg_rank_lut) if sqg_rank_lut is not None else None,
-        "tp_size": 12,
         "provenance": provenance,
     }
 

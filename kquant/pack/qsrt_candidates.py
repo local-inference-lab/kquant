@@ -1,4 +1,4 @@
-"""Offline-streamed all-expert candidates for the TP12 QSRT codec."""
+"""Offline-streamed all-expert candidates for the QSRT codec."""
 
 from __future__ import annotations
 

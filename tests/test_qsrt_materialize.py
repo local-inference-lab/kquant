@@ -79,11 +79,11 @@ def test_qsrt_materialization_closes_all_tiers_and_bytes(tmp_path) -> None:
     plan = validate_qsrt_materialization_allocation(document, pool, index)
 
     assert plan.x4t_experts == 1
-    assert plan.layers[0].kept == (7,)
+    assert plan.layers[0].x4t == (7,)
     assert plan.layers[0].compressed[7] == 8
     assert plan.total_container_bytes == document["meta"]["container_bytes"]
     assert plan.total_container_bytes == (
-        plan.trellis_slab_bytes + plan.x4t_sidecar_bytes
+        plan.qsrt_atom_bytes + plan.x4t_bytes
     )
 
 
@@ -95,7 +95,7 @@ def test_qsrt_materialization_rejects_byte_and_mode_drift(tmp_path) -> None:
         lagrange_lambda=3e-7,
     )
     document = qsrt_allocation_document(pool, index, allocation)
-    document["layers"]["1"]["x4t_sidecar_bytes"] += 4096
+    document["layers"]["1"]["x4t_layer_bytes"] += 4096
     with pytest.raises(ValueError, match="X4T bytes"):
         validate_qsrt_materialization_allocation(document, pool, index)
 

@@ -6,25 +6,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from kquant.exl3_reference import (
-    CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
-    CODEBOOK_SQG_NORMAL_E4M3,
-    reconstruct_trellis_states,
-)
+from kquant.exl3_reference import reconstruct_trellis_states
 from kquant.qsrt import (
-    EXPERT_RANK_MXFP4_BYTES,
-    EXPERT_RANK_SCALE_BYTES,
-    EXPERT_RANK_TRELLIS_BYTES,
     EXPERT_TRELLIS_BYTES,
     EXPERTS_PER_LAYER,
     FORMAT_SECTION_BYTES,
     FORMAT_TABLE_BYTES,
     HOT_METADATA_BYTES,
     INTERMEDIATE_CHANNELS,
-    KEEP_STORAGE_EXTERNAL_X4T,
     LAYER_HEADER_BYTES,
-    LOCAL_SCALE_VECTOR_BYTES,
     MATRIX_TRELLIS_BYTES,
     PAIRS_PER_EXPERT,
     PAIR_BYTES,
@@ -44,86 +34,81 @@ from kquant.qsrt import (
     SHARED_SCALE_BYTES,
     SHARED_SCALE_SECTION_BYTES,
     STORAGE_ALIGNMENT,
-    TP12LayerHeader,
-    TP12LayerLayout,
     ExpertFormatSpec,
     ModeSpec,
-    PackedTP12Trellis,
-    TP12TrellisDescriptor,
+    PackedQSRTTrellis,
+    QSRTTrellisDescriptor,
     coupled_intermediate_permutation,
-    decode_tp12_exl3_weight,
+    decode_qsrt_exl3_weight,
     expand_group_order,
-    expand_tp12_hot_metadata,
+    expand_qsrt_hot_metadata,
     expand_record_order,
     importance_group_order,
     matrix_rate_axis,
     mode_from_context_bits,
-    pack_tp12_format_table,
-    pack_tp12_format_section,
-    pack_tp12_trellis,
-    pack_tp12_rank_scale_section,
-    pack_tp12_shared_scale_section,
+    pack_qsrt_format_table,
+    pack_qsrt_format_section,
+    pack_qsrt_trellis,
+    pack_qsrt_shared_scale_section,
     pack_trellis_edges,
     rate_transfer_record_order,
     record_repack_order,
     relabel_block_contexts_for_record_order,
     repack_encoded_records,
     repack_rate_axis,
-    require_tp12,
-    tp12_pair_bits,
-    tp12_pair_kinds,
-    tp12_logical_pair_index,
-    tp12_physical_rank,
-    tp12_record_bits,
-    tp12_record_contexts,
-    tp12_storage_group_order,
-    unpack_tp12_trellis_edges,
-    unpack_tp12_format_section,
-    unpack_tp12_rank_scale_section,
-    unpack_tp12_shared_scale_section,
-    unpack_tp12_format_table,
-    unpack_tp12_trellis_states,
+    pair_bits,
+    pair_kinds,
+    logical_pair_for_slot,
+    physical_pair_slot,
+    record_bits,
+    record_contexts,
+    storage_group_order,
+    unpack_qsrt_trellis_edges,
+    unpack_qsrt_format_section,
+    unpack_qsrt_shared_scale_section,
+    unpack_qsrt_format_table,
+    unpack_qsrt_trellis_states,
     unpack_trellis_edges,
     unpack_trellis_states,
 )
 from kquant.tp_simulator import situ
 
 
-def test_tp12_mode_schedules_are_fixed_rate_pairs() -> None:
-    assert tp12_pair_kinds(R0) == ("P33",) * PAIRS_PER_EXPERT
-    assert tp12_pair_kinds(R1) == ("P24",) + ("P33",) * 11
-    assert tp12_pair_kinds(R2) == ("P24",) * 2 + ("P33",) * 10
+def test_mode_schedules_are_fixed_rate_pairs() -> None:
+    assert pair_kinds(R0) == ("P33",) * PAIRS_PER_EXPERT
+    assert pair_kinds(R1) == ("P24",) + ("P33",) * 11
+    assert pair_kinds(R2) == ("P24",) * 2 + ("P33",) * 10
 
 
-def test_tp12_pair_rotation_is_a_per_expert_bijection() -> None:
+def test_pair_rotation_is_a_per_expert_bijection() -> None:
     for layer, expert in ((1, 0), (1, 17), (40, 285), (92, 895)):
         physical = [
-            tp12_physical_rank(layer, expert, logical_pair)
+            physical_pair_slot(layer, expert, logical_pair)
             for logical_pair in range(PAIRS_PER_EXPERT)
         ]
         assert sorted(physical) == list(range(PAIRS_PER_EXPERT))
         assert [
-            tp12_logical_pair_index(layer, expert, rank)
+            logical_pair_for_slot(layer, expert, rank)
             for rank in physical
         ] == list(range(PAIRS_PER_EXPERT))
 
 
-def test_tp12_pair_rotation_balances_p24_ownership_across_experts() -> None:
+def test_pair_rotation_balances_p24_ownership_across_experts() -> None:
     counts = [0] * PAIRS_PER_EXPERT
     r = 2
     for expert in range(EXPERTS_PER_LAYER):
         for rank in range(PAIRS_PER_EXPERT):
-            counts[rank] += tp12_logical_pair_index(24, expert, rank) < r
+            counts[rank] += logical_pair_for_slot(24, expert, rank) < r
 
     assert max(counts) - min(counts) <= 1
     for r, mode in enumerate(RATE_TRANSFER_MODES):
         assert mode.mode_id == r
         assert mode.name == f"R{r}"
-        assert len(tp12_record_bits(mode)) == RECORDS_PER_EXPERT
-        assert len(tp12_pair_bits(mode)) == PAIRS_PER_EXPERT
-        assert all(sum(pair) == 6 for pair in tp12_pair_bits(mode))
-        assert sum(tp12_record_bits(mode)) / RECORDS_PER_EXPERT == 3
-        assert tp12_pair_kinds(mode) == ("P24",) * r + ("P33",) * (12 - r)
+        assert len(record_bits(mode)) == RECORDS_PER_EXPERT
+        assert len(pair_bits(mode)) == PAIRS_PER_EXPERT
+        assert all(sum(pair) == 6 for pair in pair_bits(mode))
+        assert sum(record_bits(mode)) / RECORDS_PER_EXPERT == 3
+        assert pair_kinds(mode) == ("P24",) * r + ("P33",) * (12 - r)
 
 
 def test_qsrt_encoder_policy_is_frozen_to_r012() -> None:
@@ -147,47 +132,49 @@ def test_context_allocations_map_to_the_rate_transfer_ladder() -> None:
         ModeSpec(1, "bad", (2, 3, 3, 4))
 
 
-def test_schema_rejects_non_tp12_runtime_geometry() -> None:
-    require_tp12(12)
-    with pytest.raises(ValueError, match="TP=12 only"):
-        require_tp12(8)
-    with pytest.raises(ValueError, match="TP=12 only"):
-        TP12TrellisDescriptor(mode_id=R2.mode_id, rate_axis="k", k_tiles=192, n_tiles=2, tp_size=8)
+def test_candidate_descriptor_contains_no_tensor_parallel_geometry() -> None:
+    descriptor = QSRTTrellisDescriptor(
+        mode_id=R2.mode_id,
+        rate_axis="k",
+        k_tiles=192,
+        n_tiles=224,
+    )
+    assert "tp_size" not in descriptor.to_manifest()
 
 
 def test_provisional_format_table_supports_separate_r13_r2() -> None:
-    formats = ["MXFP4", R0, R1, (1, 2)] * (EXPERTS_PER_LAYER // 4)
-    packed = pack_tp12_format_table(formats)
+    formats = ["X4T", R0, R1, (1, 2)] * (EXPERTS_PER_LAYER // 4)
+    packed = pack_qsrt_format_table(formats)
 
     assert packed.dtype == torch.uint8
     assert packed.shape == (FORMAT_TABLE_BYTES,)
     assert packed[:4].tolist() == [0xFF, 0x00, 0x11, 0x12]
-    assert unpack_tp12_format_table(packed) == tuple(
-        ["MXFP4", "R0", "R1", "R1/R2"] * (EXPERTS_PER_LAYER // 4)
+    assert unpack_qsrt_format_table(packed) == tuple(
+        ["X4T", "R0", "R1", "R1/R2"] * (EXPERTS_PER_LAYER // 4)
     )
 
     malformed = packed.clone()
     malformed[0] = 0xD0
     with pytest.raises(ValueError, match="invalid rate code"):
-        unpack_tp12_format_table(malformed)
+        unpack_qsrt_format_table(malformed)
     assert ExpertFormatSpec.compressed(1, 2).code == 0x12
     assert ExpertFormatSpec.from_code(0x12).name == "R1/R2"
-    assert ExpertFormatSpec.from_code(0xFF).is_mxfp4
+    assert ExpertFormatSpec.from_code(0xFF).is_x4t
     with pytest.raises(ValueError, match="896 experts"):
-        pack_tp12_format_table([R0])
+        pack_qsrt_format_table([R0])
     with pytest.raises(TypeError, match="torch.uint8"):
-        unpack_tp12_format_table(packed.int())
+        unpack_qsrt_format_table(packed.int())
 
 
 def test_format_section_padding_and_hot_slot_expansion_are_canonical() -> None:
-    formats = ["MXFP4", R0, R1, (1, 2)] * (EXPERTS_PER_LAYER // 4)
-    section = pack_tp12_format_section(formats)
-    codes, slots = expand_tp12_hot_metadata(formats)
+    formats = ["X4T", R0, R1, (1, 2)] * (EXPERTS_PER_LAYER // 4)
+    section = pack_qsrt_format_section(formats)
+    codes, slots = expand_qsrt_hot_metadata(formats)
 
     assert section.shape == (FORMAT_SECTION_BYTES,)
     assert torch.count_nonzero(section[FORMAT_TABLE_BYTES:]) == 0
-    assert unpack_tp12_format_section(section) == tuple(
-        ["MXFP4", "R0", "R1", "R1/R2"] * (EXPERTS_PER_LAYER // 4)
+    assert unpack_qsrt_format_section(section) == tuple(
+        ["X4T", "R0", "R1", "R1/R2"] * (EXPERTS_PER_LAYER // 4)
     )
     assert codes[:8].tolist() == [255, 0, 17, 18, 255, 0, 17, 18]
     assert slots[:8].tolist() == [0, 0, 1, 2, 1, 3, 4, 5]
@@ -196,189 +183,25 @@ def test_format_section_padding_and_hot_slot_expansion_are_canonical() -> None:
     malformed = section.clone()
     malformed[-1] = 1
     with pytest.raises(ValueError, match="nonzero alignment padding"):
-        unpack_tp12_format_section(malformed)
+        unpack_qsrt_format_section(malformed)
 
 
-def test_shared_and_rank_local_scale_sections_round_trip_exactly() -> None:
+def test_shared_scale_section_round_trips_exactly() -> None:
     shared = tuple(
         torch.linspace(-1 + index, 1 + index, 3584, dtype=torch.float16)
         for index in range(3)
     )
-    shared_section = pack_tp12_shared_scale_section(*shared)
-    unpacked_shared = unpack_tp12_shared_scale_section(shared_section)
-    for expected, actual in zip(shared, unpacked_shared, strict=True):
-        assert torch.equal(actual, expected)
+    section = pack_qsrt_shared_scale_section(*shared)
+    actual = unpack_qsrt_shared_scale_section(section)
+    assert all(
+        torch.equal(expected, observed)
+        for expected, observed in zip(shared, actual, strict=True)
+    )
 
-    layout = TP12LayerLayout(compressed_experts=3, kept_experts=893)
-    local = torch.linspace(
-        -2, 2, 3 * 3 * 256, dtype=torch.float16
-    ).reshape(3, 3, 256)
-    rank_section = pack_tp12_rank_scale_section(local, layout)
-    assert rank_section.numel() == layout.rank_scale_section_bytes
-    assert torch.equal(unpack_tp12_rank_scale_section(rank_section, layout), local)
-
-    malformed_shared = shared_section.clone()
-    malformed_shared[-1] = 1
+    malformed = section.clone()
+    malformed[-1] = 1
     with pytest.raises(ValueError, match="nonzero alignment padding"):
-        unpack_tp12_shared_scale_section(malformed_shared)
-    malformed_rank = rank_section.clone()
-    malformed_rank[-1] = 1
-    with pytest.raises(ValueError, match="nonzero alignment padding"):
-        unpack_tp12_rank_scale_section(malformed_rank, layout)
-    with pytest.raises(TypeError, match="torch.float16"):
-        pack_tp12_shared_scale_section(shared[0].float(), shared[1], shared[2])
-    nonfinite = local.clone()
-    nonfinite[0, 0, 0] = torch.nan
-    with pytest.raises(ValueError, match="non-finite"):
-        pack_tp12_rank_scale_section(nonfinite, layout)
-
-
-@pytest.mark.parametrize(("compressed", "kept"), [(800, 96), (1, 895)])
-def test_tp12_layer_layout_has_exact_aligned_offsets(
-    compressed: int, kept: int
-) -> None:
-    layout = TP12LayerLayout(compressed, kept)
-
-    assert PAIR_BYTES == 344_064
-    assert MATRIX_TRELLIS_BYTES == 4_128_768
-    assert EXPERT_TRELLIS_BYTES == 12_386_304
-    assert EXPERT_RANK_TRELLIS_BYTES == 3 * PAIR_BYTES
-    assert EXPERT_RANK_SCALE_BYTES == 3 * LOCAL_SCALE_VECTOR_BYTES == 1_536
-    assert EXPERT_RANK_MXFP4_BYTES == 1_462_272
-    assert FORMAT_TABLE_BYTES == 896
-    assert SHARED_SCALE_BYTES == 21_504
-    assert layout.rank_sections_offset == (
-        LAYER_HEADER_BYTES + FORMAT_SECTION_BYTES + SHARED_SCALE_SECTION_BYTES
-    )
-    assert layout.rank_sections_offset % STORAGE_ALIGNMENT == 0
-    assert layout.rank_stride_bytes % STORAGE_ALIGNMENT == 0
-    assert layout.disk_bytes == (
-        layout.rank_sections_offset + 12 * layout.rank_stride_bytes
-    )
-    assert layout.rank_offset(11) + layout.rank_stride_bytes == layout.disk_bytes
-    assert layout.trellis_pair_offset(0, 0, "w1") == layout.rank_offset(0)
-    assert layout.trellis_pair_offset(0, 0, "w3") == (
-        layout.rank_offset(0) + PAIR_BYTES
-    )
-    assert layout.trellis_pair_offset(0, 0, "w2") == (
-        layout.rank_offset(0) + 2 * PAIR_BYTES
-    )
-    assert layout.local_scale_offset(0, 0, "w1") == layout.rank_scale_offset(0)
-    assert layout.local_scale_offset(0, 0, "w2") == (
-        layout.rank_scale_offset(0) + 2 * LOCAL_SCALE_VECTOR_BYTES
-    )
-    assert layout.rank_keep_bytes == 0
-
-
-def test_qsrt_layer_layout_keeps_x4t_out_of_the_trellis_slab() -> None:
-    qsrt = TP12LayerLayout(
-        compressed_experts=800,
-        kept_experts=96,
-        keep_storage=KEEP_STORAGE_EXTERNAL_X4T,
-    )
-
-    assert qsrt.rank_keep_bytes == 0
-    with pytest.raises(ValueError, match="requires external X4T"):
-        TP12LayerLayout(800, 96, keep_storage="inline-mxfp4")
-
-
-def test_qsrt_v5_header_round_trip_identifies_external_x4t() -> None:
-    layout = TP12LayerLayout(
-        compressed_experts=800,
-        kept_experts=96,
-        keep_storage=KEEP_STORAGE_EXTERNAL_X4T,
-    )
-    header = TP12LayerHeader(
-        layer=24,
-        layout=layout,
-        codebook=CODEBOOK_SQG_NORMAL_E4M3,
-    )
-
-    payload = header.to_bytes()
-    decoded = TP12LayerHeader.from_bytes(payload)
-
-    assert payload[:8] == b"KQTP12V5"
-    assert decoded == header
-    assert decoded.to_manifest()["keep_storage"] == KEEP_STORAGE_EXTERNAL_X4T
-
-
-def test_tp12_layer_layout_derives_tier_counts_and_rejects_bad_slots() -> None:
-    formats = ["MXFP4"] * 96 + [R0] * 400 + [R2] * 400
-    layout = TP12LayerLayout.from_formats(formats)
-
-    assert layout == TP12LayerLayout(compressed_experts=800, kept_experts=96)
-    with pytest.raises(ValueError, match="exactly 896"):
-        TP12LayerLayout(1, 1)
-    with pytest.raises(ValueError, match="rank must be"):
-        layout.rank_offset(12)
-    with pytest.raises(ValueError, match="compressed_slot"):
-        layout.trellis_pair_offset(0, 800, "w1")
-    with pytest.raises(ValueError, match="unknown expert matrix"):
-        layout.trellis_pair_offset(0, 0, "router")
-
-
-def test_tp12_layer_header_round_trip_and_corruption_validation() -> None:
-    header = TP12LayerHeader(24, TP12LayerLayout(811, 85))
-    payload = header.to_bytes()
-
-    assert len(payload) == LAYER_HEADER_BYTES
-    assert TP12LayerHeader.from_bytes(payload) == header
-    assert header.to_manifest()["tp_size"] == 12
-
-    wrong_tp = bytearray(payload)
-    wrong_tp[12:14] = (8).to_bytes(2, "little")
-    with pytest.raises(ValueError, match="tp_size mismatch"):
-        TP12LayerHeader.from_bytes(wrong_tp)
-    nonzero_padding = bytearray(payload)
-    nonzero_padding[-1] = 1
-    with pytest.raises(ValueError, match="nonzero reserved padding"):
-        TP12LayerHeader.from_bytes(nonzero_padding)
-    with pytest.raises(ValueError, match="exactly 4096 bytes"):
-        TP12LayerHeader.from_bytes(payload[:-1])
-    with pytest.raises(ValueError, match="1..92"):
-        TP12LayerHeader(0, header.layout)
-
-
-def test_tp12_layer_header_self_identifies_sqg_e4m3() -> None:
-    header = TP12LayerHeader(
-        24,
-        TP12LayerLayout(800, 96),
-        codebook=CODEBOOK_SQG_NORMAL_E4M3,
-    )
-
-    decoded = TP12LayerHeader.from_bytes(header.to_bytes())
-
-    assert decoded == header
-    assert decoded.to_manifest()["codebook"] == CODEBOOK_SQG_NORMAL_E4M3
-    assert decoded.to_manifest()["codebook_multiplier"] == 0
-
-
-def test_tp12_layer_header_self_identifies_sqg_cheb_e4m3() -> None:
-    header = TP12LayerHeader(
-        24,
-        TP12LayerLayout(800, 96),
-        codebook=CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    )
-
-    decoded = TP12LayerHeader.from_bytes(header.to_bytes())
-
-    assert decoded == header
-    assert decoded.to_manifest()["codebook_id"] == 4
-    assert decoded.to_manifest()["codebook_multiplier"] == 0
-
-
-def test_tp12_layer_header_self_identifies_sqg_cheb_k2_q8h4_w2() -> None:
-    header = TP12LayerHeader(
-        24,
-        TP12LayerLayout(800, 96),
-        codebook=CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
-    )
-
-    decoded = TP12LayerHeader.from_bytes(header.to_bytes())
-
-    assert decoded == header
-    assert decoded.to_manifest()["codebook_id"] == 5
-    assert decoded.to_manifest()["codebook_multiplier"] == 0
+        unpack_qsrt_shared_scale_section(malformed)
 
 
 def test_matrix_rate_axis_tracks_shared_intermediate_dimension() -> None:
@@ -489,14 +312,14 @@ def _legal_qsrt_states(
     [("k", (192, 224, 256)), ("n", (224, 192, 256))],
 )
 @pytest.mark.parametrize("mode", [R0, R1, R2])
-def test_tp12_pair_payload_closes_on_both_logical_axes(
+def test_pair_payload_closes_on_both_logical_axes(
     rate_axis: str, shape: tuple[int, int, int], mode
 ) -> None:
     encoded = _legal_qsrt_states(
-        shape, tp12_record_bits(mode), rate_axis, 200 + mode.mode_id
+        shape, record_bits(mode), rate_axis, 200 + mode.mode_id
     )
-    packed = pack_tp12_trellis(encoded, mode, rate_axis=rate_axis)
-    unpacked = unpack_tp12_trellis_edges(packed)
+    packed = pack_qsrt_trellis(encoded, mode, rate_axis=rate_axis)
+    unpacked = unpack_qsrt_trellis_edges(packed)
 
     assert packed.descriptor.schema == SCHEMA
     assert packed.payload.numel() == encoded.numel() * 3 // 16
@@ -506,57 +329,57 @@ def test_tp12_pair_payload_closes_on_both_logical_axes(
         == packed.payload.numel()
     )
     assert packed.descriptor.to_manifest()["pair_kinds"] == list(
-        tp12_pair_kinds(mode)
+        pair_kinds(mode)
     )
     torch.testing.assert_close(
-        unpacked, _expected_edge_symbols(encoded, tp12_record_bits(mode), rate_axis)
+        unpacked, _expected_edge_symbols(encoded, record_bits(mode), rate_axis)
     )
-    torch.testing.assert_close(unpack_tp12_trellis_states(packed), encoded)
+    torch.testing.assert_close(unpack_qsrt_trellis_states(packed), encoded)
 
 
-def test_tp12_packer_rejects_noncyclic_states() -> None:
+def test_packer_rejects_noncyclic_states() -> None:
     malformed = torch.zeros((192, 224, 256), dtype=torch.int16)
     malformed[..., 0] = 1
 
     with pytest.raises(ValueError, match="closed cyclic trellis path"):
-        pack_tp12_trellis(malformed, R2, rate_axis="k")
+        pack_qsrt_trellis(malformed, R2, rate_axis="k")
 
 
-def test_tp12_payload_rejects_wrong_shape_dtype_and_length() -> None:
+def test_payload_rejects_wrong_shape_dtype_and_length() -> None:
     encoded = torch.zeros((192, 224, 256), dtype=torch.int16)
-    packed = pack_tp12_trellis(encoded, R2, rate_axis="k")
+    packed = pack_qsrt_trellis(encoded, R2, rate_axis="k")
     suh = torch.ones(3072, dtype=torch.float16)
     svh = torch.ones(3584, dtype=torch.float16)
 
     with pytest.raises(ValueError, match="length"):
-        PackedTP12Trellis(packed.descriptor, packed.payload[:-1]).validate()
+        PackedQSRTTrellis(packed.descriptor, packed.payload[:-1]).validate()
     with pytest.raises(TypeError, match="torch.int16"):
-        PackedTP12Trellis(packed.descriptor, packed.payload.int()).validate()
+        PackedQSRTTrellis(packed.descriptor, packed.payload.int()).validate()
     with pytest.raises(ValueError, match="3072"):
-        pack_tp12_trellis(encoded[:184], R2, rate_axis="k")
+        pack_qsrt_trellis(encoded[:184], R2, rate_axis="k")
     with pytest.raises(ValueError, match="rate_axis"):
         replace(packed.descriptor, rate_axis="x")
     with pytest.raises(TypeError, match="suh must use torch.float16"):
-        decode_tp12_exl3_weight(packed, suh.float(), svh)
+        decode_qsrt_exl3_weight(packed, suh.float(), svh)
     with pytest.raises(ValueError, match="exactly 3072"):
-        decode_tp12_exl3_weight(packed, suh[:-1], svh)
+        decode_qsrt_exl3_weight(packed, suh[:-1], svh)
     nonfinite = svh.clone()
     nonfinite[0] = torch.inf
     with pytest.raises(ValueError, match="non-finite"):
-        decode_tp12_exl3_weight(packed, suh, nonfinite)
+        decode_qsrt_exl3_weight(packed, suh, nonfinite)
 
 
-def test_context_orders_form_homogeneous_tp12_records() -> None:
+def test_context_orders_form_homogeneous_records() -> None:
     block_contexts = torch.arange(24).repeat_interleave(32)
     importance = importance_group_order(block_contexts, R2)
-    storage = tp12_storage_group_order(block_contexts, R2)
+    storage = storage_group_order(block_contexts, R2)
     storage_channels = block_contexts.index_select(0, storage).repeat_interleave(4)
 
     assert expand_group_order(storage).shape == (INTERMEDIATE_CHANNELS,)
     assert torch.all(storage_channels.reshape(RECORDS_PER_EXPERT, 128).diff(dim=1) == 0)
     assert (
         storage_channels.reshape(RECORDS_PER_EXPERT, 128)[:, 0].tolist()
-        == list(tp12_record_contexts(R2))
+        == list(record_contexts(R2))
     )
 
     order = record_repack_order(importance, storage)
@@ -598,7 +421,7 @@ def test_arbitrary_shared_record_map_folds_into_common_permutation() -> None:
     assert order[-2:] == tuple(reversed(recipients))
     assert ordered_semantic_records.tolist() == list(order)
 
-    storage = tp12_storage_group_order(relabeled, R2)
+    storage = storage_group_order(relabeled, R2)
     physical_records = base_contexts.index_select(0, storage).reshape(
         RECORDS_PER_EXPERT, 32
     )[:, 0]

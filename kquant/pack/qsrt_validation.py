@@ -1,4 +1,4 @@
-"""Untouched-corpus scoring for selected TP12 QSRT candidates.
+"""Untouched-corpus scoring for selected QSRT candidates.
 
 The candidate pool stores one already selected equal-byte mode pair per expert:
 one rate-transfer mode shared by ``w1``/``w3`` and one for ``w2``.
@@ -27,9 +27,9 @@ from kquant.qsrt_candidates import RoutedRows, functional_sse_by_request
 from kquant.qsrt import (
     SCHEMA,
     MATRIX_TRELLIS_BYTES,
-    PackedTP12Trellis,
-    TP12TrellisDescriptor,
-    decode_tp12_exl3_weight,
+    PackedQSRTTrellis,
+    QSRTTrellisDescriptor,
+    decode_qsrt_exl3_weight,
     resolve_mode,
 )
 from kquant.pack.qsrt_candidates import MatrixStore, candidate_tensor_name
@@ -37,7 +37,7 @@ from kquant.tp_simulator import situ
 
 
 VALIDATION_SCORE_KIND = "kquant_kimi_k3_qsrt_validation_scores"
-VALIDATION_SCORE_SCHEMA_VERSION = 3
+VALIDATION_SCORE_SCHEMA_VERSION = 4
 VALIDATION_DAMAGE_METRIC = "validation_official_source_excess_sse"
 VALIDATION_DAMAGE_WEIGHTING = (
     "natural-routing token-uniform document-disjoint validation rows with "
@@ -277,7 +277,7 @@ def decode_candidate_matrix(
         raise ValueError(f"unsupported expert matrix {matrix!r}")
     mode = resolve_mode(mode_id)
     rate_axis, k_tiles, n_tiles = MATRIX_GEOMETRY[matrix]
-    descriptor = TP12TrellisDescriptor(
+    descriptor = QSRTTrellisDescriptor(
         mode_id=mode.mode_id,
         rate_axis=rate_axis,
         k_tiles=k_tiles,
@@ -293,11 +293,11 @@ def decode_candidate_matrix(
     svh = reader.get_tensor(names["svh"])
     if payload.numel() * payload.element_size() != MATRIX_TRELLIS_BYTES:
         raise ValueError(f"{matrix} candidate trellis has the wrong byte count")
-    packed = PackedTP12Trellis(
+    packed = PackedQSRTTrellis(
         descriptor,
         payload.to(device=device, dtype=torch.int16).contiguous(),
     )
-    return decode_tp12_exl3_weight(
+    return decode_qsrt_exl3_weight(
         packed,
         suh.to(device=device, dtype=torch.float16).contiguous(),
         svh.to(device=device, dtype=torch.float16).contiguous(),
@@ -445,7 +445,6 @@ def load_qsrt_validation_scores(
         "candidate_mode_ids": list(candidate_pool.mode_ids),
         "source_model": C.MODEL_ID,
         "source_revision": candidate_manifest.get("source_revision"),
-        "tp_size": 12,
         "metric": VALIDATION_DAMAGE_METRIC,
         "selection_data_used": False,
     }

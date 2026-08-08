@@ -1,4 +1,4 @@
-"""Calibration and conservative mode selection for TP12 QSRT candidates.
+"""Calibration and conservative mode selection for QSRT candidates.
 
 This module contains the data-facing part of the phase-1 encoder contract.  It
 does not load model weights and it never reads the external validation corpus.

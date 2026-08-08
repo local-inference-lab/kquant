@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Allocate QSRT trellis and exact X4T experts at an exact-byte budget."""
+"""Allocate TP-independent QSRT atoms and exact X4T experts by exact bytes."""
 
 from __future__ import annotations
 

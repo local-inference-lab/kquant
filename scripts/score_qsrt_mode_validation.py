@@ -312,7 +312,6 @@ def _manifest(
                 "bootstrap_replicates",
             )
         },
-        "tp_size": 12,
         "metric": MODE_VALIDATION_METRIC,
         "audit_population": (
             "every assignment with selected r13>0 or selected r2>0"
@@ -984,7 +983,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--devices",
         type=_parse_devices,
-        default=_parse_devices(",".join(str(index) for index in range(12))),
+        help=(
+            "comma-separated GPU indices; defaults to all CUDA devices visible "
+            "to this process"
+        ),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--workers-per-device", type=int, default=1)
@@ -1000,6 +1002,10 @@ def parse_args() -> argparse.Namespace:
     args.validation_scores = args.validation_scores.resolve()
     args.dest = args.dest.resolve()
     args.validation_sample_cache = args.validation_sample_cache.resolve()
+    if args.devices is None:
+        args.devices = tuple(range(torch.cuda.device_count()))
+    if not args.devices:
+        parser.error("parent mode requires at least one visible CUDA device")
     if (args.worker_index is None) != (args.worker_count is None):
         parser.error("worker index and count must be supplied together")
     if args.workers_per_device < 1:

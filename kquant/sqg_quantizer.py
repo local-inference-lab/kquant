@@ -16,7 +16,7 @@ from kquant.sqg_e4m3 import sqg_e4m3_bytes
 def _extension():
     project = Path(__file__).resolve().parents[1]
     return load(
-        name="kquant_sqg_quantize_ext_v17",
+        name="kquant_sqg_quantize_ext_v22",
         sources=[
             str(project / "kquant/csrc/sqg_quantize.cpp"),
             str(project / "kquant/csrc/sqg_quantize.cu"),

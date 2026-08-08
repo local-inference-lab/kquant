@@ -11,20 +11,17 @@ from pathlib import Path
 import numpy as np
 
 from kquant import constants as C
-from kquant.qsrt import (
-    FORMAT_MXFP4,
-    KEEP_STORAGE_EXTERNAL_X4T,
-    TP12LayerLayout,
-    ExpertFormatSpec,
-)
+from kquant.qsrt import FORMAT_X4T, ExpertFormatSpec
+from kquant.qsrt_storage import QSRTLayerLayout
 from kquant.pack.qsrt_pool import QSRTCandidatePool
 from kquant.pack.x4t_index import X4TCostIndex
 from kquant.x4t import X4T_DATA_OFFSET
 
 
 QSRT_ALLOCATION_KIND = "kquant_kimi_k3_qsrt_allocation"
-QSRT_ALLOCATION_SCHEMA_VERSION = 1
-QSRT_ALLOCATION_FILENAME = "allocation-qsrt-tp12.json"
+QSRT_ALLOCATION_SCHEMA_VERSION = 2
+QSRT_ALLOCATION_FILENAME = "allocation-qsrt.json"
+HIGH_TIER_STORAGE = "x4t"
 
 
 @dataclass(frozen=True)
@@ -59,10 +56,9 @@ def _validate_inputs(
 def qsrt_trellis_layer_bytes(x4t_count: int) -> int:
     if isinstance(x4t_count, bool) or not 0 <= x4t_count <= C.NUM_EXPERTS:
         raise ValueError(f"X4T count must lie in 0..{C.NUM_EXPERTS}")
-    return TP12LayerLayout(
+    return QSRTLayerLayout(
         compressed_experts=C.NUM_EXPERTS - x4t_count,
-        kept_experts=x4t_count,
-        keep_storage=KEEP_STORAGE_EXTERNAL_X4T,
+        x4t_experts=x4t_count,
     ).disk_bytes
 
 
@@ -253,7 +249,7 @@ def qsrt_allocation_document(
         x4t = np.flatnonzero(mask[row]).tolist()
         compressed = np.flatnonzero(~mask[row]).tolist()
         format_codes = [
-            FORMAT_MXFP4
+            FORMAT_X4T
             if mask[row, expert]
             else ExpertFormatSpec.compressed(
                 int(pool.selected_r13[row, expert]),
@@ -265,8 +261,8 @@ def qsrt_allocation_document(
             "x4t": x4t,
             "compressed": compressed,
             "format_codes": format_codes,
-            "trellis_slab_bytes": qsrt_trellis_layer_bytes(len(x4t)),
-            "x4t_sidecar_bytes": X4T_DATA_OFFSET
+            "qsrt_atom_layer_bytes": qsrt_trellis_layer_bytes(len(x4t)),
+            "x4t_layer_bytes": X4T_DATA_OFFSET
             + int(x4t_index.expert_storage_bytes[row, mask[row]].sum()),
         }
     parameters = C.NUM_MOE_LAYERS * C.NUM_EXPERTS * 3 * 3072 * 3584
@@ -275,8 +271,7 @@ def qsrt_allocation_document(
         "schema_version": QSRT_ALLOCATION_SCHEMA_VERSION,
         "meta": {
             "codec": "QSRT",
-            "tp_size": 12,
-            "high_tier_storage": KEEP_STORAGE_EXTERNAL_X4T,
+            "high_tier_storage": HIGH_TIER_STORAGE,
             "candidate_pool": str(pool.root),
             "candidate_pool_content_sha256": pool.content_sha256,
             "candidate_codebook": pool.codebook,

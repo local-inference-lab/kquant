@@ -12,8 +12,8 @@ from kquant import constants as C
 from kquant.io.safetensors_stream import TensorSpec
 from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3
 from kquant.qsrt import SCHEMA
-import scripts.pack_qsrt_candidates_tp12 as pack_script
-from scripts.pack_qsrt_candidates_tp12 import (
+import scripts.pack_qsrt_candidates as pack_script
+from scripts.pack_qsrt_candidates import (
     _ScheduleJob,
     _balanced_expert_schedule,
     _balanced_layer_schedule,

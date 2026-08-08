@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize complete layers in a running TP12 QSRT candidate pool.
+"""Summarize complete layers in a running QSRT candidate pool.
 
 The all-expert writer publishes payload, metric, and selection files atomically
 per layer.  This tool deliberately ignores active ``.partial`` payloads and

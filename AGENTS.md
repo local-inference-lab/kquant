@@ -1,6 +1,7 @@
 # kquant agent guide
 
-This repository builds and validates `Kimi-K3-QSRT`, a TP12 hybrid checkpoint.
+This repository builds and validates `Kimi-K3-QSRT`, a TP-independent hybrid
+checkpoint whose first qualified serving target is TP12.
 QSRT experts use SQG-E4M3 trellis reconstruction with expert-static K2/K4 rate
 shifts around K3. The high-quality tier uses X4T, which reproduces the official
 MXFP4 tensors exactly while compressing their scale plane. Non-expert linears
@@ -18,8 +19,13 @@ or external EXL encoder APIs.
   for 82,432 layer/expert assignments.
 - `/models/Kimi-K3-EXL3-3p09` and its serve directory remain the validated
   interim teacher and comparison checkpoint. They are not the QSRT format.
-- QSRT v1 is TP12 only. Do not add TP4 or TP16 requirements to its storage,
-  allocation, capture, or kernel gates.
+- QSRT storage is tensor-parallel independent. The canonical Kimi container is
+  atom-major and never serializes a TP count or rank ownership. TP12 remains
+  the first qualified serving target and the current performance gate, but
+  candidate generation, allocation, capture, storage, and byte accounting must
+  not depend on it. Direct-load serving views own complete balanced atoms;
+  prepared rank-local tensors are disposable load caches, never checkpoint
+  shards.
 - The lossy search is `R0/R1/R2`, with one `r13` decision shared by `w1` and
   `w3` and an independent `r2` decision for `w2`.
 - `sqg-normal-e4m3` is the frozen R44 control. The next production pool uses
@@ -206,7 +212,7 @@ production latency before calling `<Model>-QSRT` usable.
 
 Keep model-specific dimensions, source formats, schema IDs, and kernel support
 out of the shared QSRT theory. A successful new-model port should add a small
-adapter and explicit format version, not weaken Kimi-K3's frozen TP12 contract.
+adapter and explicit format version, not weaken Kimi-K3's frozen codec contract.
 
 ## Repository boundaries
 
@@ -271,7 +277,7 @@ TP join mismatch, epoch-zero probe contamination, or document overlap.
 
 ### 3. Reduce the capture once
 
-Do not let every candidate worker rescan the raw TP12 capture. Build the valid
+Do not let every candidate worker rescan the raw routed capture. Build the valid
 layer-global `H13` matrices in one tensor-selective GPU pass and repack the
 rank-zero route/input rows into directly addressable layer files. The bundle
 stores only a symbolic identity fallback for `H2`. For every supported expert,
@@ -300,7 +306,7 @@ time. It must use the new capture, the validated Hessian bundle, separate
 `r13/r2` selection, and only R0/R1/R2.
 
 ```bash
-.venv/bin/python scripts/pack_qsrt_candidates_tp12.py \
+.venv/bin/python scripts/pack_qsrt_candidates.py \
   --dest <fresh-candidate-pool> \
   --capture <training-capture> \
   --sample-cache <layer-sample-cache> \
@@ -348,7 +354,7 @@ codebooks, margins, or the X4T allocation.
 .venv/bin/python scripts/index_x4t_costs.py \
   --dest <x4t-cost-index> --jobs 12 --resume
 
-.venv/bin/python scripts/allocate_qsrt_tp12.py \
+.venv/bin/python scripts/allocate_qsrt.py \
   --candidate-pool <candidate-pool> \
   --validation-scores <validation-scores> \
   --x4t-cost-index <x4t-cost-index> \
@@ -363,25 +369,23 @@ three-bit trellis payload; they are not the high-tier allocation.
 ### 6. Materialize, package, and validate
 
 ```bash
-.venv/bin/python scripts/materialize_qsrt_tp12.py \
+.venv/bin/python scripts/materialize_qsrt.py \
   --candidate-pool <candidate-pool> \
   --x4t-cost-index <x4t-cost-index> \
   --allocation <allocation.json> \
   --dest <fresh-artifact> --resume
 
-.venv/bin/python scripts/package_qsrt_tp12_serve_dir.py \
-  <fresh-artifact> <fresh-serve-dir> \
-  --x4t-tp12-source <x4t-runtime-source>
-
-.venv/bin/python scripts/validate_qsrt_tp12_artifact.py \
+.venv/bin/python scripts/validate_qsrt_artifact.py \
   --artifact <fresh-artifact> \
   --verify-payloads \
   --output out/validate-qsrt.json
 ```
 
-Every materialized layer is a fixed QSRT trellis slab plus an exact X4T
-sidecar. Validation must close schemas, hashes, byte accounting, zero padding,
-format tables, candidate bytes, and official MXFP4 reconstruction.
+Every materialized layer is a canonical QSRT atom file plus an exact X4T
+layer file. Validation must close schemas, hashes, byte accounting, zero
+padding, format tables, candidate bytes, and official MXFP4 reconstruction.
+Serving builds a disposable rank-local preparation cache from these files; it
+does not package another checkpoint or change canonical ownership.
 
 ### 7. Quality and runtime gates
 

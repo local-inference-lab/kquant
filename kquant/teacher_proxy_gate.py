@@ -448,7 +448,7 @@ def compare_teacher_proxy_suite(
         next_action = "increase document support before accepting the interim proxy"
     else:
         status = "pass"
-        next_action = "interim teacher accepted for the scoped TP12 codec study"
+        next_action = "interim teacher accepted for the scoped QSRT codec study"
 
     return {
         "kind": TEACHER_PROXY_GATE_KIND,

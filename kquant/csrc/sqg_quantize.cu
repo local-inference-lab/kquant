@@ -137,7 +137,7 @@ void launch_trellis(
     int tailbite_context,
     cudaStream_t stream)
 {
-    const int threads = K == 2 ? 1024 : (K == 3 ? 768 : 512);
+    const int threads = K == 2 ? 1024 : (K == 3 ? 640 : 704);
     cudaFuncSetAttribute(
         quantize_tiles_kernel<K, codebook>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,

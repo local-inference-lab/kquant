@@ -14,8 +14,8 @@ from kquant.qsrt import (
     MATRIX_TRELLIS_BYTES,
     PHASE1_MODE_IDS,
     SCHEMA,
-    TP12LayerLayout,
 )
+from kquant.qsrt_storage import QSRTLayerLayout
 from kquant.pack.qsrt_pool import (
     CERTIFIED_ALLOCATION_OPTIMALITY,
     CANDIDATE_POOL_COMPLETION_FILENAME,
@@ -399,37 +399,28 @@ def test_count_allocation_keeps_exact_global_top_damage_with_stable_ties() -> No
     assert raw_keep_allocation_optimality(allocation) == CERTIFIED_ALLOCATION_OPTIMALITY
 
 
-def test_exact_byte_target_repairs_layer_alignment_at_minimum_local_loss() -> None:
+def test_exact_byte_target_uses_canonical_atom_alignment() -> None:
     damage = _damage()
     damage[0, :3] = [10, 9, 7]
     damage[1, 0] = 8
-    all_compressed = C.NUM_MOE_LAYERS * TP12LayerLayout(
-        C.NUM_EXPERTS, 0
-    ).disk_bytes
-    # Three promotions fit only if all three land in one layer: its rank-scale
-    # padding is 6,144 bytes, versus 55,296 bytes for a 2+1 distribution.
-    target = all_compressed + 3 * RAW_KEEP_PROMOTION_BYTES + 6_144
+    expected = np.zeros_like(damage, dtype=np.bool_)
+    expected[0, :2] = True
+    expected[1, 0] = True
+    target = raw_keep_container_bytes(expected)
 
     allocation = choose_qsrt_raw_keep_allocation(
         damage, target_container_bytes=target
     )
 
     assert allocation.retained_experts == 3
-    assert allocation.keep_mask[0, :3].tolist() == [True, True, True]
-    assert not allocation.keep_mask[1, 0]
+    assert np.array_equal(allocation.keep_mask, expected)
     assert allocation.container_bytes == target
-    assert allocation.alignment_repair_swaps == 1
-    assert allocation.alignment_repair_damage_cost == 1.0
-    assert (
-        raw_keep_allocation_optimality(allocation)
-        == UNCERTIFIED_ALLOCATION_OPTIMALITY
-    )
 
 
 def test_exact_byte_target_drops_one_when_alignment_cannot_be_repaired() -> None:
     damage = _damage()
     damage[0, 0] = 1
-    all_compressed = C.NUM_MOE_LAYERS * TP12LayerLayout(
+    all_compressed = C.NUM_MOE_LAYERS * QSRTLayerLayout(
         C.NUM_EXPERTS, 0
     ).disk_bytes
 

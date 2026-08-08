@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare selection-corpus and document-disjoint TP12 keep rankings."""
+"""Compare selection-corpus and document-disjoint QSRT keep rankings."""
 
 from __future__ import annotations
 

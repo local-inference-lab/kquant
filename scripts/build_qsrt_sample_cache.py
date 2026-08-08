@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repack a TP12 capture into directly addressable per-layer input samples."""
+"""Repack routed capture rows into directly addressable per-layer samples."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the TP12 phase-1 all-expert QSRT candidate pool.
+"""Build the all-expert QSRT candidate pool.
 
 The resident teacher is represented only by its finalized calibration capture.
 Official MXFP4 expert matrices are streamed from the source checkpoint; the
@@ -83,7 +83,7 @@ from kquant.pack.qsrt_encoder import (
 from kquant.source_weights import OfficialMXFP4Store
 
 
-NUM_GPUS = 12
+DEFAULT_PARALLEL_WORKERS = 12
 SCHEMA_VERSION = CANDIDATE_POOL_SCHEMA_VERSION
 KIND = CANDIDATE_POOL_KIND
 
@@ -394,7 +394,7 @@ def _balanced_layer_schedule(
     layer_costs: dict[int, int],
     layers: list[int],
     *,
-    workers: int = NUM_GPUS,
+    workers: int = DEFAULT_PARALLEL_WORKERS,
 ) -> tuple[tuple[int, ...], ...]:
     """Greedily LPT-pack indivisible layer outputs across GPU workers."""
 
@@ -418,7 +418,7 @@ def _balanced_expert_schedule(
     expert_costs: dict[int, tuple[int, ...]],
     layers: list[int],
     *,
-    workers: int = NUM_GPUS,
+    workers: int = DEFAULT_PARALLEL_WORKERS,
     expert_batch_size: int = 20,
     max_splits: int | None = None,
 ) -> tuple[tuple[_ScheduleJob, ...], ...]:
@@ -646,12 +646,14 @@ def _schedule_report(
 def _schedule_from_report(
     report: object,
     *,
-    workers: int = NUM_GPUS,
+    workers: int | None = None,
 ) -> tuple[tuple[_ScheduleJob, ...], ...]:
     if not isinstance(report, dict) or report.get("schema_version") != 2:
         raise ValueError("worker schedule must use schema version 2")
     worker_values = report.get("workers")
-    if not isinstance(worker_values, list) or len(worker_values) != workers:
+    if not isinstance(worker_values, list) or not worker_values:
+        raise ValueError("worker schedule has no workers")
+    if workers is not None and len(worker_values) != workers:
         raise ValueError("worker schedule has the wrong worker count")
     schedule: list[tuple[_ScheduleJob, ...]] = []
     for expected_worker, worker_value in enumerate(worker_values):
@@ -1398,17 +1400,18 @@ def _merge_scheduled_layers(
 
 
 def worker(args: argparse.Namespace) -> None:
-    # Twelve independent encoders share one 24-core host.  PyTorch otherwise
-    # gives every process a 24-thread intra-op pool, creating 288 runnable CPU
-    # threads for lightweight indexing and source-I/O preparation.  The dense
-    # numerical work is CUDA, so reserve an explicit, small CPU budget per
-    # worker instead of oversubscribing the host.
+    # Independent GPU encoders share one host. PyTorch otherwise gives every
+    # process a full-host intra-op pool. The dense numerical work is CUDA, so
+    # reserve an explicit, small CPU budget per worker instead of
+    # oversubscribing the host.
     torch.set_num_threads(args.cpu_threads)
     torch.set_num_interop_threads(1)
     if args.work_plan is not None:
         if args.layers is not None or args.experts is not None:
             raise ValueError("a scheduled worker cannot override layers or experts")
-        schedule = _schedule_from_report(_read_json(args.work_plan))
+        schedule = _schedule_from_report(
+            _read_json(args.work_plan), workers=args.worker_count
+        )
         jobs = list(schedule[args.worker])
     else:
         layers = (
@@ -1417,7 +1420,7 @@ def worker(args: argparse.Namespace) -> None:
             else [
                 layer
                 for index, layer in enumerate(C.MOE_LAYERS)
-                if index % NUM_GPUS == args.worker
+                if index % args.worker_count == args.worker
             ]
         )
         experts = (
@@ -1504,7 +1507,6 @@ def _manifest(args: argparse.Namespace) -> dict:
             "router_weighting": "applied_gate_squared",
             "down_candidate_grid": "w2_r13_r2",
         },
-        "tp_size": 12,
         "mode_ids": list(args.mode_ids),
         "format_grid": "cartesian_r13_r2",
         "shared_r": False,
@@ -1589,7 +1591,9 @@ def parent(args: argparse.Namespace) -> None:
             or schedule_report.get("full_grid_expert_cost") != full_work
         ):
             raise ValueError("resume worker schedule uses another mode-grid cost")
-        schedule = _schedule_from_report(schedule_report)
+        schedule = _schedule_from_report(
+            schedule_report, workers=len(args.devices)
+        )
     else:
         if args.resume:
             raise ValueError("resume destination is missing its worker schedule")
@@ -1609,6 +1613,7 @@ def parent(args: argparse.Namespace) -> None:
         schedule = _balanced_expert_schedule(
             expert_costs,
             list(C.MOE_LAYERS),
+            workers=len(args.devices),
             expert_batch_size=args.expert_batch_size,
         )
         full_grid = {
@@ -1638,7 +1643,10 @@ def parent(args: argparse.Namespace) -> None:
     for worker_id, jobs in enumerate(schedule):
         if not jobs:
             continue
-        environment = dict(os.environ, CUDA_VISIBLE_DEVICES=str(worker_id))
+        environment = dict(
+            os.environ,
+            CUDA_VISIBLE_DEVICES=str(args.devices[worker_id]),
+        )
         command = [
             sys.executable,
             __file__,
@@ -1690,6 +1698,8 @@ def parent(args: argparse.Namespace) -> None:
             args.logical_trellis_schema,
             "--worker",
             str(worker_id),
+            "--worker-count",
+            str(len(args.devices)),
             "--work-plan",
             str(schedule_path),
         ]
@@ -1783,7 +1793,7 @@ def parse_args() -> argparse.Namespace:
         "--layout",
         choices=MIXED_SEARCH_LAYOUTS,
         default="qsrt_guarded_reuse",
-        help="offline LDLQ traversal order; physical TP12 storage is unchanged",
+        help="offline LDLQ traversal order; canonical QSRT pair storage is unchanged",
     )
     parser.add_argument(
         "--ldlq-tf32",
@@ -1862,6 +1872,17 @@ def parse_args() -> argparse.Namespace:
         help="logical candidate descriptor schema written into every manifest",
     )
     parser.add_argument("--worker", type=int)
+    parser.add_argument("--worker-count", type=int)
+    parser.add_argument(
+        "--devices",
+        type=lambda value: tuple(
+            int(item) for item in value.split(",") if item.strip()
+        ),
+        help=(
+            "comma-separated GPU indices for parent scheduling; defaults to "
+            "all CUDA devices visible to this process"
+        ),
+    )
     parser.add_argument(
         "--work-plan",
         type=Path,
@@ -1887,8 +1908,22 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--rotation-plan cannot be combined with nonzero fixed rotation draws"
         )
-    if args.worker is not None and not 0 <= args.worker < NUM_GPUS:
-        parser.error("--worker must be in 0..11")
+    if args.worker is None:
+        if args.worker_count is not None:
+            parser.error("--worker-count is internal to worker mode")
+        if args.devices is None:
+            args.devices = tuple(range(torch.cuda.device_count()))
+        if (
+            not args.devices
+            or len(set(args.devices)) != len(args.devices)
+            or any(device < 0 for device in args.devices)
+        ):
+            parser.error("--devices must contain unique nonnegative GPU indices")
+    else:
+        if args.worker_count is None or args.worker_count < 1:
+            parser.error("worker mode requires a positive --worker-count")
+        if not 0 <= args.worker < args.worker_count:
+            parser.error("--worker must lie in 0..worker-count-1")
     if args.work_plan is not None and args.worker is None:
         parser.error("--work-plan requires --worker")
     if args.layers is not None and any(layer not in C.MOE_LAYERS for layer in args.layers):

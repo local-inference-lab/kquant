@@ -13,7 +13,7 @@ from kquant.qsrt import (
     LATENT_CHANNELS,
     MATRIX_TRELLIS_BYTES,
     SCHEMA,
-    TP12TrellisDescriptor,
+    QSRTTrellisDescriptor,
 )
 from kquant.pack.qsrt_candidates import (
     CANDIDATE_POOL_KIND,
@@ -192,7 +192,7 @@ def _selections(
                             "mode": f"R{r2 if matrix == 'w2' else r13}",
                             "mode_id": r2 if matrix == "w2" else r13,
                             "rate_axis": rate_axis,
-                            "trellis_descriptor": TP12TrellisDescriptor(
+                            "trellis_descriptor": QSRTTrellisDescriptor(
                                 mode_id=r2 if matrix == "w2" else r13,
                                 rate_axis=rate_axis,
                                 k_tiles=k_tiles,

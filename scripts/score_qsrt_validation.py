@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score selected TP12 QSRT candidates on the untouched capture.
+"""Score selected QSRT candidates on the untouched capture.
 
 The candidate pool's fit and confirmation documents are never read.  Every
 selected candidate is decoded from its persisted payload and compared with
@@ -45,7 +45,6 @@ from kquant.pack.qsrt_validation import (
 from kquant.source_weights import OfficialMXFP4Store
 
 
-NUM_GPUS = 12
 MANIFEST_NAME = "qsrt-validation-manifest.json"
 COMPLETION_NAME = "qsrt-validation-completion.json"
 
@@ -58,6 +57,22 @@ class _WorkerResources:
     logical_trellis_schema: str
     codebook: str
     mode_ids: tuple[int, ...]
+
+
+def _parse_devices(value: str) -> tuple[int, ...]:
+    try:
+        result = tuple(int(part) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated GPU indices"
+        ) from exc
+    if (
+        not result
+        or len(set(result)) != len(result)
+        or any(device < 0 for device in result)
+    ):
+        raise argparse.ArgumentTypeError("GPU indices must be nonnegative and unique")
+    return result
 
 
 def _read_json(path: Path) -> dict:
@@ -236,7 +251,6 @@ def _manifest(args: argparse.Namespace) -> dict:
         "validation_report": str(args.validation_report.resolve()),
         "validation_documents": len(documents),
         "provenance": provenance,
-        "tp_size": 12,
         "metric": VALIDATION_DAMAGE_METRIC,
         "selection_data_used": False,
         "official_source_residency": "one expert matrix at a time",
@@ -465,9 +479,9 @@ def parent(args: argparse.Namespace) -> None:
         _atomic_json(manifest_path, manifest)
 
     processes = []
-    worker_count = NUM_GPUS * args.workers_per_gpu
+    worker_count = len(args.devices) * args.workers_per_gpu
     for worker_id in range(worker_count):
-        device = worker_id % NUM_GPUS
+        device = args.devices[worker_id % len(args.devices)]
         # Each worker owns a GPU and only needs host threads for small tensor
         # bookkeeping.  Letting every process create a full 24-thread OpenMP
         # team oversubscribes this host by 12x and starves the CUDA submission
@@ -533,7 +547,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--official-repo-dir", type=Path)
     parser.add_argument("--official-revision", default=C.REVISION)
     parser.add_argument("--worker", type=int)
-    parser.add_argument("--worker-count", type=int, default=NUM_GPUS)
+    parser.add_argument("--worker-count", type=int)
+    parser.add_argument(
+        "--devices",
+        type=_parse_devices,
+        help=(
+            "comma-separated GPU indices for parent scheduling; defaults to "
+            "all CUDA devices visible to this process"
+        ),
+    )
     parser.add_argument("--workers-per-gpu", type=int, default=1)
     parser.add_argument("--layers", type=_parse_ints)
     parser.add_argument("--resume", action="store_true")
@@ -542,14 +564,21 @@ def parse_args() -> argparse.Namespace:
     args.validation_capture = args.validation_capture.resolve()
     args.validation_report = args.validation_report.resolve()
     args.dest = args.dest.resolve()
-    if args.worker_count < 1:
-        parser.error("--worker-count must be positive")
     if args.workers_per_gpu < 1:
         parser.error("--workers-per-gpu must be positive")
-    if args.worker is not None and not 0 <= args.worker < args.worker_count:
-        parser.error("--worker must be in 0..worker-count-1")
-    if args.worker is None and args.worker_count != NUM_GPUS:
-        parser.error("parent mode derives --worker-count from --workers-per-gpu")
+    if args.worker is None:
+        if args.worker_count is not None:
+            parser.error("--worker-count is internal to worker mode")
+        if args.devices is None:
+            args.devices = tuple(range(torch.cuda.device_count()))
+        if not args.devices:
+            parser.error("parent mode requires at least one visible CUDA device")
+    elif (
+        args.worker_count is None
+        or args.worker_count < 1
+        or not 0 <= args.worker < args.worker_count
+    ):
+        parser.error("worker mode requires a valid --worker-count and --worker")
     if args.layers is not None and any(
         layer not in C.MOE_LAYERS for layer in args.layers
     ):

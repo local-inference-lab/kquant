@@ -2,7 +2,7 @@
 
 The ordinary validation sidecar measures the damage of the payload that the
 training/confirmation selector already chose.  That is the correct input to
-the MXFP4 keep allocator, but it does not answer a different question: whether
+the X4T allocator, but it does not answer a different question: whether
 an accepted nonzero ``(r13, r2)`` format still beats a matched uniform
 ``(R0, R0)`` encode on the fully untouched corpus.
 
@@ -34,7 +34,7 @@ from kquant.pack.qsrt_validation import (
 
 
 MODE_VALIDATION_KIND = "kquant_kimi_k3_qsrt_mode_validation"
-MODE_VALIDATION_SCHEMA_VERSION = 2
+MODE_VALIDATION_SCHEMA_VERSION = 3
 MODE_VALIDATION_METRIC = "external_selected_vs_matched_r0_excess_sse"
 MANIFEST_FILENAME = "qsrt-mode-validation-manifest.json"
 COMPLETION_FILENAME = "qsrt-mode-validation-completion.json"
@@ -272,7 +272,6 @@ def load_qsrt_mode_validation_scores(
         "selected_validation_schema_version": VALIDATION_SCORE_SCHEMA_VERSION,
         "source_model": C.MODEL_ID,
         "source_revision": C.REVISION,
-        "tp_size": 12,
         "metric": MODE_VALIDATION_METRIC,
     }
     for name, value in expected.items():

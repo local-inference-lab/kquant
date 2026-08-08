@@ -6,9 +6,11 @@ import pytest
 import torch
 
 from kquant.x4t import (
+    X4TMatrix,
     X4TLayerReader,
     X4TLayerWriter,
     pack_x4t_matrix_record,
+    partition_x4t_components,
     unpack_x4t_matrix_record,
     x4t_matrix_storage_bytes,
     x4t_record_bpw,
@@ -161,3 +163,25 @@ def test_x4t_layer_writer_requires_canonical_order(tmp_path) -> None:
         with X4TLayerWriter(destination, layer=1) as writer:
             writer.add(1, "w1", packed, scale)
             writer.add(0, "w1", packed, scale)
+
+
+@pytest.mark.parametrize("matrix", ("w1", "w2"))
+@pytest.mark.parametrize("shard_count", (5, 12))
+def test_x4t_matrix_partitions_cover_canonical_intermediate_axis(
+    matrix: str,
+    shard_count: int,
+) -> None:
+    packed, scale = _production_matrix(matrix, packed_seed=17)
+    source = X4TMatrix(matrix=matrix, packed=packed, scale=scale)
+    pieces = [
+        partition_x4t_components(source, matrix, shard_count, shard_index)
+        for shard_index in range(shard_count)
+    ]
+    dimension = 0 if matrix == "w1" else 1
+
+    assert torch.equal(torch.cat([part[0] for part in pieces], dim=dimension), packed)
+    assert torch.equal(torch.cat([part[1] for part in pieces], dim=dimension), scale)
+    widths = [part[0].shape[dimension] for part in pieces]
+    assert max(widths) - min(widths) <= (32 if matrix == "w1" else 16)
+    if shard_count == 12:
+        assert len(set(widths)) == 1

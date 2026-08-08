@@ -21,11 +21,12 @@ from safetensors.torch import load_file, save_file
 
 from kquant import constants as C
 from kquant.capture import load_layer_samples
-from kquant.qsrt import TP_SIZE, tp12_logical_pair_index
+from kquant.qsrt import logical_pair_for_slot
 from scripts.summarize_qsrt_candidate_pool import summarize_candidate_pool
 
 
 KIND = "kquant_kimi_k3_qsrt_tp12_benchmark_fixture"
+TP_SIZE = 12
 SCHEMA_VERSION = 1
 
 
@@ -81,7 +82,7 @@ def build_fixture_tensors(
 
     logical_pairs = torch.tensor(
         [
-            tp12_logical_pair_index(layer, expert, rank)
+            logical_pair_for_slot(layer, expert, rank)
             for expert in range(C.NUM_EXPERTS)
         ],
         dtype=torch.uint8,

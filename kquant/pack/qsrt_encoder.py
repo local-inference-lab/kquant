@@ -1,9 +1,9 @@
-"""Production-facing TP12 heterogeneous QSRT encoder wrapper.
+"""Production-facing heterogeneous Kimi-K3 QSRT encoder wrapper.
 
 The kquant encoder backend owns the dense-H LDLQ traversal. This module owns
 the Kimi-K3 semantics around it: one common intermediate-neuron order, the
 logical rate axis of each expert matrix, complete-record repacking into the
-TP12 P24/P33 layout, and closure against the stored FP16 scale vectors.
+balanced P24/P33 layout, and closure against the stored FP16 scale vectors.
 
 The returned reconstruction is in the source checkpoint's canonical neuron
 order.  The returned tensors are in physical serving order and contain one
@@ -41,23 +41,23 @@ from kquant.qsrt import (
     LATENT_CHANNELS,
     ModeSpec,
     ExpertFormatSpec,
-    PackedTP12Trellis,
+    PackedQSRTTrellis,
     RECORD_CHANNELS,
     SCHEMA,
     RateAxis,
-    decode_tp12_exl3_weight,
+    decode_qsrt_exl3_weight,
     expand_group_order,
     importance_group_order,
     matrix_rate_axis,
-    pack_tp12_trellis,
+    pack_qsrt_trellis,
     record_repack_order,
     repack_encoded_records,
     repack_rate_axis,
     resolve_mode,
-    tp12_record_bits,
-    tp12_storage_group_order,
-    unpack_tp12_trellis_edges,
-    unpack_tp12_trellis_states,
+    record_bits,
+    storage_group_order,
+    unpack_qsrt_trellis_edges,
+    unpack_qsrt_trellis_states,
 )
 from kquant.ldlq import SIGMA_REG, make_shared_h
 from kquant.tp_simulator import comparison_metrics
@@ -86,7 +86,7 @@ MIXED_SEARCH_LAYOUTS: tuple[SearchLayout, ...] = (
 # end of the offline LDLQ traversal leaves a 20-record K3 suffix. LDLQ walks K
 # backwards, so the suffix can be encoded once and its exact error-feedback
 # state can be fanned out into all three candidates. The serving permutation is
-# unchanged: selected records are still repacked into the ordinary TP12
+# unchanged: selected records are still repacked into the ordinary QSRT
 # P24/P33 order after encoding.
 QSRT_PREFIX_REUSE_MAX_MODE = 2
 
@@ -143,8 +143,8 @@ class QSRTMatrixPlan:
     record_repack_order: torch.Tensor
     encoder_tile_bits: tuple[int, ...]
     physical_tile_bits: tuple[int, ...]
-    encoder_tp12_rank_bpw: tuple[float, ...]
-    physical_tp12_rank_bpw: tuple[float, ...]
+    encoder_pair_bpw: tuple[float, ...]
+    physical_pair_bpw: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -152,9 +152,9 @@ class QSRTTransformSeeds:
     """Independent deterministic sign streams for one matrix transform.
 
     ``input_sign`` produces ``su`` and ``output_sign`` produces ``sv`` in the
-    local EXL encoder.  The TP12 slab requires the residual-side stream to be
-    layer-shared (w1/w3 input, w2 output), while the opposite intermediate-side
-    stream may be selected per expert.
+    local EXL encoder.  Canonical QSRT storage requires the residual-side
+    stream to be layer-shared (w1/w3 input, w2 output), while the opposite
+    intermediate-side stream may be selected per expert.
     """
 
     input_sign: int
@@ -230,7 +230,7 @@ class QSRTMatrixEncoding:
 
     reconstruction: torch.Tensor
     tensors: dict[str, torch.Tensor]
-    packed: PackedTP12Trellis
+    packed: PackedQSRTTrellis
     plan: QSRTMatrixPlan
     coding: dict[str, object]
 
@@ -266,7 +266,7 @@ class QSRTExpertEncoding:
     coding: dict[str, object]
 
 
-def _rank_bpw(tile_bits: tuple[int, ...]) -> tuple[float, ...]:
+def _pair_bpw(tile_bits: tuple[int, ...]) -> tuple[float, ...]:
     if len(tile_bits) != INTERMEDIATE_CHANNELS // 16:
         raise ValueError("rate map must cover the 3072-channel tile axis")
     return tuple(
@@ -282,7 +282,7 @@ def plan_qsrt_matrix(
     matrix: str,
     layout: Layout = "importance_ordered",
 ) -> QSRTMatrixPlan:
-    """Plan one rate-shifted traversal and its fixed TP12 physical repack."""
+    """Plan one rate-shifted traversal and its canonical paired-record repack."""
 
     spec = resolve_mode(mode)
     rate_axis = matrix_rate_axis(matrix)
@@ -297,7 +297,7 @@ def plan_qsrt_matrix(
     else:
         raise ValueError(f"unsupported context layout: {layout}")
 
-    physical_group_order = tp12_storage_group_order(block_contexts, spec)
+    physical_group_order = storage_group_order(block_contexts, spec)
     encoder_permutation = expand_group_order(encoder_group_order)
     physical_permutation = expand_group_order(physical_group_order)
     repack_order = record_repack_order(
@@ -323,10 +323,10 @@ def plan_qsrt_matrix(
         for context in physical_tiles[:, 0].cpu().tolist()
     )
     expected_physical_bits = tuple(
-        bits for bits in tp12_record_bits(spec) for _ in range(8)
+        bits for bits in record_bits(spec) for _ in range(8)
     )
     if physical_tile_bits != expected_physical_bits:
-        raise ValueError("physical contexts do not match the TP12 mode schedule")
+        raise ValueError("physical contexts do not match the QSRT mode schedule")
 
     return QSRTMatrixPlan(
         matrix=matrix,
@@ -338,8 +338,8 @@ def plan_qsrt_matrix(
         record_repack_order=repack_order,
         encoder_tile_bits=encoder_tile_bits,
         physical_tile_bits=physical_tile_bits,
-        encoder_tp12_rank_bpw=_rank_bpw(encoder_tile_bits),
-        physical_tp12_rank_bpw=_rank_bpw(physical_tile_bits),
+        encoder_pair_bpw=_pair_bpw(encoder_tile_bits),
+        physical_pair_bpw=_pair_bpw(physical_tile_bits),
     )
 
 
@@ -914,7 +914,7 @@ def finalize_qsrt_matrix_candidate(
     physical = repack_encoded_records(
         candidate.encoded, plan.record_repack_order, plan.rate_axis
     )
-    packed = pack_tp12_trellis(
+    packed = pack_qsrt_trellis(
         physical,
         plan.mode,
         rate_axis=plan.rate_axis,
@@ -925,7 +925,7 @@ def finalize_qsrt_matrix_candidate(
         # duplicate work in the all-expert encoder.
         validate_states=False,
     )
-    edge_symbols = unpack_tp12_trellis_edges(packed)
+    edge_symbols = unpack_qsrt_trellis_edges(packed)
     rate_bits = torch.tensor(
         plan.physical_tile_bits,
         device=physical.device,
@@ -936,7 +936,7 @@ def finalize_qsrt_matrix_candidate(
     edge_closes = torch.all(
         edge_symbols.to(torch.int64) == (physical.to(torch.int64) & masks)
     )
-    decoded_states = unpack_tp12_trellis_states(packed)
+    decoded_states = unpack_qsrt_trellis_states(packed)
     state_closes = torch.all(decoded_states == physical.to(torch.int16))
     edge_ok, state_ok = torch.stack((edge_closes, state_closes)).cpu().tolist()
     if not edge_ok:
@@ -1022,7 +1022,7 @@ def finalize_qsrt_matrix_candidate(
         for name in ("suh", "svh")
     )
     if index_bits != reconstruction.numel() * 3:
-        raise ValueError("TP12 QSRT payload is not exactly three trellis bpw")
+        raise ValueError("QSRT payload is not exactly three trellis bpw")
     coding: dict[str, object] = {
         "proxy": candidate.proxy,
         "scale_bits": scale_bits,
@@ -1034,8 +1034,8 @@ def finalize_qsrt_matrix_candidate(
         "mode_id": plan.mode.mode_id,
         "rate_axis": plan.rate_axis,
         "layout": plan.layout,
-        "tp12_rank_trellis_bpw": list(plan.encoder_tp12_rank_bpw),
-        "postpack_tp12_rank_trellis_bpw": list(plan.physical_tp12_rank_bpw),
+        "encoder_pair_trellis_bpw": list(plan.encoder_pair_bpw),
+        "stored_pair_trellis_bpw": list(plan.physical_pair_bpw),
         "postpack_moves_complete_128_channel_records": True,
         "reference_edge_roundtrip": True,
         "reference_state_roundtrip": True,
@@ -1083,7 +1083,7 @@ def quantize_qsrt_matrix(
     tailbite_context: int = 128,
     transform_seeds: QSRTTransformSeeds | None = None,
 ) -> QSRTMatrixEncoding:
-    """Run dense-H heterogeneous LDLQ and close the stored TP12 payload.
+    """Run dense-H heterogeneous LDLQ and close the stored QSRT payload.
 
     ``shared_scale_scope`` is required for ``w1``/``w3`` because their hidden
     ``suh`` vector is stored once per layer/matrix.  All experts and all mode
@@ -1147,19 +1147,19 @@ def quantize_qsrt_matrix(
         transform_seeds=seeds,
     )
 
-    packed_holder: dict[str, PackedTP12Trellis] = {}
+    packed_holder: dict[str, PackedQSRTTrellis] = {}
 
     def pack_qsrt(encoded: torch.Tensor, _quant_args: dict) -> torch.Tensor:
         physical = repack_encoded_records(
             encoded, plan.record_repack_order, plan.rate_axis
         )
-        packed = pack_tp12_trellis(
+        packed = pack_qsrt_trellis(
             physical,
             plan.mode,
             rate_axis=plan.rate_axis,
             schema=logical_trellis_schema,
         )
-        edge_symbols = unpack_tp12_trellis_edges(packed)
+        edge_symbols = unpack_qsrt_trellis_edges(packed)
         rate_bits = torch.tensor(
             plan.physical_tile_bits,
             device=physical.device,
@@ -1172,7 +1172,7 @@ def quantize_qsrt_matrix(
         ):
             raise ValueError("QSRT reference edge unpack failed closure")
         if not torch.equal(
-            unpack_tp12_trellis_states(packed), physical.to(torch.int16)
+            unpack_qsrt_trellis_states(packed), physical.to(torch.int16)
         ):
             raise ValueError("QSRT state reconstruction failed exact closure")
         packed_holder["packed"] = packed
@@ -1211,7 +1211,7 @@ def quantize_qsrt_matrix(
         if not tensor.is_contiguous():
             tensors[name] = tensor.contiguous()
 
-    decoded_physical = decode_tp12_exl3_weight(
+    decoded_physical = decode_qsrt_exl3_weight(
         packed,
         tensors["suh"],
         tensors["svh"],
@@ -1253,7 +1253,7 @@ def quantize_qsrt_matrix(
         for name in ("suh", "svh")
     )
     if index_bits != source.numel() * 3:
-        raise ValueError("TP12 QSRT payload is not exactly three trellis bpw")
+        raise ValueError("QSRT payload is not exactly three trellis bpw")
     if not torch.equal(tensors["trellis"], packed.payload):
         raise ValueError("quantizer returned a different trellis payload")
 
@@ -1268,8 +1268,8 @@ def quantize_qsrt_matrix(
         "mode_id": plan.mode.mode_id,
         "rate_axis": plan.rate_axis,
         "layout": plan.layout,
-        "tp12_rank_trellis_bpw": list(plan.encoder_tp12_rank_bpw),
-        "postpack_tp12_rank_trellis_bpw": list(plan.physical_tp12_rank_bpw),
+        "encoder_pair_trellis_bpw": list(plan.encoder_pair_bpw),
+        "stored_pair_trellis_bpw": list(plan.physical_pair_bpw),
         "postpack_moves_complete_128_channel_records": True,
         "reference_edge_roundtrip": True,
         "reference_state_roundtrip": True,
@@ -1316,7 +1316,7 @@ def quantize_qsrt_expert(
 ) -> QSRTExpertEncoding:
     """Encode all three expert matrices with one physical neuron order."""
 
-    if format_spec.is_mxfp4:
+    if format_spec.is_x4t:
         raise ValueError("quantize_qsrt_expert requires a compressed format")
     if set(sources) != set(MATRICES):
         raise ValueError(f"sources must contain exactly {MATRICES}")

@@ -30,7 +30,7 @@ QSRT_CODEBOOKS = (
 
 def _validate_bits(bits: int) -> None:
     if isinstance(bits, bool) or not isinstance(bits, int) or bits not in (2, 3, 4):
-        raise ValueError("the TP12 reference supports K=2, K=3, or K=4")
+        raise ValueError("the QSRT reference supports K=2, K=3, or K=4")
 
 
 def reconstruct_trellis_states(

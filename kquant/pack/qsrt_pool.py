@@ -1,4 +1,4 @@
-"""Validation and raw-keep diagnostics for TP12 QSRT candidate pools.
+"""Validation and raw-keep diagnostics for QSRT candidate pools.
 
 The candidate encoder scores the complete gated expert function against the
 decoded official MXFP4 source.  Those scores already follow natural captured
@@ -28,18 +28,15 @@ from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3, QSRT_CODEBOOKS
 from kquant.io.hf_cache import read_safetensors_header
 from kquant.qsrt import (
     EXPERTS_PER_LAYER,
-    EXPERT_RANK_MXFP4_BYTES,
-    EXPERT_RANK_SCALE_BYTES,
     EXPERT_TRELLIS_BYTES,
     INTERMEDIATE_CHANNELS,
     LATENT_CHANNELS,
     LOGICAL_CANDIDATE_SCHEMAS,
     MATRIX_TRELLIS_BYTES,
     SCHEMA as QSRT_SCHEMA,
-    TP_SIZE,
     ExpertFormatSpec,
-    TP12LayerLayout,
 )
+from kquant.qsrt_storage import ATOM_SCALE_BYTES, ATOMS_PER_EXPERT, QSRTLayerLayout
 from kquant.pack.qsrt_candidates import (
     CANDIDATE_POOL_KIND,
     CANDIDATE_POOL_SCHEMA_VERSION,
@@ -50,8 +47,9 @@ from kquant.pack.qsrt_candidates import (
 RAW_KEEP_ALLOCATION_KIND = "kquant_kimi_k3_qsrt_raw_keep_diagnostic"
 ALLOCATION_SCHEMA_VERSION = 3
 RAW_KEEP_PROMOTION_BYTES = (
-    TP_SIZE * EXPERT_RANK_MXFP4_BYTES
-    - (EXPERT_TRELLIS_BYTES + TP_SIZE * EXPERT_RANK_SCALE_BYTES)
+    3 * (INTERMEDIATE_CHANNELS * LATENT_CHANNELS // 2)
+    + 3 * (INTERMEDIATE_CHANNELS * LATENT_CHANNELS // 32)
+    - (EXPERT_TRELLIS_BYTES + ATOMS_PER_EXPERT * ATOM_SCALE_BYTES)
 )
 CERTIFIED_ALLOCATION_OPTIMALITY = "globally_optimal_equal_promotion_cost"
 UNCERTIFIED_ALLOCATION_OPTIMALITY = "uncertified_greedy_alignment_repair"
@@ -1055,7 +1053,6 @@ def load_qsrt_candidate_pool(
         "schema_version": CANDIDATE_POOL_SCHEMA_VERSION,
         "source_model": C.MODEL_ID,
         "source_revision": C.REVISION,
-        "tp_size": 12,
         "damage_metric": OFFICIAL_SOURCE_DAMAGE_METRIC,
         "damage_already_natural_route_and_gate_weighted": True,
     }
@@ -1259,7 +1256,7 @@ def load_qsrt_candidate_pool(
 def raw_keep_container_bytes(keep_mask: np.ndarray) -> int:
     """Return bytes for the legacy equal-cost retained-tier diagnostic.
 
-    ``TP12LayerLayout`` now owns only the compressed trellis slab because the
+    ``QSRTLayerLayout`` owns only the compressed trellis slab because the
     production high tier lives in an external X4T sidecar.  This older ranking
     diagnostic deliberately models a fixed-size raw MXFP4 payload per retained
     expert; omitting that payload would make a promotion appear to *remove*
@@ -1281,11 +1278,16 @@ def _nominal_raw_keep_layer_bytes(keep_count: int) -> int:
     """Compressed slab plus fixed-size raw MXFP4 bytes for a legacy keep tier."""
 
     return (
-        TP12LayerLayout(
+        QSRTLayerLayout(
             compressed_experts=C.NUM_EXPERTS - keep_count,
-            kept_experts=keep_count,
+            x4t_experts=keep_count,
         ).disk_bytes
-        + keep_count * TP_SIZE * EXPERT_RANK_MXFP4_BYTES
+        + keep_count
+        * 3
+        * (
+            INTERMEDIATE_CHANNELS * LATENT_CHANNELS // 2
+            + INTERMEDIATE_CHANNELS * LATENT_CHANNELS // 32
+        )
     )
 
 
@@ -1366,7 +1368,7 @@ def choose_qsrt_raw_keep_allocation(
     keep_count: int | None = None,
     target_container_bytes: int | None = None,
 ) -> QSRTRawKeepAllocation:
-    """Choose retained experts and account the exact aligned TP12 bytes.
+    """Choose retained experts and account the exact aligned container bytes.
 
     With a count/fraction target this is the exact top-damage allocation.  A
     byte target first chooses the maximum count permitted by the unaligned
@@ -1534,7 +1536,7 @@ def allocation_document(
         keep = np.flatnonzero(keep_mask[row]).tolist()
         compressed = np.flatnonzero(~keep_mask[row]).tolist()
         format_codes = [
-            ExpertFormatSpec.mxfp4().code
+            ExpertFormatSpec.x4t().code
             if keep_mask[row, expert]
             else ExpertFormatSpec.compressed(
                 int(pool.selected_r13[row, expert]),
@@ -1564,7 +1566,6 @@ def allocation_document(
             "candidate_codebook": pool.codebook,
             "candidate_mode_ids": list(pool.mode_ids),
             "source_revision": pool.manifest["source_revision"],
-            "tp_size": 12,
             "damage_metric": pool.damage_metric,
             "damage_weighting": pool.damage_weighting,
             "damage_provenance": pool.damage_provenance,

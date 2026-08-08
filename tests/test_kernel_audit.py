@@ -55,17 +55,17 @@ def test_hybrid_audit_requires_exl3_trellis_evidence() -> None:
     assert audit_kernel_path(log, "hybrid-exl3")["pass"] is True
 
 
-def test_qsrt_tp12_audit_requires_materialized_slab_reader() -> None:
+def test_qsrt_audit_requires_canonical_atom_reader() -> None:
     log = "\n".join(
         (
             "quantization=nvfp4_nf3_hybrid",
-            "Loaded qsrt_tp12 layer 1 rank 0: 800 compressed, 96 MXFP4",
+            "Loaded QSRT atom layer 1 shard 0: 800 compressed, 96 X4T",
             "target=some.module.W4A16FusedMoeKernel",
             "repeat implementation=w4a16",
         )
     )
 
-    assert audit_kernel_path(log, "qsrt-tp12")["pass"] is True
+    assert audit_kernel_path(log, "qsrt")["pass"] is True
 
 
 def test_kernel_audit_rejects_unknown_path() -> None:

@@ -7,8 +7,8 @@ from typing import Any
 
 STOCK_W4A16 = "stock-w4a16"
 HYBRID_EXL3 = "hybrid-exl3"
-QSRT_TP12 = "qsrt-tp12"
-KERNEL_PATHS = (STOCK_W4A16, HYBRID_EXL3, QSRT_TP12)
+QSRT = "qsrt"
+KERNEL_PATHS = (STOCK_W4A16, HYBRID_EXL3, QSRT)
 
 _REQUIRED: Mapping[str, Mapping[str, tuple[str, ...]]] = {
     STOCK_W4A16: {
@@ -32,9 +32,9 @@ _REQUIRED: Mapping[str, Mapping[str, tuple[str, ...]]] = {
         "exl3_trellis_layout": ("trellis3_t256",),
         "repeat_check_w4a16": ("implementation=w4a16",),
     },
-    QSRT_TP12: {
+    QSRT: {
         "hybrid_quantization": ("quantization=nvfp4_nf3_hybrid",),
-        "qsrt_tp12_reader": ("Loaded qsrt_tp12 layer",),
+        "qsrt_atom_reader": ("Loaded QSRT atom layer",),
         "w4a16_kernel_family": ("W4A16FusedMoeKernel",),
         "repeat_check_w4a16": ("implementation=w4a16",),
     },
@@ -50,7 +50,7 @@ _FORBIDDEN: Mapping[str, Mapping[str, tuple[str, ...]]] = {
         ),
     },
     HYBRID_EXL3: {},
-    QSRT_TP12: {},
+    QSRT: {},
 }
 
 

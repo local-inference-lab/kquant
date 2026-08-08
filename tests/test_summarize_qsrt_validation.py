@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 
 from kquant import constants as C
-from kquant.qsrt import TP12LayerLayout
 from kquant.pack.qsrt_pool import RAW_KEEP_PROMOTION_BYTES
+from kquant.qsrt_storage import QSRTLayerLayout
 from scripts.summarize_qsrt_validation import (
     _average_ranks,
     _spearman,
@@ -30,11 +30,11 @@ def test_ranking_comparison_reports_held_out_allocation_regret() -> None:
     selection[0, 1] = 9.0
     validation[0, 0] = 1.0
     validation[0, 1] = 11.0
-    all_compressed = C.NUM_MOE_LAYERS * TP12LayerLayout(
+    all_compressed = C.NUM_MOE_LAYERS * QSRTLayerLayout(
         C.NUM_EXPERTS, 0
     ).disk_bytes
-    # Allow alignment slack for one promotion in the same layer.
-    target = all_compressed + RAW_KEEP_PROMOTION_BYTES + 64 * 1024
+    # Allow atom-slot alignment slack for one promotion in the same layer.
+    target = all_compressed + RAW_KEEP_PROMOTION_BYTES + 512 * 1024
 
     result = compare_damage_rankings(
         selection, validation, target_container_bytes=target
@@ -55,10 +55,10 @@ def test_document_bootstrap_reports_stable_exact_budget_keep() -> None:
     )
     damage[0, 0] = [10.0, 11.0, 9.0]
     damage[0, 1] = [1.0, 2.0, 1.5]
-    all_compressed = C.NUM_MOE_LAYERS * TP12LayerLayout(
+    all_compressed = C.NUM_MOE_LAYERS * QSRTLayerLayout(
         C.NUM_EXPERTS, 0
     ).disk_bytes
-    target = all_compressed + RAW_KEEP_PROMOTION_BYTES + 64 * 1024
+    target = all_compressed + RAW_KEEP_PROMOTION_BYTES + 512 * 1024
 
     result = bootstrap_keep_stability(
         damage,

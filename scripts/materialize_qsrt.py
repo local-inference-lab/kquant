@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Materialize a TP12 QSRT allocation into trellis/X4T layer pairs.
+"""Materialize a TP-independent QSRT allocation into atom/X4T layer pairs.
 
 The official checkpoint is streamed only as an offline source.  Every output
-layer consists of a fixed SQG trellis slab and an exact X4T sidecar.  A resume
+layer consists of a fixed SQG atom file and an exact X4T file.  A resume
 accepts only the same sealed candidate pool, X4T index, allocation, and source
 revision.
 """
@@ -16,10 +16,10 @@ from pathlib import Path
 
 from kquant import constants as C
 from kquant.pack.qsrt_pool import load_qsrt_candidate_pool
-from kquant.pack.qsrt_slab import (
+from kquant.pack.qsrt_atoms import (
+    QSRTAtomLayerReader,
     layer_filename,
-    materialize_layer,
-    validate_materialized_layer,
+    materialize_atom_layer,
 )
 from kquant.pack.qsrt_materialize import (
     QSRT_MANIFEST_FILENAME,
@@ -36,7 +36,12 @@ from kquant.pack.qsrt_materialize import (
 )
 from kquant.pack.x4t_index import load_x4t_cost_index
 from kquant.source_weights import OfficialMXFP4Store
-from kquant.x4t import X4TLayerReader, x4t_layer_path
+from kquant.x4t import (
+    X4T_MATRIX_ORDER,
+    X4TLayerReader,
+    X4TLayerWriter,
+    x4t_layer_path,
+)
 
 
 def _parse_ints(value: str) -> tuple[int, ...]:
@@ -78,11 +83,6 @@ def parse_args() -> argparse.Namespace:
         help="resume only an identical immutable QSRT build contract",
     )
     parser.add_argument(
-        "--sparse",
-        action="store_true",
-        help="use ftruncate instead of reserving each trellis slab extent",
-    )
-    parser.add_argument(
         "--skip-payload-header-validation",
         action="store_true",
         help="skip the initial all-candidate safetensors header inventory",
@@ -97,36 +97,9 @@ def _read_json(path: Path) -> dict:
     return value
 
 
-def _combine_fresh_closure(
-    metadata: dict[str, int | str],
-    structural: dict[str, int | str],
-) -> dict[str, int | str]:
-    for name in (
-        "file",
-        "disk_bytes",
-        "compressed_experts",
-        "kept_experts",
-        "codebook",
-    ):
-        if metadata.get(name) != structural.get(name):
-            raise AssertionError(f"fresh QSRT closure field {name} drifted")
-    return {
-        **metadata,
-        **{
-            name: structural[name]
-            for name in (
-                "x4t_file",
-                "x4t_disk_bytes",
-                "x4t_records",
-                "layer_container_bytes",
-            )
-        },
-    }
-
-
 def _load_or_rebuild_closure(
-    slab: Path,
-    sidecar: Path,
+    atom_file: Path,
+    x4t_file: Path,
     spec,
     *,
     expected_x4t_bytes: int,
@@ -136,8 +109,8 @@ def _load_or_rebuild_closure(
 ) -> dict[str, int | str]:
     try:
         return load_qsrt_layer_closure_receipt(
-            slab,
-            sidecar,
+            atom_file,
+            x4t_file,
             spec,
             expected_x4t_bytes=expected_x4t_bytes,
             build_document=build,
@@ -149,16 +122,16 @@ def _load_or_rebuild_closure(
             flush=True,
         )
     closure = validate_qsrt_layer_payloads(
-        slab,
-        sidecar,
+        atom_file,
+        x4t_file,
         spec,
         pool.root,
         store,
         expected_x4t_bytes=expected_x4t_bytes,
     )
     write_qsrt_layer_closure_receipt(
-        slab,
-        sidecar,
+        atom_file,
+        x4t_file,
         spec,
         closure,
         expected_x4t_bytes=expected_x4t_bytes,
@@ -168,31 +141,38 @@ def _load_or_rebuild_closure(
 
 
 def _repair_orphan_pair(
-    slab: Path,
-    sidecar: Path,
+    atom_file: Path,
+    x4t_file: Path,
     spec,
     *,
     expected_x4t_bytes: int,
     resume: bool,
 ) -> None:
-    if slab.exists() == sidecar.exists():
+    if atom_file.exists() == x4t_file.exists():
         return
     if not resume:
         raise ValueError(
             f"layer {spec.layer} has only one member of its QSRT file pair"
         )
-    if slab.exists():
-        validate_materialized_layer(slab, spec)
-        removed = slab
+    if atom_file.exists():
+        with QSRTAtomLayerReader(atom_file) as reader:
+            if (
+                reader.header.layer != spec.layer
+                or reader.header.layout != spec.layout
+            ):
+                raise ValueError(
+                    f"layer {spec.layer} orphan atom file does not match the build"
+                )
+        removed = atom_file
     else:
-        reader = X4TLayerReader(sidecar)
+        reader = X4TLayerReader(x4t_file)
         if reader.layer != spec.layer or reader.file_bytes != expected_x4t_bytes:
             raise ValueError(
-                f"layer {spec.layer} orphan X4T sidecar does not match the build"
+                f"layer {spec.layer} orphan X4T file does not match the build"
             )
-        removed = sidecar
+        removed = x4t_file
     removed.unlink()
-    slab.with_name(qsrt_layer_closure_filename(spec.layer)).unlink(
+    atom_file.with_name(qsrt_layer_closure_filename(spec.layer)).unlink(
         missing_ok=True
     )
     print(
@@ -200,6 +180,27 @@ def _repair_orphan_pair(
         "rebuilding the atomic pair",
         flush=True,
     )
+
+
+def _materialize_x4t_layer(
+    destination: Path,
+    spec,
+    store: OfficialMXFP4Store,
+) -> None:
+    """Stream one exact tier directly from the official source."""
+
+    with X4TLayerWriter(destination, layer=spec.layer) as writer:
+        if not spec.x4t:
+            return
+        with store.open_layer(
+            spec.layer,
+            experts=spec.x4t,
+            matrices=X4T_MATRIX_ORDER,
+        ) as source:
+            for expert in spec.x4t:
+                for matrix in X4T_MATRIX_ORDER:
+                    raw = source.load_packed_matrix(spec.layer, expert, matrix)
+                    writer.add(expert, matrix, raw.packed, raw.scale)
 
 
 def main() -> None:
@@ -249,16 +250,16 @@ def main() -> None:
         zip(plan.layers, plan.x4t_layer_bytes, strict=True),
         start=1,
     ):
-        slab = destination / layer_filename(spec.layer)
-        sidecar = x4t_layer_path(destination, spec.layer)
+        atom_file = destination / layer_filename(spec.layer)
+        x4t_file = x4t_layer_path(destination, spec.layer)
         _repair_orphan_pair(
-            slab,
-            sidecar,
+            atom_file,
+            x4t_file,
             spec,
             expected_x4t_bytes=expected_x4t_bytes,
             resume=args.resume,
         )
-        x4t_partial = sidecar.with_name(f".{sidecar.name}.partial")
+        x4t_partial = x4t_file.with_name(f".{x4t_file.name}.partial")
         if x4t_partial.exists():
             if not args.resume:
                 raise FileExistsError(x4t_partial)
@@ -267,12 +268,12 @@ def main() -> None:
                 f"layer {spec.layer}: discarded stale X4T partial",
                 flush=True,
             )
-        if slab.exists():
+        if atom_file.exists():
             if not args.resume:
-                raise FileExistsError(slab)
+                raise FileExistsError(atom_file)
             verified[spec.layer] = _load_or_rebuild_closure(
-                slab,
-                sidecar,
+                atom_file,
+                x4t_file,
                 spec,
                 expected_x4t_bytes=expected_x4t_bytes,
                 build=build,
@@ -283,25 +284,34 @@ def main() -> None:
             continue
         if spec.layer not in selected:
             continue
-        metadata = materialize_layer(
+        materialize_atom_layer(
             pool.root,
-            store,
-            slab,
+            atom_file,
             spec,
             discard_partial=args.resume,
-            preallocate=not args.sparse,
-            x4t_destination=sidecar,
         )
+        try:
+            _materialize_x4t_layer(x4t_file, spec, store)
+        except BaseException:
+            atom_file.unlink(missing_ok=True)
+            raise
         structural = validate_qsrt_layer_pair(
-            slab,
-            sidecar,
+            atom_file,
+            x4t_file,
             spec,
             expected_x4t_bytes=expected_x4t_bytes,
         )
-        closure = _combine_fresh_closure(metadata, structural)
+        closure = validate_qsrt_layer_payloads(
+            atom_file,
+            x4t_file,
+            spec,
+            pool.root,
+            store,
+            expected_x4t_bytes=expected_x4t_bytes,
+        )
         write_qsrt_layer_closure_receipt(
-            slab,
-            sidecar,
+            atom_file,
+            x4t_file,
             spec,
             closure,
             expected_x4t_bytes=expected_x4t_bytes,
@@ -311,7 +321,7 @@ def main() -> None:
         elapsed = time.time() - started
         print(
             f"layer {spec.layer}: wrote {structural['layer_container_bytes']} "
-            f"bytes ({len(spec.compressed)} SQG, {len(spec.kept)} X4T); "
+            f"bytes ({len(spec.compressed)} SQG, {len(spec.x4t)} X4T); "
             f"{index}/{len(plan.layers)} layers considered in {elapsed:.1f}s",
             flush=True,
         )
@@ -322,9 +332,9 @@ def main() -> None:
         plan.x4t_layer_bytes,
         strict=True,
     ):
-        slab = destination / layer_filename(spec.layer)
-        sidecar = x4t_layer_path(destination, spec.layer)
-        if not slab.is_file() or not sidecar.is_file():
+        atom_file = destination / layer_filename(spec.layer)
+        x4t_file = x4t_layer_path(destination, spec.layer)
+        if not atom_file.is_file() or not x4t_file.is_file():
             print(
                 f"partial artifact: layer {spec.layer} pair is incomplete; "
                 f"no {QSRT_MANIFEST_FILENAME} written",
@@ -334,8 +344,8 @@ def main() -> None:
         closure = verified.get(spec.layer)
         if closure is None:
             closure = _load_or_rebuild_closure(
-                slab,
-                sidecar,
+                atom_file,
+                x4t_file,
                 spec,
                 expected_x4t_bytes=expected_x4t_bytes,
                 build=build,

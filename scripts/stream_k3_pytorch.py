@@ -4,7 +4,7 @@
 Only one decoder layer is materialized at a time. Routed experts are
 reconstructed in bulk after routing and released after the layer. The expert
 source may be the official MXFP4 checkpoint, a hybrid EXL3/MXFP4 artifact, or
-a completed TP12 QSRT artifact with trellis slabs and exact X4T sidecars.
+a completed TP-independent QSRT artifact with balanced atoms and exact X4T.
 Serialized MXFP8 non-expert projections can be dequantized into the same
 official PyTorch layer implementation.
 
@@ -49,10 +49,9 @@ from kquant.kimi_stream import (
 )
 from kquant.qsrt import (
     SCHEMA as QSRT_SCHEMA,
-    TP_SIZE as QSRT_TP_SIZE,
-    PackedTP12Trellis,
-    TP12TrellisDescriptor,
-    decode_tp12_exl3_weight,
+    PackedQSRTTrellis,
+    QSRTTrellisDescriptor,
+    decode_qsrt_exl3_weight,
     matrix_rate_axis,
 )
 from kquant.pack.qsrt_materialize import (
@@ -60,12 +59,12 @@ from kquant.pack.qsrt_materialize import (
     QSRT_ARTIFACT_SCHEMA_VERSION,
     QSRT_MANIFEST_FILENAME,
 )
-from kquant.pack.qsrt_slab import (
+from kquant.pack.qsrt_atoms import (
     FORMAT_SECTION_BYTES,
     LAYER_HEADER_BYTES,
-    QSRT_LAYER_PREFIX,
+    LAYER_PREFIX,
     SHARED_SCALE_SECTION_BYTES,
-    TP12LayerReader,
+    QSRTAtomLayerReader,
     layer_filename as qsrt_layer_filename,
 )
 from kquant.teacher_proxy import align_routed_post_situ
@@ -87,15 +86,15 @@ EXL3_PARTS = ("trellis", "suh", "svh")
 
 
 @dataclass(frozen=True)
-class QSRTTP12Artifact:
-    """Strict, read-only inventory for one completed TP12 QSRT artifact."""
+class QSRTArtifact:
+    """Strict, read-only inventory for one completed QSRT artifact."""
 
     root: Path
     manifest_path: Path
     manifest: dict[str, Any]
 
     @classmethod
-    def load(cls, root: str | Path) -> "QSRTTP12Artifact":
+    def load(cls, root: str | Path) -> "QSRTArtifact":
         root = Path(root).expanduser().resolve()
         manifest_path = root / QSRT_MANIFEST_FILENAME
         if not manifest_path.is_file():
@@ -107,7 +106,6 @@ class QSRTTP12Artifact:
             "kind": QSRT_ARTIFACT_KIND,
             "schema_version": QSRT_ARTIFACT_SCHEMA_VERSION,
             "complete": True,
-            "tp_size": QSRT_TP_SIZE,
             "codec": "QSRT",
         }
         for name, expected in expected_scalars.items():
@@ -128,28 +126,28 @@ class QSRTTP12Artifact:
                 f"{manifest_path}: expected exactly {len(expected_layers)} "
                 "MoE layer entries"
             )
-        expected_trellis_files = {
-            str(layers[str(layer)].get("trellis_slab"))
+        expected_atom_files = {
+            str(layers[str(layer)].get("qsrt_atoms"))
             for layer in KQ_C.MOE_LAYERS
         }
-        canonical_trellis_files = {
+        canonical_atom_files = {
             qsrt_layer_filename(layer) for layer in KQ_C.MOE_LAYERS
         }
-        if expected_trellis_files != canonical_trellis_files:
-            raise ValueError(f"{manifest_path}: noncanonical trellis inventory")
-        actual_trellis_files = {
+        if expected_atom_files != canonical_atom_files:
+            raise ValueError(f"{manifest_path}: noncanonical atom inventory")
+        actual_atom_files = {
             path.name
-            for path in root.glob(f"{QSRT_LAYER_PREFIX}*.bin")
+            for path in root.glob(f"{LAYER_PREFIX}*.atoms")
             if path.is_file()
         }
-        if actual_trellis_files != expected_trellis_files:
+        if actual_atom_files != expected_atom_files:
             raise ValueError(
-                "QSRT trellis layer inventory does not close; "
-                f"missing={sorted(expected_trellis_files - actual_trellis_files)[:3]}, "
-                f"extra={sorted(actual_trellis_files - expected_trellis_files)[:3]}"
+                "QSRT atom layer inventory does not close; "
+                f"missing={sorted(expected_atom_files - actual_atom_files)[:3]}, "
+                f"extra={sorted(actual_atom_files - expected_atom_files)[:3]}"
             )
         expected_x4t_files = {
-            str(layers[str(layer)].get("x4t_sidecar"))
+            str(layers[str(layer)].get("x4t"))
             for layer in KQ_C.MOE_LAYERS
         }
         canonical_x4t_files = {
@@ -729,7 +727,7 @@ class StagedExperts:
 
 
 def _decode_qsrt_trellis_matrix(
-    reader: TP12LayerReader,
+    reader: QSRTAtomLayerReader,
     *,
     expert_id: int,
     matrix: str,
@@ -749,19 +747,19 @@ def _decode_qsrt_trellis_matrix(
             f"layer {reader.header.layer} expert {expert_id} {matrix}: "
             f"shape {expected} is not 16x16 tiled"
         )
-    format_spec = reader.formats[expert_id]
-    if format_spec.is_mxfp4:
+    format_spec = reader.format_specs[expert_id]
+    if format_spec.is_x4t:
         raise ValueError(f"expert {expert_id} is not in the compressed tier")
     parts = reader.read_compressed_matrix(expert_id, matrix)
     mode_id = format_spec.r2 if matrix == "w2" else format_spec.r13
-    descriptor = TP12TrellisDescriptor(
+    descriptor = QSRTTrellisDescriptor(
         mode_id=mode_id,
         rate_axis=matrix_rate_axis(matrix),
         k_tiles=expected[1] // 16,
         n_tiles=expected[0] // 16,
         schema=QSRT_SCHEMA,
     )
-    packed = PackedTP12Trellis(
+    packed = PackedQSRTTrellis(
         descriptor,
         parts["trellis"].to(device=device).contiguous(),
     )
@@ -769,7 +767,7 @@ def _decode_qsrt_trellis_matrix(
     suh = parts["suh"].to(device=device).contiguous()
     svh = parts["svh"].to(device=device).contiguous()
     dense = (
-        decode_tp12_exl3_weight(packed, suh, svh, codebook=codebook)
+        decode_qsrt_exl3_weight(packed, suh, svh, codebook=codebook)
         .T.contiguous()
         .to(dtype=torch.bfloat16)
     )
@@ -783,13 +781,13 @@ def _decode_qsrt_trellis_matrix(
     return dense, bytes_read
 
 
-class QSRTTP12StagedExperts:
-    """Stage active experts from one QSRT trellis/X4T layer pair."""
+class QSRTStagedExperts:
+    """Stage active experts from one QSRT atom/X4T layer pair."""
 
     def __init__(
         self,
         *,
-        reader: TP12LayerReader,
+        reader: QSRTAtomLayerReader,
         x4t_reader: X4TLayerReader,
         layer_idx: int,
         scheme: Any,
@@ -799,11 +797,11 @@ class QSRTTP12StagedExperts:
     ):
         if reader.header.layer != layer_idx:
             raise ValueError(
-                f"QSRT slab layer {reader.header.layer} != decoder layer {layer_idx}"
+                f"QSRT atom layer {reader.header.layer} != decoder layer {layer_idx}"
             )
         if x4t_reader.layer != layer_idx:
             raise ValueError(
-                f"X4T sidecar layer {x4t_reader.layer} != decoder layer {layer_idx}"
+                f"X4T layer {x4t_reader.layer} != decoder layer {layer_idx}"
             )
         self.reader = reader
         self.x4t_reader = x4t_reader
@@ -876,14 +874,14 @@ class QSRTTP12StagedExperts:
 
         for expert_id in expert_ids:
             expert = experts[expert_id]
-            format_spec = self.reader.formats[expert_id]
-            if format_spec.is_mxfp4:
+            format_spec = self.reader.format_specs[expert_id]
+            if format_spec.is_x4t:
                 self.stats.kept_expert_ids.append(expert_id)
             else:
                 self.stats.exl3_expert_ids.append(expert_id)
             for matrix in EXPERT_MATRICES:
                 expected = tuple(getattr(expert, matrix).weight.shape)
-                if format_spec.is_mxfp4:
+                if format_spec.is_x4t:
                     packed = self.x4t_reader.read(expert_id, matrix)
                     self.stats.packed_bytes += self.x4t_reader.record_bytes(
                         expert_id, matrix
@@ -1277,7 +1275,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     qsrt_artifact = (
         None
         if args.qsrt_artifact is None
-        else QSRTTP12Artifact.load(args.qsrt_artifact)
+        else QSRTArtifact.load(args.qsrt_artifact)
     )
     expert_checkpoint = (
         checkpoint
@@ -1441,7 +1439,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         None if args.input_ids or input_suite is not None else args.prompt
     )
     if qsrt_artifact is not None:
-        expert_kind = "qsrt_tp12"
+        expert_kind = "qsrt"
     else:
         expert_kind = "hybrid_exl3_mxfp4" if mcg_mult is not None else "mxfp4"
     nonexpert_kind = (
@@ -1475,7 +1473,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "compressed_tensors MXFP4PackedCompressor"
             ),
             "exl3_reconstruction": (
-                "kquant QSRT TP12 unpack plus independent PyTorch "
+                "kquant QSRT balanced-atom unpack plus independent PyTorch "
                 f"{qsrt_artifact.codebook}/Hadamard decode"
                 if qsrt_artifact is not None
                 else (
@@ -1600,14 +1598,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     prefetcher=prefetcher,
                 )
             else:
-                reader = TP12LayerReader(
+                reader = QSRTAtomLayerReader(
                     qsrt_artifact.layer_path(layer_idx)
                 )
                 x4t_reader = X4TLayerReader(
                     qsrt_artifact.x4t_layer_path(layer_idx)
                 )
                 try:
-                    staged_experts = QSRTTP12StagedExperts(
+                    staged_experts = QSRTStagedExperts(
                         reader=reader,
                         x4t_reader=x4t_reader,
                         layer_idx=layer_idx,
@@ -1792,7 +1790,7 @@ def parse_args() -> argparse.Namespace:
         "--qsrt-artifact",
         type=Path,
         help=(
-            "Completed TP12 QSRT trellis/X4T artifact used as the expert "
+            "Completed QSRT atom/X4T artifact used as the expert "
             "source; the official --checkpoint remains the model-code source"
         ),
     )

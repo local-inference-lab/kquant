@@ -10,9 +10,11 @@ import torch
 import scripts.stream_k3_pytorch as stream
 from kquant import constants as C
 from kquant.qsrt import (
-    TP_SIZE,
+    FORMAT_SECTION_BYTES,
+    LAYER_HEADER_BYTES,
+    SHARED_SCALE_SECTION_BYTES,
     ExpertFormatSpec,
-    TP12TrellisDescriptor,
+    QSRTTrellisDescriptor,
     matrix_rate_axis,
 )
 from kquant.pack.qsrt_materialize import (
@@ -20,12 +22,7 @@ from kquant.pack.qsrt_materialize import (
     QSRT_ARTIFACT_SCHEMA_VERSION,
     QSRT_MANIFEST_FILENAME,
 )
-from kquant.pack.qsrt_slab import (
-    FORMAT_SECTION_BYTES,
-    LAYER_HEADER_BYTES,
-    SHARED_SCALE_SECTION_BYTES,
-    layer_filename,
-)
+from kquant.pack.qsrt_atoms import layer_filename
 from kquant.source_weights import PackedMXFP4Matrix
 from kquant.x4t import X4T_DATA_OFFSET, x4t_layer_path
 
@@ -35,13 +32,12 @@ def _artifact_tree(root: Path) -> None:
         "kind": QSRT_ARTIFACT_KIND,
         "schema_version": QSRT_ARTIFACT_SCHEMA_VERSION,
         "complete": True,
-        "tp_size": TP_SIZE,
         "codec": "QSRT",
         "trellis_codebook": "sqg-normal-e4m3",
         "layers": {
             str(layer): {
-                "trellis_slab": layer_filename(layer),
-                "x4t_sidecar": x4t_layer_path(Path("."), layer).name,
+                "qsrt_atoms": layer_filename(layer),
+                "x4t": x4t_layer_path(Path("."), layer).name,
             }
             for layer in C.MOE_LAYERS
         },
@@ -52,26 +48,26 @@ def _artifact_tree(root: Path) -> None:
         x4t_layer_path(root, layer).touch()
 
 
-def test_qsrt_tp12_artifact_requires_complete_exact_inventory(
+def test_qsrt_artifact_requires_complete_exact_inventory(
     tmp_path: Path,
 ) -> None:
     _artifact_tree(tmp_path)
 
-    artifact = stream.QSRTTP12Artifact.load(tmp_path)
+    artifact = stream.QSRTArtifact.load(tmp_path)
 
     assert artifact.root == tmp_path.resolve()
     assert artifact.layer_path(17) == (tmp_path / layer_filename(17)).resolve()
     assert artifact.x4t_layer_path(17) == x4t_layer_path(tmp_path, 17).resolve()
     (tmp_path / layer_filename(92)).unlink()
-    with pytest.raises(ValueError, match="trellis layer inventory does not close"):
-        stream.QSRTTP12Artifact.load(tmp_path)
+    with pytest.raises(ValueError, match="atom layer inventory does not close"):
+        stream.QSRTArtifact.load(tmp_path)
 
 
 def test_qsrt_compressed_decode_uses_matrix_mode_and_orientation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected = (C.EXPERT_INTER, C.LATENT)
-    descriptor = TP12TrellisDescriptor(
+    descriptor = QSRTTrellisDescriptor(
         mode_id=2,
         rate_axis=matrix_rate_axis("w1"),
         k_tiles=expected[1] // 16,
@@ -85,7 +81,7 @@ def test_qsrt_compressed_decode_uses_matrix_mode_and_orientation(
 
     class Reader:
         header = SimpleNamespace(layer=7)
-        formats = tuple(ExpertFormatSpec.compressed(2, 1) for _ in range(9))
+        format_specs = tuple(ExpertFormatSpec.compressed(2, 1) for _ in range(9))
 
         @staticmethod
         def read_compressed_matrix(
@@ -108,7 +104,7 @@ def test_qsrt_compressed_decode_uses_matrix_mode_and_orientation(
         value[1, 2] = 7
         return value
 
-    monkeypatch.setattr(stream, "decode_tp12_exl3_weight", fake_decode)
+    monkeypatch.setattr(stream, "decode_qsrt_exl3_weight", fake_decode)
 
     dense, bytes_read = stream._decode_qsrt_trellis_matrix(
         Reader(),
@@ -119,7 +115,7 @@ def test_qsrt_compressed_decode_uses_matrix_mode_and_orientation(
     )
 
     actual_descriptor = observed["descriptor"]
-    assert isinstance(actual_descriptor, TP12TrellisDescriptor)
+    assert isinstance(actual_descriptor, QSRTTrellisDescriptor)
     assert actual_descriptor.mode_id == 2
     assert actual_descriptor.rate_axis == "n"
     assert observed["codebook"] == "sqg-normal-e4m3"
@@ -137,9 +133,9 @@ def test_qsrt_stager_classifies_tiers_and_releases_to_meta(
 
     class Reader:
         header = SimpleNamespace(layer=1)
-        formats = (
+        format_specs = (
             ExpertFormatSpec.compressed(1),
-            ExpertFormatSpec.mxfp4(),
+            ExpertFormatSpec.x4t(),
         )
 
         def __init__(self) -> None:
@@ -191,7 +187,7 @@ def test_qsrt_stager_classifies_tiers_and_releases_to_meta(
 
     reader = Reader()
     experts = torch.nn.ModuleList((Expert(), Expert()))
-    stager = stream.QSRTTP12StagedExperts(
+    stager = stream.QSRTStagedExperts(
         reader=reader,
         x4t_reader=X4TReader(),
         layer_idx=1,

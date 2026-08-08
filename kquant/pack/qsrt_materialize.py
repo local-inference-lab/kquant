@@ -1,10 +1,8 @@
-"""Validation and materialization helpers for the TP12 QSRT artifact.
+"""Authenticate and materialize the TP-independent QSRT artifact.
 
-QSRT stores each MoE layer as two independently random-access files: a
-fixed TP12 trellis slab for SQG experts and an exact X4T sidecar for the
-high-quality tier.  This module authenticates that pair as one logical layer;
-an ordinary QSRT slab receipt is intentionally insufficient because it
-would not bind the X4T bytes.
+Every MoE layer is represented by a canonical balanced-atom QSRT file and an
+exact X4T file. Tensor parallelism is a serving-time view over those files;
+neither the build contract nor the serialized layer names a TP size.
 """
 
 from __future__ import annotations
@@ -15,35 +13,31 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
+import torch
+from safetensors import safe_open
 
 from kquant import constants as C
 from kquant.exl3_reference import QSRT_CODEBOOKS
-from kquant.qsrt import (
-    EXPERTS_PER_LAYER,
-    FORMAT_MXFP4,
-    KEEP_STORAGE_EXTERNAL_X4T,
-    PHASE1_MODE_IDS,
-    TP12LayerLayout,
-    ExpertFormatSpec,
-)
-from kquant.pack.qsrt_pool import QSRTCandidatePool
-from kquant.pack.qsrt_slab import (
-    LayerMaterializationSpec,
-    expected_logical_source_bytes,
-    layer_filename,
-    validate_materialized_layer,
-    validate_materialized_layer_payloads,
-)
 from kquant.pack.qsrt_allocation import (
+    HIGH_TIER_STORAGE,
     QSRT_ALLOCATION_KIND,
     QSRT_ALLOCATION_SCHEMA_VERSION,
     choose_qsrt_lagrangian,
     qsrt_total_container_bytes,
     qsrt_trellis_layer_bytes,
 )
+from kquant.pack.qsrt_atoms import (
+    QSRTAtomLayerReader,
+    QSRTAtomLayerSpec,
+    assemble_candidate_atoms,
+    candidate_layer_path,
+    layer_filename,
+)
+from kquant.pack.qsrt_candidates import candidate_tensor_name
+from kquant.pack.qsrt_pool import QSRTCandidatePool
 from kquant.pack.qsrt_validation import (
     VALIDATION_DAMAGE_METRIC,
     VALIDATION_DAMAGE_WEIGHTING,
@@ -54,37 +48,39 @@ from kquant.pack.x4t_index import (
     X4T_COST_MANIFEST_FILENAME,
     X4TCostIndex,
 )
-from kquant.source_weights import OfficialMXFP4Store
-from kquant.x4t import (
-    X4T_DATA_OFFSET,
-    X4T_MATRIX_ORDER,
-    X4TLayerReader,
-    x4t_layer_path,
+from kquant.qsrt import (
+    EXPERTS_PER_LAYER,
+    FORMAT_X4T,
+    PHASE1_MODE_IDS,
+    ExpertFormatSpec,
 )
+from kquant.qsrt_storage import QSRTLayerLayout
+from kquant.source_weights import OfficialMXFP4Store
+from kquant.x4t import X4T_DATA_OFFSET, X4T_MATRIX_ORDER, X4TLayerReader, x4t_layer_path
 
 
 QSRT_ARTIFACT_KIND = "kquant_kimi_k3_qsrt_artifact"
-QSRT_ARTIFACT_SCHEMA_VERSION = 1
+QSRT_ARTIFACT_SCHEMA_VERSION = 2
 QSRT_BUILD_KIND = "kquant_kimi_k3_qsrt_materialization_request"
-QSRT_BUILD_SCHEMA_VERSION = 1
-QSRT_BUILD_FILENAME = "qsrt-tp12-build.json"
-QSRT_MANIFEST_FILENAME = "qsrt-tp12-manifest.json"
-QSRT_ALLOCATION_COPY_FILENAME = "allocation-qsrt-tp12.json"
+QSRT_BUILD_SCHEMA_VERSION = 2
+QSRT_BUILD_FILENAME = "qsrt-build.json"
+QSRT_MANIFEST_FILENAME = "qsrt-manifest.json"
+QSRT_ALLOCATION_COPY_FILENAME = "allocation-qsrt.json"
 QSRT_CANDIDATE_MANIFEST_COPY_FILENAME = "qsrt-candidate-manifest.json"
 QSRT_CANDIDATE_COMPLETION_COPY_FILENAME = "qsrt-candidate-completion.json"
 QSRT_X4T_MANIFEST_COPY_FILENAME = "qsrt-x4t-cost-manifest.json"
 QSRT_X4T_COMPLETION_COPY_FILENAME = "qsrt-x4t-cost-completion.json"
 QSRT_CLOSURE_KIND = "kquant_kimi_k3_qsrt_layer_closure"
-QSRT_CLOSURE_SCHEMA_VERSION = 1
-QSRT_CLOSURE_SUFFIX = ".qsrt.closure.json"
+QSRT_CLOSURE_SCHEMA_VERSION = 2
+QSRT_CLOSURE_SUFFIX = ".closure.json"
 
 
 @dataclass(frozen=True)
 class QSRTMaterializationPlan:
-    layers: tuple[LayerMaterializationSpec, ...]
+    layers: tuple[QSRTAtomLayerSpec, ...]
     x4t_layer_bytes: tuple[int, ...]
-    trellis_slab_bytes: int
-    x4t_sidecar_bytes: int
+    qsrt_atom_bytes: int
+    x4t_bytes: int
     total_container_bytes: int
     x4t_experts: int
     compressed_experts: int
@@ -94,13 +90,10 @@ class QSRTMaterializationPlan:
             raise ValueError("QSRT layer specs and X4T byte ledger disagree")
 
     def x4t_bytes_for_layer(self, layer: int) -> int:
-        try:
-            index = next(
-                index for index, spec in enumerate(self.layers) if spec.layer == layer
-            )
-        except StopIteration as exc:
-            raise ValueError(f"QSRT plan has no layer {layer}") from exc
-        return self.x4t_layer_bytes[index]
+        for index, spec in enumerate(self.layers):
+            if spec.layer == layer:
+                return self.x4t_layer_bytes[index]
+        raise ValueError(f"QSRT plan has no layer {layer}")
 
 
 def _plain_int(value: object, name: str) -> int:
@@ -118,9 +111,68 @@ def _finite(value: object, name: str) -> float:
     return result
 
 
-def _allocation_damage(meta: dict, pool: QSRTCandidatePool) -> np.ndarray:
-    """Authenticate and load the damage array used for QSRT allocation."""
+def _read_json(path: Path) -> dict:
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise TypeError(f"expected a JSON object in {path}")
+    return value
 
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_json_sha256(document: dict) -> str:
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_bytes(path: Path, payload: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_json(path: Path, document: dict) -> None:
+    _atomic_bytes(
+        path,
+        (json.dumps(document, indent=1, sort_keys=True) + "\n").encode(),
+    )
+
+
+def _file_identity(path: Path) -> dict[str, int | str]:
+    stat = path.stat()
+    return {
+        "file": path.name,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
+    }
+
+
+def _allocation_damage(meta: dict, pool: QSRTCandidatePool) -> np.ndarray:
     metric = meta.get("damage_metric")
     weighting = meta.get("damage_weighting")
     provenance = meta.get("damage_provenance")
@@ -155,7 +207,7 @@ def validate_qsrt_materialization_allocation(
     pool: QSRTCandidatePool,
     x4t_index: X4TCostIndex,
 ) -> QSRTMaterializationPlan:
-    """Authenticate the complete QSRT decision and exact byte ledger."""
+    """Authenticate the complete allocation and TP-free byte ledger."""
 
     if document.get("kind") != QSRT_ALLOCATION_KIND:
         raise ValueError("allocation is not a QSRT allocation")
@@ -166,8 +218,7 @@ def validate_qsrt_materialization_allocation(
         raise ValueError("QSRT allocation is missing its meta object")
     expected_meta = {
         "codec": "QSRT",
-        "tp_size": 12,
-        "high_tier_storage": KEEP_STORAGE_EXTERNAL_X4T,
+        "high_tier_storage": HIGH_TIER_STORAGE,
         "candidate_pool_content_sha256": pool.content_sha256,
         "candidate_codebook": pool.codebook,
         "candidate_mode_ids": list(PHASE1_MODE_IDS),
@@ -183,7 +234,7 @@ def validate_qsrt_materialization_allocation(
                 f"{meta.get(name)!r} != {expected!r}"
             )
     if pool.codebook not in QSRT_CODEBOOKS or pool.mode_ids != PHASE1_MODE_IDS:
-        raise ValueError("QSRT requires a production SQG codebook and mode IDs R0/R1/R2")
+        raise ValueError("QSRT requires a production codebook and R0/R1/R2")
     if x4t_index.manifest.get("source_revision") != pool.manifest.get(
         "source_revision"
     ):
@@ -199,10 +250,10 @@ def validate_qsrt_materialization_allocation(
     if not isinstance(layers, dict) or set(layers) != expected_layer_keys:
         raise ValueError("QSRT allocation must contain exactly 92 MoE layers")
     mask = np.zeros((C.NUM_MOE_LAYERS, C.NUM_EXPERTS), dtype=np.bool_)
-    specs: list[LayerMaterializationSpec] = []
-    x4t_layer_bytes: list[int] = []
-    trellis_bytes = 0
-    sidecar_bytes = 0
+    specs: list[QSRTAtomLayerSpec] = []
+    layer_x4t_bytes: list[int] = []
+    total_atoms = 0
+    total_x4t = 0
     universe = tuple(range(EXPERTS_PER_LAYER))
     for row, layer in enumerate(C.MOE_LAYERS):
         entry = layers[str(layer)]
@@ -237,10 +288,10 @@ def validate_qsrt_materialization_allocation(
                 raise ValueError(f"QSRT layer {layer} format code is out of range")
             format_spec = ExpertFormatSpec.from_code(code)
             if expert in x4t_set:
-                if code != FORMAT_MXFP4:
-                    raise ValueError(f"QSRT layer {layer} X4T expert is not W4A16")
+                if code != FORMAT_X4T:
+                    raise ValueError(f"QSRT layer {layer} X4T expert is not exact")
             elif (
-                format_spec.is_mxfp4
+                format_spec.is_x4t
                 or format_spec.r13 != int(pool.selected_r13[row, expert])
                 or format_spec.r2 != int(pool.selected_r2[row, expert])
             ):
@@ -250,44 +301,30 @@ def validate_qsrt_materialization_allocation(
                 )
             formats.append(format_spec)
         mask[row, list(x4t)] = True
-        layout = TP12LayerLayout(
-            compressed_experts=len(compressed),
-            kept_experts=len(x4t),
-            keep_storage=KEEP_STORAGE_EXTERNAL_X4T,
-        )
-        if TP12LayerLayout.from_formats(formats) != layout:
-            raise AssertionError("QSRT format-derived layout drifted")
-        expected_trellis = qsrt_trellis_layer_bytes(len(x4t))
-        expected_sidecar = X4T_DATA_OFFSET + int(
+        layout = QSRTLayerLayout(len(compressed), len(x4t))
+        expected_atoms = qsrt_trellis_layer_bytes(len(x4t))
+        expected_x4t = X4T_DATA_OFFSET + int(
             x4t_index.expert_storage_bytes[row, mask[row]].sum()
         )
+        if expected_atoms != layout.disk_bytes:
+            raise AssertionError("QSRT atom byte accounting drifted")
         if (
-            _plain_int(entry.get("trellis_slab_bytes"), "trellis_slab_bytes")
-            != expected_trellis
+            _plain_int(entry.get("qsrt_atom_layer_bytes"), "qsrt_atom_layer_bytes")
+            != expected_atoms
         ):
-            raise ValueError(f"QSRT layer {layer} trellis bytes do not close")
+            raise ValueError(f"QSRT layer {layer} atom bytes do not close")
         if (
-            _plain_int(entry.get("x4t_sidecar_bytes"), "x4t_sidecar_bytes")
-            != expected_sidecar
+            _plain_int(entry.get("x4t_layer_bytes"), "x4t_layer_bytes")
+            != expected_x4t
         ):
             raise ValueError(f"QSRT layer {layer} X4T bytes do not close")
-        specs.append(
-            LayerMaterializationSpec(
-                layer=layer,
-                formats=tuple(formats),
-                compressed=compressed,
-                kept=x4t,
-                layout=layout,
-                codebook=pool.codebook,
-            )
-        )
-        x4t_layer_bytes.append(expected_sidecar)
-        trellis_bytes += expected_trellis
-        sidecar_bytes += expected_sidecar
+        specs.append(QSRTAtomLayerSpec(layer, tuple(formats), compressed, x4t))
+        layer_x4t_bytes.append(expected_x4t)
+        total_atoms += expected_atoms
+        total_x4t += expected_x4t
 
     lagrange_lambda = _finite(
-        meta.get("lagrange_lambda_damage_per_byte"),
-        "QSRT Lagrange multiplier",
+        meta.get("lagrange_lambda_damage_per_byte"), "QSRT Lagrange multiplier"
     )
     expected = choose_qsrt_lagrangian(
         damage,
@@ -298,7 +335,7 @@ def validate_qsrt_materialization_allocation(
     if not np.array_equal(mask, expected.x4t_mask):
         raise ValueError("QSRT X4T set is not optimal for its reported multiplier")
     total_bytes = qsrt_total_container_bytes(mask, x4t_index.expert_storage_bytes)
-    if total_bytes != trellis_bytes + sidecar_bytes:
+    if total_bytes != total_atoms + total_x4t:
         raise AssertionError("QSRT materialization byte accounting drifted")
     integer_fields = {
         "x4t_experts": int(mask.sum()),
@@ -331,76 +368,13 @@ def validate_qsrt_materialization_allocation(
             raise ValueError(f"QSRT allocation meta {name} does not close")
     return QSRTMaterializationPlan(
         layers=tuple(specs),
-        x4t_layer_bytes=tuple(x4t_layer_bytes),
-        trellis_slab_bytes=trellis_bytes,
-        x4t_sidecar_bytes=sidecar_bytes,
+        x4t_layer_bytes=tuple(layer_x4t_bytes),
+        qsrt_atom_bytes=total_atoms,
+        x4t_bytes=total_x4t,
         total_container_bytes=total_bytes,
         x4t_experts=int(mask.sum()),
         compressed_experts=int(mask.size - mask.sum()),
     )
-
-
-def _read_json(path: Path) -> dict:
-    value = json.loads(path.read_text())
-    if not isinstance(value, dict):
-        raise TypeError(f"expected a JSON object in {path}")
-    return value
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _canonical_json_sha256(document: dict) -> str:
-    payload = json.dumps(
-        document,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _atomic_bytes(path: Path, payload: bytes) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-        _fsync_directory(path.parent)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
-def _atomic_json(path: Path, document: dict) -> None:
-    payload = (json.dumps(document, indent=1, sort_keys=True) + "\n").encode()
-    _atomic_bytes(path, payload)
-
-
-def _file_identity(path: Path) -> dict[str, int | str]:
-    stat = path.stat()
-    return {
-        "file": path.name,
-        "device": stat.st_dev,
-        "inode": stat.st_ino,
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-        "ctime_ns": stat.st_ctime_ns,
-    }
 
 
 def qsrt_layer_closure_filename(layer: int) -> str:
@@ -410,132 +384,163 @@ def qsrt_layer_closure_filename(layer: int) -> str:
 
 
 def validate_qsrt_layer_pair(
-    slab_path: str | Path,
+    atom_path: str | Path,
     x4t_path: str | Path,
-    spec: LayerMaterializationSpec,
+    spec: QSRTAtomLayerSpec,
     *,
     expected_x4t_bytes: int,
 ) -> dict[str, int | str]:
-    """Validate one trellis slab and the complete inventory of its X4T peer."""
+    """Validate one complete TP-free layer file pair."""
 
-    slab_path = Path(slab_path)
+    atom_path = Path(atom_path)
     x4t_path = Path(x4t_path)
-    structural = validate_materialized_layer(slab_path, spec)
-    reader = X4TLayerReader(x4t_path)
-    if reader.layer != spec.layer:
-        raise ValueError("QSRT X4T sidecar layer disagrees with its trellis slab")
-    if reader.file_bytes != expected_x4t_bytes:
-        raise ValueError(
-            f"layer {spec.layer} X4T sidecar has {reader.file_bytes} bytes, "
-            f"expected {expected_x4t_bytes}"
-        )
-    expected_records = len(spec.kept) * len(X4T_MATRIX_ORDER)
-    if reader.record_count != expected_records:
-        raise ValueError("QSRT X4T sidecar record count disagrees with its tier")
-    kept = set(spec.kept)
+    with QSRTAtomLayerReader(atom_path) as atoms:
+        if atoms.header.layer != spec.layer or atoms.header.layout != spec.layout:
+            raise ValueError("QSRT atom layer disagrees with its materialization plan")
+        expected_formats = tuple(value.name for value in spec.formats)
+        if atoms.formats != expected_formats:
+            raise ValueError("QSRT atom layer format table drifted")
+    x4t = X4TLayerReader(x4t_path)
+    if x4t.layer != spec.layer or x4t.file_bytes != expected_x4t_bytes:
+        raise ValueError("QSRT X4T layer disagrees with its materialization plan")
+    expected_records = len(spec.x4t) * len(X4T_MATRIX_ORDER)
+    if x4t.record_count != expected_records:
+        raise ValueError("QSRT X4T record count disagrees with its tier")
+    exact = set(spec.x4t)
     for expert in range(C.NUM_EXPERTS):
-        expected = expert in kept
         for matrix in X4T_MATRIX_ORDER:
-            if reader.has(expert, matrix) != expected:
+            if x4t.has(expert, matrix) != (expert in exact):
                 raise ValueError(
-                    f"layer {spec.layer} X4T inventory drifted at expert "
-                    f"{expert} {matrix}"
+                    f"layer {spec.layer} X4T inventory drifted at {expert} {matrix}"
                 )
     return {
-        **structural,
+        "atom_file": atom_path.name,
+        "atom_disk_bytes": atom_path.stat().st_size,
         "x4t_file": x4t_path.name,
-        "x4t_disk_bytes": reader.file_bytes,
-        "x4t_records": reader.record_count,
-        "layer_container_bytes": int(structural["disk_bytes"])
-        + reader.file_bytes,
+        "x4t_disk_bytes": x4t.file_bytes,
+        "compressed_experts": len(spec.compressed),
+        "x4t_experts": len(spec.x4t),
+        "layer_container_bytes": atom_path.stat().st_size + x4t.file_bytes,
     }
 
 
 def validate_qsrt_layer_payloads(
-    slab_path: str | Path,
+    atom_path: str | Path,
     x4t_path: str | Path,
-    spec: LayerMaterializationSpec,
+    spec: QSRTAtomLayerSpec,
     candidate_root: str | Path,
     store: OfficialMXFP4Store,
     *,
     expected_x4t_bytes: int,
 ) -> dict[str, int | str]:
-    """Prove both files reproduce their selected immutable source payloads."""
+    """Compare every atom with its candidate and every X4T tensor with source."""
 
-    payload = validate_materialized_layer_payloads(
-        slab_path,
-        spec,
-        candidate_root,
-        store,
-        x4t_path=x4t_path,
-    )
     structural = validate_qsrt_layer_pair(
-        slab_path,
-        x4t_path,
-        spec,
-        expected_x4t_bytes=expected_x4t_bytes,
+        atom_path, x4t_path, spec, expected_x4t_bytes=expected_x4t_bytes
     )
-    for name in (
-        "file",
-        "disk_bytes",
-        "compressed_experts",
-        "kept_experts",
-        "codebook",
+    candidate_path = candidate_layer_path(candidate_root, spec.layer)
+    with (
+        QSRTAtomLayerReader(atom_path) as atom_reader,
+        safe_open(candidate_path, framework="pt", device="cpu") as candidates,
     ):
-        if payload.get(name) != structural.get(name):
-            raise AssertionError(f"QSRT layer structural field {name} drifted")
-    return {
-        **payload,
-        **{
-            name: structural[name]
-            for name in (
-                "x4t_file",
-                "x4t_disk_bytes",
-                "x4t_records",
-                "layer_container_bytes",
+        expected_shared: dict[str, torch.Tensor] = {}
+        for compressed_slot, expert in enumerate(spec.compressed):
+            tensors = {
+                matrix: {
+                    part: candidates.get_tensor(
+                        candidate_tensor_name(spec.layer, expert, matrix, part)
+                    )
+                    for part in ("trellis", "suh", "svh")
+                }
+                for matrix in C.EXPERT_MATRICES
+            }
+            expected, shared = assemble_candidate_atoms(
+                layer=spec.layer,
+                expert=expert,
+                format_spec=spec.formats[expert],
+                tensors=tensors,
             )
-        },
+            for name, value in shared.items():
+                reference = expected_shared.setdefault(name, value)
+                if not torch.equal(reference, value):
+                    raise ValueError(
+                        f"layer {spec.layer} candidate shared scale {name} drifted"
+                    )
+            if not torch.equal(atom_reader.read_expert_atoms(compressed_slot), expected):
+                raise ValueError(
+                    f"layer {spec.layer} expert {expert} atom bytes drifted"
+                )
+        actual_shared = dict(
+            zip(
+                ("w1.suh", "w3.suh", "w2.svh"),
+                atom_reader.shared_scales,
+                strict=True,
+            )
+        )
+        if spec.compressed:
+            if set(expected_shared) != set(actual_shared):
+                raise AssertionError("QSRT shared-scale inventory drifted")
+            for name, value in expected_shared.items():
+                if not torch.equal(actual_shared[name], value):
+                    raise ValueError(
+                        f"layer {spec.layer} shared scale {name} drifted"
+                    )
+        elif any(bool(torch.count_nonzero(value)) for value in actual_shared.values()):
+            raise ValueError(
+                f"layer {spec.layer} all-X4T shared scale section is nonzero"
+            )
+    x4t_reader = X4TLayerReader(x4t_path)
+    if spec.x4t:
+        with store.open_layer(spec.layer, experts=spec.x4t) as source:
+            for expert in spec.x4t:
+                for matrix in X4T_MATRIX_ORDER:
+                    actual = x4t_reader.read(expert, matrix)
+                    expected = source.load_packed_matrix(spec.layer, expert, matrix)
+                    if not torch.equal(actual.packed, expected.packed) or not torch.equal(
+                        actual.scale, expected.scale
+                    ):
+                        raise ValueError(
+                            f"layer {spec.layer} expert {expert} {matrix} X4T drifted"
+                        )
+    return {
+        **structural,
+        "payload_closure": "bit_exact",
+        "compressed_experts_verified": len(spec.compressed),
+        "x4t_experts_verified": len(spec.x4t),
     }
 
 
 def _validate_full_qsrt_closure(
     metadata: object,
-    spec: LayerMaterializationSpec,
+    spec: QSRTAtomLayerSpec,
     structural: dict[str, int | str],
 ) -> dict[str, int | str]:
     expected = {
         **structural,
         "payload_closure": "bit_exact",
         "compressed_experts_verified": len(spec.compressed),
-        "kept_experts_verified": len(spec.kept),
-        "logical_source_bytes_verified": expected_logical_source_bytes(spec),
+        "x4t_experts_verified": len(spec.x4t),
     }
     if metadata != expected:
         raise ValueError(
-            f"layer {spec.layer} QSRT closure does not describe a complete "
-            "bit-exact source comparison"
+            f"layer {spec.layer} closure does not describe complete source coverage"
         )
     return expected
 
 
 def write_qsrt_layer_closure_receipt(
-    slab_path: str | Path,
+    atom_path: str | Path,
     x4t_path: str | Path,
-    spec: LayerMaterializationSpec,
+    spec: QSRTAtomLayerSpec,
     metadata: dict[str, int | str],
     *,
     expected_x4t_bytes: int,
     build_document: dict,
 ) -> Path:
-    """Bind a bit-exact closure result to both immutable layer files."""
-
-    slab_path = Path(slab_path)
+    atom_path = Path(atom_path)
     x4t_path = Path(x4t_path)
     structural = validate_qsrt_layer_pair(
-        slab_path,
-        x4t_path,
-        spec,
-        expected_x4t_bytes=expected_x4t_bytes,
+        atom_path, x4t_path, spec, expected_x4t_bytes=expected_x4t_bytes
     )
     closure = _validate_full_qsrt_closure(metadata, spec, structural)
     receipt = {
@@ -543,55 +548,41 @@ def write_qsrt_layer_closure_receipt(
         "schema_version": QSRT_CLOSURE_SCHEMA_VERSION,
         "layer": spec.layer,
         "build_sha256": _canonical_json_sha256(build_document),
-        "slab_identity": _file_identity(slab_path),
+        "atom_identity": _file_identity(atom_path),
         "x4t_identity": _file_identity(x4t_path),
         "closure": closure,
     }
-    receipt_path = slab_path.with_name(qsrt_layer_closure_filename(spec.layer))
-    _atomic_json(receipt_path, receipt)
-    return receipt_path
+    path = atom_path.with_name(qsrt_layer_closure_filename(spec.layer))
+    _atomic_json(path, receipt)
+    return path
 
 
 def load_qsrt_layer_closure_receipt(
-    slab_path: str | Path,
+    atom_path: str | Path,
     x4t_path: str | Path,
-    spec: LayerMaterializationSpec,
+    spec: QSRTAtomLayerSpec,
     *,
     expected_x4t_bytes: int,
     build_document: dict,
 ) -> dict[str, int | str]:
-    """Accept a receipt only while it names this exact two-file layer pair."""
-
-    slab_path = Path(slab_path)
+    atom_path = Path(atom_path)
     x4t_path = Path(x4t_path)
-    receipt_path = slab_path.with_name(qsrt_layer_closure_filename(spec.layer))
-    if not receipt_path.is_file():
-        raise FileNotFoundError(receipt_path)
-    receipt = _read_json(receipt_path)
-    expected_scalars = {
+    receipt = _read_json(atom_path.with_name(qsrt_layer_closure_filename(spec.layer)))
+    expected = {
         "kind": QSRT_CLOSURE_KIND,
         "schema_version": QSRT_CLOSURE_SCHEMA_VERSION,
         "layer": spec.layer,
         "build_sha256": _canonical_json_sha256(build_document),
-        "slab_identity": _file_identity(slab_path),
+        "atom_identity": _file_identity(atom_path),
         "x4t_identity": _file_identity(x4t_path),
     }
-    for name, expected in expected_scalars.items():
-        if receipt.get(name) != expected:
-            raise ValueError(
-                f"layer {spec.layer} QSRT closure receipt {name} no longer matches"
-            )
+    for name, value in expected.items():
+        if receipt.get(name) != value:
+            raise ValueError(f"layer {spec.layer} closure receipt {name} drifted")
     structural = validate_qsrt_layer_pair(
-        slab_path,
-        x4t_path,
-        spec,
-        expected_x4t_bytes=expected_x4t_bytes,
+        atom_path, x4t_path, spec, expected_x4t_bytes=expected_x4t_bytes
     )
-    return _validate_full_qsrt_closure(
-        receipt.get("closure"),
-        spec,
-        structural,
-    )
+    return _validate_full_qsrt_closure(receipt.get("closure"), spec, structural)
 
 
 def qsrt_materialization_build_document(
@@ -603,8 +594,6 @@ def qsrt_materialization_build_document(
     official_revision: str,
     plan: QSRTMaterializationPlan,
 ) -> dict:
-    """Freeze every immutable input to a byte-materialization run."""
-
     if pool.content_sha256 is None:
         raise ValueError("QSRT materialization requires a sealed candidate pool")
     allocation_path = Path(allocation_path).resolve()
@@ -621,20 +610,19 @@ def qsrt_materialization_build_document(
     ):
         if not path.is_file():
             raise FileNotFoundError(path)
-    allocation = _read_json(allocation_path)
-    allocation_meta = allocation.get("meta")
+    allocation_meta = _read_json(allocation_path).get("meta")
     if not isinstance(allocation_meta, dict):
         raise ValueError("QSRT allocation is missing its meta object")
     return {
         "kind": QSRT_BUILD_KIND,
         "schema_version": QSRT_BUILD_SCHEMA_VERSION,
         "codec": "QSRT",
+        "storage_schema": "kquant_kimi_k3_qsrt_atoms_v1",
         "codec_contract": {
-            "tp_size": 12,
             "trellis_codebook": pool.codebook,
             "trellis_modes": list(PHASE1_MODE_IDS),
             "separate_r13_r2": True,
-            "high_tier": "X4T-exact-MXFP4",
+            "high_tier": "X4T",
         },
         "source_model": C.MODEL_ID,
         "source_revision": official_revision,
@@ -654,8 +642,8 @@ def qsrt_materialization_build_document(
         "allocation_damage_metric": allocation_meta.get("damage_metric"),
         "allocation_damage_weighting": allocation_meta.get("damage_weighting"),
         "allocation_damage_provenance": allocation_meta.get("damage_provenance"),
-        "trellis_slab_bytes": plan.trellis_slab_bytes,
-        "x4t_sidecar_bytes": plan.x4t_sidecar_bytes,
+        "qsrt_atom_bytes": plan.qsrt_atom_bytes,
+        "x4t_bytes": plan.x4t_bytes,
         "container_bytes": plan.total_container_bytes,
         "x4t_experts": plan.x4t_experts,
         "compressed_experts": plan.compressed_experts,
@@ -674,21 +662,16 @@ def prepare_qsrt_destination(
     x4t_index: X4TCostIndex,
     resume: bool,
 ) -> Path:
-    """Atomically create or strictly reopen an QSRT artifact directory."""
-
     destination = Path(destination).resolve()
-    allocation_path = Path(allocation_path).resolve()
     sources = {
-        QSRT_ALLOCATION_COPY_FILENAME: allocation_path,
+        QSRT_ALLOCATION_COPY_FILENAME: Path(allocation_path).resolve(),
         QSRT_CANDIDATE_MANIFEST_COPY_FILENAME: (
             pool.root / "qsrt-candidate-manifest.json"
         ),
         QSRT_CANDIDATE_COMPLETION_COPY_FILENAME: (
             pool.root / "qsrt-candidate-completion.json"
         ),
-        QSRT_X4T_MANIFEST_COPY_FILENAME: (
-            x4t_index.root / X4T_COST_MANIFEST_FILENAME
-        ),
+        QSRT_X4T_MANIFEST_COPY_FILENAME: x4t_index.root / X4T_COST_MANIFEST_FILENAME,
         QSRT_X4T_COMPLETION_COPY_FILENAME: (
             x4t_index.root / X4T_COST_COMPLETION_FILENAME
         ),
@@ -696,10 +679,7 @@ def prepare_qsrt_destination(
     build_path = destination / QSRT_BUILD_FILENAME
     if destination.exists():
         if not resume:
-            raise FileExistsError(
-                f"destination {destination} exists; use --resume only for the "
-                "identical QSRT build"
-            )
+            raise FileExistsError(destination)
         if not build_path.is_file() or _read_json(build_path) != build_document:
             raise ValueError("QSRT resume destination build contract does not match")
         for name, source in sources.items():
@@ -734,35 +714,30 @@ def qsrt_artifact_manifest(
     plan: QSRTMaterializationPlan,
     layers: Sequence[dict[str, int | str]],
 ) -> dict:
-    """Construct the final exact-byte manifest after all 92 pairs close."""
-
     if len(layers) != len(plan.layers):
         raise ValueError("a final QSRT manifest requires every MoE layer")
     by_layer: dict[str, dict] = {}
-    trellis_bytes = 0
+    atom_bytes = 0
     x4t_bytes = 0
     for spec, expected_x4t, metadata in zip(
-        plan.layers,
-        plan.x4t_layer_bytes,
-        layers,
-        strict=True,
+        plan.layers, plan.x4t_layer_bytes, layers, strict=True
     ):
-        if metadata.get("disk_bytes") != spec.layout.disk_bytes:
-            raise ValueError(f"layer {spec.layer} trellis byte ledger drifted")
+        if metadata.get("atom_disk_bytes") != spec.layout.disk_bytes:
+            raise ValueError(f"layer {spec.layer} atom byte ledger drifted")
         if metadata.get("x4t_disk_bytes") != expected_x4t:
             raise ValueError(f"layer {spec.layer} X4T byte ledger drifted")
-        trellis_bytes += spec.layout.disk_bytes
+        atom_bytes += spec.layout.disk_bytes
         x4t_bytes += expected_x4t
         by_layer[str(spec.layer)] = {
             **metadata,
-            "trellis_slab": layer_filename(spec.layer),
-            "x4t_sidecar": x4t_layer_path(Path("."), spec.layer).name,
+            "qsrt_atoms": layer_filename(spec.layer),
+            "x4t": x4t_layer_path(Path("."), spec.layer).name,
             "layout": spec.layout.to_manifest(),
         }
     if (
-        trellis_bytes != plan.trellis_slab_bytes
-        or x4t_bytes != plan.x4t_sidecar_bytes
-        or trellis_bytes + x4t_bytes != plan.total_container_bytes
+        atom_bytes != plan.qsrt_atom_bytes
+        or x4t_bytes != plan.x4t_bytes
+        or atom_bytes + x4t_bytes != plan.total_container_bytes
     ):
         raise AssertionError("QSRT final artifact byte ledger does not close")
     return {
@@ -772,8 +747,8 @@ def qsrt_artifact_manifest(
         "build": QSRT_BUILD_FILENAME,
         "build_sha256": _canonical_json_sha256(build_document),
         "allocation": QSRT_ALLOCATION_COPY_FILENAME,
-        "tp_size": 12,
         "codec": "QSRT",
+        "storage_schema": "kquant_kimi_k3_qsrt_atoms_v1",
         "source_model": build_document["source_model"],
         "source_revision": build_document["source_revision"],
         "candidate_pool_content_sha256": build_document[
@@ -784,9 +759,9 @@ def qsrt_artifact_manifest(
         ],
         "trellis_codebook": build_document["codec_contract"]["trellis_codebook"],
         "trellis_modes": list(PHASE1_MODE_IDS),
-        "trellis_slab_bytes": trellis_bytes,
-        "x4t_sidecar_bytes": x4t_bytes,
-        "container_bytes": trellis_bytes + x4t_bytes,
+        "qsrt_atom_bytes": atom_bytes,
+        "x4t_bytes": x4t_bytes,
+        "container_bytes": atom_bytes + x4t_bytes,
         "x4t_experts": plan.x4t_experts,
         "compressed_experts": plan.compressed_experts,
         "layer_count": len(plan.layers),
@@ -794,15 +769,37 @@ def qsrt_artifact_manifest(
     }
 
 
-def write_qsrt_artifact_manifest(
-    destination: str | Path,
-    document: dict,
-) -> Path:
-    destination = Path(destination)
-    path = destination / QSRT_MANIFEST_FILENAME
+def write_qsrt_artifact_manifest(destination: str | Path, document: dict) -> Path:
+    path = Path(destination) / QSRT_MANIFEST_FILENAME
     if path.exists():
         if _read_json(path) != document:
             raise ValueError("existing QSRT manifest disagrees with the build")
         return path
     _atomic_json(path, document)
     return path
+
+
+__all__ = [
+    "QSRT_ALLOCATION_COPY_FILENAME",
+    "QSRT_ARTIFACT_KIND",
+    "QSRT_ARTIFACT_SCHEMA_VERSION",
+    "QSRT_BUILD_FILENAME",
+    "QSRT_BUILD_KIND",
+    "QSRT_BUILD_SCHEMA_VERSION",
+    "QSRT_CANDIDATE_COMPLETION_COPY_FILENAME",
+    "QSRT_CANDIDATE_MANIFEST_COPY_FILENAME",
+    "QSRT_MANIFEST_FILENAME",
+    "QSRTMaterializationPlan",
+    "QSRT_X4T_COMPLETION_COPY_FILENAME",
+    "QSRT_X4T_MANIFEST_COPY_FILENAME",
+    "load_qsrt_layer_closure_receipt",
+    "prepare_qsrt_destination",
+    "qsrt_artifact_manifest",
+    "qsrt_layer_closure_filename",
+    "qsrt_materialization_build_document",
+    "validate_qsrt_layer_pair",
+    "validate_qsrt_layer_payloads",
+    "validate_qsrt_materialization_allocation",
+    "write_qsrt_artifact_manifest",
+    "write_qsrt_layer_closure_receipt",
+]

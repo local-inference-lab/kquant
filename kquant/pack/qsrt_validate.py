@@ -1,4 +1,4 @@
-"""Independent structural and source validation for TP12 QSRT artifacts."""
+"""Independent structural and source validation for TP-free QSRT artifacts."""
 
 from __future__ import annotations
 
@@ -8,12 +8,15 @@ from pathlib import Path
 
 from kquant import constants as C
 from kquant.exl3_reference import QSRT_CODEBOOKS
-from kquant.qsrt import PHASE1_MODE_IDS
-from kquant.pack.qsrt_pool import load_qsrt_candidate_pool
-from kquant.pack.qsrt_slab import (
-    expected_logical_source_bytes,
-    layer_filename,
+from kquant.qsrt import (
+    EXPERT_TRELLIS_BYTES,
+    INTERMEDIATE_CHANNELS,
+    LATENT_CHANNELS,
+    PHASE1_MODE_IDS,
+    SCALE_BYTES,
 )
+from kquant.pack.qsrt_atoms import layer_filename
+from kquant.pack.qsrt_pool import load_qsrt_candidate_pool
 from kquant.pack.qsrt_materialize import (
     QSRT_ALLOCATION_COPY_FILENAME,
     QSRT_ARTIFACT_KIND,
@@ -71,6 +74,20 @@ def _require_copy(copy: Path, source: Path, *, name: str) -> None:
         raise ValueError(f"QSRT {name} metadata copy drifted")
 
 
+def _expected_logical_source_bytes(spec) -> int:
+    compressed_expert_bytes = EXPERT_TRELLIS_BYTES + 3 * (
+        LATENT_CHANNELS + INTERMEDIATE_CHANNELS
+    ) * SCALE_BYTES
+    source_matrix_bytes = (
+        INTERMEDIATE_CHANNELS * LATENT_CHANNELS // 2
+        + INTERMEDIATE_CHANNELS * LATENT_CHANNELS // 32
+    )
+    return (
+        len(spec.compressed) * compressed_expert_bytes
+        + len(spec.x4t) * 3 * source_matrix_bytes
+    )
+
+
 def validate_qsrt_artifact(
     root: str | Path,
     *,
@@ -119,11 +136,10 @@ def validate_qsrt_artifact(
     if codebook not in QSRT_CODEBOOKS:
         raise ValueError("QSRT build trellis codebook is unsupported")
     expected_contract = {
-        "tp_size": 12,
         "trellis_codebook": codebook,
         "trellis_modes": list(PHASE1_MODE_IDS),
         "separate_r13_r2": True,
-        "high_tier": "X4T-exact-MXFP4",
+        "high_tier": "X4T",
     }
     if build.get("codec_contract") != expected_contract:
         raise ValueError("QSRT build codec contract drifted")
@@ -190,8 +206,8 @@ def validate_qsrt_artifact(
         if build.get(name) != expected:
             raise ValueError(f"QSRT build {name} drifted from its allocation")
     expected_plan = {
-        "trellis_slab_bytes": plan.trellis_slab_bytes,
-        "x4t_sidecar_bytes": plan.x4t_sidecar_bytes,
+        "qsrt_atom_bytes": plan.qsrt_atom_bytes,
+        "x4t_bytes": plan.x4t_bytes,
         "container_bytes": plan.total_container_bytes,
         "x4t_experts": plan.x4t_experts,
         "compressed_experts": plan.compressed_experts,
@@ -208,7 +224,6 @@ def validate_qsrt_artifact(
         "build": QSRT_BUILD_FILENAME,
         "build_sha256": _canonical_json_sha256(build),
         "allocation": QSRT_ALLOCATION_COPY_FILENAME,
-        "tp_size": 12,
         "codec": "QSRT",
         "trellis_codebook": codebook,
         "trellis_modes": list(PHASE1_MODE_IDS),
@@ -274,11 +289,11 @@ def validate_qsrt_artifact(
         plan.x4t_layer_bytes,
         strict=True,
     ):
-        slab = root / layer_filename(spec.layer)
-        sidecar = x4t_layer_path(root, spec.layer)
+        atom_file = root / layer_filename(spec.layer)
+        x4t_file = x4t_layer_path(root, spec.layer)
         receipt = load_qsrt_layer_closure_receipt(
-            slab,
-            sidecar,
+            atom_file,
+            x4t_file,
             spec,
             expected_x4t_bytes=expected_x4t_bytes,
             build_document=build,
@@ -286,8 +301,8 @@ def validate_qsrt_artifact(
         if verify_payloads:
             assert store is not None
             current = validate_qsrt_layer_payloads(
-                slab,
-                sidecar,
+                atom_file,
+                x4t_file,
                 spec,
                 pool.root,
                 store,
@@ -300,18 +315,18 @@ def validate_qsrt_artifact(
         entry = layer_entries[str(spec.layer)]
         expected_entry = {
             **receipt,
-            "trellis_slab": slab.name,
-            "x4t_sidecar": sidecar.name,
+            "qsrt_atoms": atom_file.name,
+            "x4t": x4t_file.name,
             "layout": spec.layout.to_manifest(),
         }
         if entry != expected_entry:
             raise ValueError(f"layer {spec.layer} manifest entry does not close")
-        total_trellis += slab.stat().st_size
-        total_x4t += sidecar.stat().st_size
-        total_logical += expected_logical_source_bytes(spec)
+        total_trellis += atom_file.stat().st_size
+        total_x4t += x4t_file.stat().st_size
+        total_logical += _expected_logical_source_bytes(spec)
     if (
-        total_trellis != plan.trellis_slab_bytes
-        or total_x4t != plan.x4t_sidecar_bytes
+        total_trellis != plan.qsrt_atom_bytes
+        or total_x4t != plan.x4t_bytes
         or total_trellis + total_x4t != plan.total_container_bytes
     ):
         raise AssertionError("QSRT filesystem byte ledger does not close")
@@ -321,12 +336,11 @@ def validate_qsrt_artifact(
         "schema_version": QSRT_ARTIFACT_SCHEMA_VERSION,
         "artifact": str(root),
         "complete": True,
-        "tp_size": 12,
         "layers": len(plan.layers),
         "x4t_experts": plan.x4t_experts,
         "compressed_experts": plan.compressed_experts,
-        "trellis_slab_bytes": total_trellis,
-        "x4t_sidecar_bytes": total_x4t,
+        "qsrt_atom_bytes": total_trellis,
+        "x4t_bytes": total_x4t,
         "container_bytes": total_trellis + total_x4t,
         "candidate_codebook": pool.codebook,
         "candidate_mode_ids": list(pool.mode_ids),
@@ -335,7 +349,7 @@ def validate_qsrt_artifact(
         "logical_source_bytes_covered": total_logical,
         "candidate_payload_headers_validated": validate_candidate_payload_headers,
         "source_payloads_reverified": verify_payloads,
-        "serving_gates": "pending-separate-TP12-validation",
+        "serving_gates": "pending-separate-runtime-validation",
     }
 
 

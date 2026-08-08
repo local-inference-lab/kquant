@@ -23,11 +23,12 @@ from safetensors.torch import load_file
 
 from kquant import constants as C
 from kquant.capture import index_layer_samples, load_capture
-from kquant.qsrt import TP_SIZE, tp12_logical_pair_index
+from kquant.qsrt import logical_pair_for_slot
 from scripts.summarize_qsrt_candidate_pool import summarize_candidate_pool
 
 
 KIND = "kquant_kimi_k3_qsrt_tp12_runtime_mix"
+TP_SIZE = 12
 SCHEMA_VERSION = 1
 
 
@@ -82,7 +83,7 @@ def _p24_table(layer: int, modes: torch.Tensor) -> torch.Tensor:
     for rank in range(TP_SIZE):
         logical = torch.tensor(
             [
-                tp12_logical_pair_index(layer, expert, rank)
+                logical_pair_for_slot(layer, expert, rank)
                 for expert in range(C.NUM_EXPERTS)
             ],
             dtype=torch.uint8,
@@ -292,7 +293,7 @@ def summarize_runtime_mix(
         "capture_used_for_performance_weighting_only": True,
         "interpretation": (
             "diagnostic natural-route weighting for the TP12 kernel gate; it "
-            "does not select codec modes or MXFP4 keeps"
+            "does not select codec modes or X4T promotions"
         ),
         "tp_size": TP_SIZE,
         "layers": list(selected),

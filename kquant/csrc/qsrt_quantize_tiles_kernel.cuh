@@ -12,8 +12,8 @@
 #include "exl3_compat/quant/codebook.cuh"
 
 #define QUANTIZE_TILES_K2_NUM_THREADS 1024
-#define QUANTIZE_TILES_K3_NUM_THREADS 768
-#define QUANTIZE_TILES_K4_NUM_THREADS 512
+#define QUANTIZE_TILES_K3_NUM_THREADS 640
+#define QUANTIZE_TILES_K4_NUM_THREADS 704
 #ifndef H_INF
 #define H_INF __ushort_as_half(0x7c00)
 #endif

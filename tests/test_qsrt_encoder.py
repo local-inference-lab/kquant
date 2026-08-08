@@ -13,7 +13,7 @@ from kquant.qsrt import (
     INTERMEDIATE_CHANNELS,
     RATE_TRANSFER_MODES,
     RECORDS_PER_EXPERT,
-    tp12_record_bits,
+    record_bits,
 )
 from kquant.pack.qsrt_encoder import (
     QSRTTransformSeeds,
@@ -34,7 +34,7 @@ def _scrambled_record_contexts() -> torch.Tensor:
     ("matrix", "rate_axis"), (("w1", "n"), ("w3", "n"), ("w2", "k"))
 )
 @pytest.mark.parametrize("r", [0, 1, 2])
-def test_qsrt_matrix_plan_closes_the_physical_tp12_schedule(
+def test_qsrt_matrix_plan_closes_the_physical_pair_schedule(
     matrix: str, rate_axis: str, r: int
 ) -> None:
     contexts = _scrambled_record_contexts()
@@ -49,9 +49,9 @@ def test_qsrt_matrix_plan_closes_the_physical_tp12_schedule(
         range(RECORDS_PER_EXPERT)
     )
     assert plan.physical_tile_bits == tuple(
-        bits for bits in tp12_record_bits(mode) for _ in range(8)
+        bits for bits in record_bits(mode) for _ in range(8)
     )
-    assert plan.physical_tp12_rank_bpw == (3.0,) * 12
+    assert plan.physical_pair_bpw == (3.0,) * 12
 
 
 def test_common_physical_permutation_is_matrix_independent() -> None:

@@ -1,11 +1,12 @@
-# Kimi-K3-QSRT v1 technical brief
+# Kimi-K3-QSRT technical brief
 
-Status: TP12 format/kernel implementation and calibration redesign, 2026-08-04.
+Status: TP-independent canonical storage and TP12 runtime qualification,
+2026-08-07.
 
 `QSRT` means **Quantile-Stratified Rate-shifted Trellis codec**. QSRT is an
 expert-static, fixed-payload mixed-rate trellis codec for gated
-mixture-of-experts weights. Version 1 deliberately instantiates the general
-construction for Kimi-K3 at TP12. It combines three independently useful ideas:
+mixture-of-experts weights. The Kimi-K3 construction combines three
+independently useful ideas:
 
 1. an L16 stratified-quantile graph whose transitions reconstruct finite E4M3
    values (`SQG-E4M3`);
@@ -17,14 +18,15 @@ construction for Kimi-K3 at TP12. It combines three independently useful ideas:
 The intended artifact name is `Kimi-K3-QSRT`. The first usable checkpoint will
 contain QSRT experts selected from a fresh all-expert candidate pool and X4T
 experts chosen by an exact-byte global allocator. There is no raw-MXFP4 keep
-tier in the final v1 storage contract.
+tier in the storage contract.
 
-## Frozen v1 scope
+## Frozen scope
 
 The initial production experiment is intentionally narrow:
 
 ```text
-tensor-parallel geometry       TP12 only
+canonical storage              TP-independent 32-channel balanced atoms
+qualified runtime              TP12 first; TP is not serialized in the codec
 trellis window                 L16
 reconstruction family         SQG normal -> finite E4M3, RNE
 lossy rate candidates          R0, R1, R2
@@ -36,8 +38,11 @@ calibration teacher            resident interim EXL3 checkpoint
 encoder objective              expert-stratified dense-H BlockLDLQ + routed replay
 ```
 
-TP4, TP16, alternate companders, wider rate ladders, learned per-layer
-tables, and entropy-coded hot streams are outside the supported v1 surface.
+The current performance gate is TP12 because that is the available Kimi-K3
+deployment. TP4, TP8, TP16, TP24, and TP32 are storage-valid direct-load views
+of the same artifact and require kernel qualification, not re-encoding.
+Alternate companders, wider rate ladders, learned per-layer tables, and
+entropy-coded hot streams remain outside the supported surface.
 
 ## Encoder ownership
 
@@ -52,7 +57,7 @@ encoder. No QSRT format, rate-selection, SQG, LDLQ, or CUDA change may be
 carried as a local ExLlamaV3 patch. The exact upstream-derived source retained
 in kquant is covered by `THIRD_PARTY_NOTICES.md`.
 
-## SQG-E4M3 reconstruction
+## QSRT-E4M3 reconstruction
 
 QSRT's reconstruction mechanism is the **Stratified Quantile Graph (SQG)**.
 SQG assigns the $2^L$ directed edges of an $L$-bit de Bruijn trellis
@@ -82,18 +87,123 @@ round-to-nearest-even to finite E4M3. Numerically identical E4M3 labels may
 remain on different directed edges and lead to different successors; scalar
 label collisions therefore do not collapse the richer trellis geometry.
 
-The rank-to-E4M3 law may be implemented with an E4M3-aware piecewise Chebyshev
-approximation. Instead of minimizing real-valued approximation error, its
-coefficients are constrained so finite-arithmetic evaluation lands inside the
-rounding interval of the desired E4M3 label at every discrete rank. Exhaustive
-validation over all $2^L$ ranks then proves label identity. This provides a
-compact arithmetic decoder without a 65,536-entry table.
+The public runtime profile is **QSRT-E4M3**. Its definition is the composition
+of an SQG rank map and a finite reconstruction staircase:
 
-For Kimi-K3, $L=16$. The current R44 labeler and the SQG-Cheb labeler are
-explicitly different implementation candidates for the same frozen SQG graph;
-they must not be conflated with changes to the transition topology. Bit-exact
-rank mixing and label generation live in `kquant/sqg_e4m3.py`, and encoder
-integration lives in `kquant/sqg_quantizer.py`.
+$$
+\text{codeword}
+\xrightarrow{G_K}
+r
+\xrightarrow{Y_{12}}
+\text{finite E4M3}.
+$$
+
+The graph $G_K$ and scalar law $Y_{12}$ are independent mathematical objects.
+In particular, the carry-mixed graph does not approximate an inverse CDF or a
+Chebyshev polynomial.
+
+### Carry-mixed SQG rank map
+
+For $L=16$, rate $K\in\{2,3,4\}$, and $w=16-K$, split a codeword $t$ into
+history and physical branch:
+
+$$
+h=t\mathbin{\gg}K,
+\qquad
+b=t\mathbin{\&}(2^K-1).
+$$
+
+With $M_w=2^w-1$, define
+
+$$
+\begin{aligned}
+x_0 &= h\oplus(h\gg11),\\
+x_1 &= x_0\oplus((x_0\ll11)\mathbin{\&}M_w),\\
+p &= (\mathtt{0x3FA7D929}\,x_1+\mathtt{0xC928FD8E})\bmod2^{32},\\
+\phi &= p\mathbin{\&}M_w,\\
+s_K &= p\gg(32-K),\\
+j &= \operatorname{rev}_K(b)\oplus s_K,\\
+G_K(h,b)=r &= (j\ll w)\mathbin{|}\phi.
+\end{aligned}
+$$
+
+Here $\operatorname{rev}_K$ reverses the $K$ branch bits. Both xorshifts are
+triangular bijections on $w$ bits, and `0x3FA7D929` is odd, so multiplication
+by it is invertible modulo $2^w$. Therefore $h\mapsto\phi$ is a permutation.
+For fixed $h$, $b\mapsto j$ is also a permutation. It follows that
+
+$$
+(h,b)\longleftrightarrow(j,\phi)
+$$
+
+is a bijection over all $2^{16}$ directed edges. Every state has exactly one
+outgoing branch in each of its $2^K$ strata, and every global rank occurs once.
+
+The rank bijection does not by itself specify sequence behavior. If $P(h)=\phi$
+is the phase permutation, $\pi_h(b)=j$ is the branch permutation, and $T$ is
+the de Bruijn successor, then logical stratum $j$ induces the continuation map
+
+$$
+F_j(\phi)=P\!\left(
+T\!\left(P^{-1}(\phi),\pi_{P^{-1}(\phi)}^{-1}(j)\right)
+\right).
+$$
+
+The family $\{F_j\}$ is the branch-conditioned phase-transition geometry used
+by Viterbi. It is part of $G_K$, not part of the scalar reconstruction law.
+
+### Chebyshev-derived finite staircase
+
+The exact normal staircase is defined on every global rank $r$ by
+
+$$
+u_r=\frac{r+\tfrac12}{65536},
+\qquad
+z_r=\Phi^{-1}(u_r),
+\qquad
+Y(r)=\operatorname{RNE}_{\mathrm{E4M3FN}}(1.5z_r).
+$$
+
+An E4M3-aware piecewise Chebyshev construction is a compact synthesis of this
+discrete map. For the target byte $Y(r)$, its polynomial output is constrained
+to lie inside the real interval that rounds to $Y(r)$. Exhaustive evaluation
+over all 65,536 ranks proves byte identity. Chebyshev therefore derives the
+rank-to-byte staircase; it does not participate in $G_K$.
+
+### Twelve-bit execution staircase
+
+QSRT-E4M3 compresses the exact staircase from 65,536 rank labels to 4,096
+bytes. For $q\in\{0,\ldots,4095\}$, define
+
+$$
+Y_{12}(q)=
+\operatorname{mode}\{Y(16q),Y(16q+1),\ldots,Y(16q+15)\},
+$$
+
+with the lower unsigned E4M3 byte selected on a modal tie. Runtime
+reconstruction is
+
+$$
+\widehat Y_K(h,b)=Y_{12}\!\left(G_K(h,b)\gg4\right).
+$$
+
+Thus the 12-bit table is a piecewise-constant approximation to the discrete
+Chebyshev-derived E4M3 staircase. It is not a Chebyshev evaluator and does not
+change the reference distribution. The approximation chain is
+
+$$
+\text{normal equal-probability rank}
+\longrightarrow
+\text{Chebyshev-derived finite-E4M3 label}
+\longrightarrow
+\text{modal 16-rank execution label}.
+$$
+
+The authoritative runtime rank map and 4,096-byte staircase live in B12X.
+Before building a new candidate pool, kquant must import their byte-identical
+K2/K3/K4 direct labels into `kquant/sqg_e4m3.py` and use them through
+`kquant/sqg_quantizer.py`. A payload encoded under a different graph cannot be
+relabelled in place because $\{F_j\}$ and the selected Viterbi paths differ.
 
 ## Fixed-payload rate shifting
 
@@ -132,12 +242,130 @@ QSRT redistributes rate over paired 128-channel records without changing
 payload size. A `P24` container assigns K2 to a low-priority donor record and
 K4 to a high-priority recipient, while a `P33` container assigns K3 to both.
 Each consumes six trellis bits per coefficient pair and occupies the same
-physical size. Pair ownership is rotated by layer and expert so any P24/P33
-execution imbalance is distributed across the 12 ranks.
+physical size. Pair placement is rotated over a global 96-slot atom axis by
+layer and expert so P24 work remains balanced at every supported TP view.
 
-The v1 mode is `(r13, r2)`. `w1` and `w3` share `r13` for fused execution;
+The mode is `(r13, r2)`. `w1` and `w3` share `r13` for fused execution;
 `w2` selects `r2` independently. The common physical neuron permutation does
 not require the three matrices to share a rate schedule.
+
+## TP-independent balanced-atom storage
+
+Tensor parallelism is a view over the checkpoint, not part of the codec. The
+canonical sharding unit is a balanced 32-channel atom. For logical mirrored
+record pair $i\in\{0,\ldots,11\}$ and 16-channel stripe
+$s\in\{0,\ldots,7\}$, define
+
+$$
+a=8i+s.
+$$
+
+The encoder serializes logical donor/recipient pair $i$ as physical records
+$2i$ and $2i+1$. Atom $a$ owns stripe $s$ from both of those physical
+records. In mode `Rr`, its rate pair is
+
+$$
+(K_\mathrm{low},K_\mathrm{high})=
+\begin{cases}
+(2,4),&i<r,\\
+(3,3),&i\ge r.
+\end{cases}
+$$
+
+Both cases contain exactly six trellis bits per coefficient pair. For one
+matrix, one atom therefore occupies exactly
+
+$$
+32\cdot3584\cdot\frac{3}{8}=43{,}008\ \text{bytes}.
+$$
+
+The atom bundle stores the fixed trellis fragments for `w1`, `w3`, and `w2`
+plus their three 32-value FP16 intermediate-side scale fragments:
+
+$$
+B_\mathrm{atom}
+=3(43{,}008+32\cdot2)
+=129{,}216\ \text{bytes}.
+$$
+
+There are 96 atoms per compressed expert, so atomization preserves the exact
+payload:
+
+$$
+96B_\mathrm{atom}=12{,}404{,}736\ \text{bytes per expert}.
+$$
+
+It adds no rate padding and cannot separate coupled coordinates: both sides
+of a P24/P33 pair, all three expert matrices, and all three local scale
+fragments have one atom owner.
+
+### Physical atom order
+
+Let
+
+$$
+\rho_{\ell,e}=(5e+\ell)\bmod12.
+$$
+
+The physical slot of logical atom $a$ is
+
+$$
+p=(a+8\rho_{\ell,e})\bmod96.
+$$
+
+The rotation is defined over the model-global atom axis and contains no TP
+rank. It rotates complete record pairs, leaves the stripe index unchanged,
+and is bijective for every layer/expert. The on-disk compressed tensor is
+atom-major:
+
+```text
+[96 physical atom slots, compressed experts, 129216 bytes]
+```
+
+Each physical-slot row is padded once to a 4 KiB boundary. The padding is at
+most 4,095 bytes per slot per layer, not per expert. Header, expert format
+table, and the three shared hidden-side scale vectors precede this tensor.
+
+### Shard views
+
+For any TP size $T$ dividing 96, rank $q$ owns
+
+$$
+A=96/T
+$$
+
+consecutive physical atom slots beginning at $qA$. Its local intermediate
+width is $32A=3072/T$. Consequently one rank loads one aligned contiguous
+extent per layer; no trellis bit is decoded, shifted, concatenated, or
+repacked. All practical Kimi-K3 views through TP32 are exact direct views:
+
+```text
+TP = 1, 2, 3, 4, 6, 8, 12, 16, 24, 32
+```
+
+TP48 and TP96 are also equal-width views. A shard count that does not divide
+96 still receives one aligned, contiguous range of complete atoms. The
+quotient/remainder partition covers every atom once and differs by at most one
+atom, or 32 intermediate channels, between shards. A runtime requiring equal
+local shapes pads only its disposable prepared cache; canonical bytes remain
+unchanged. Thus arbitrary resharding never separates a P24/P33 atom or
+requires trellis re-encoding.
+
+At TP12, a rank owns eight atoms, exactly 256 intermediate channels. This is
+a consequence of the canonical layout, not a serialized TP12 contract.
+
+### Load preparation
+
+The loader reads the small layer metadata and one atom range, then performs
+one GPU preparation pass that removes slot padding and transposes atom-major
+storage into the fused-MoE operand layout. It also derives P24/P33 work queues
+from `(layer, expert, physical_slot, r13, r2)`. Rate metadata is per
+expert/atom during preparation; the fused coefficient loop has no TP-dependent
+addressing and no coefficient-level rate branch. Rank-local prepared buffers
+are disposable caches and are never checkpoint files.
+
+The canonical implementation and byte-accounting reference are in
+`kquant/qsrt_storage.py`.
 
 ## Dense-H encoding and statistical selection
 
@@ -167,45 +395,40 @@ runtime rate selection.
 ## X4T exact endpoint
 
 Official MXFP4 uses four E2M1 bits per weight plus one UE8M0 scale byte per 32
-weights, or 4.25 bpw.  X4T changes no represented value:
+weights, or 4.25 bpw. X4T changes no represented value:
 
-- the packed E2M1 nibble plane is copied byte-for-byte, including both zero
-  codes;
+- every E2M1 nibble is preserved exactly, including both zero codes;
 - each scale row chooses the adjacent UE8M0 pair that covers the most entries;
-- every 16-row slab stores 16 base bytes followed by fixed-stride selector
-  bits, with values outside the chosen pair carried by a sorted uint32
-  exception stream; and
-- decoding recovers both official tensors exactly before ordinary TP12
-  sharding and W4A16 preparation.
+- selector bits and out-of-pair exceptions reproduce the complete official
+  scale plane; and
+- load preparation partitions the decoded exact matrix on 32-channel storage
+  groups, with the same equal or quotient/remainder shard rule as QSRT.
 
 The selector stream is directly indexable and needs no tile offset table,
-prefix sum, or exception search.  X4T is therefore the v1 high-quality
+prefix sum, or exception search.  X4T is therefore the high-quality
 endpoint; uniform K4 remains lossy and is not treated as a substitute for the
 official weights.  The all-expert X4T index records exact aligned bytes for
 each expert rather than relying on a nominal bpw estimate.
 
-The frozen sidecar representation uses:
+The canonical X4T layer is TP-independent and stores each promoted expert's
+three complete, independently authenticated matrix records:
 
 ```text
-one sparse sidecar per MoE layer
 4 KiB canonical header
-64 KiB fixed expert/matrix directory
-24-byte directory entry per (expert, matrix)
-full-matrix records in expert-major w1, w3, w2 order
-64-byte record header
-raw nibble bytes + compact scale payload
-4 KiB record alignment
-CRC32 for the directory and every record
+fixed expert/matrix directory
+aligned complete nibble and X4T scale records
+CRC32 for metadata and every matrix record
 strict zero padding and canonical re-encode validation
 ```
 
-Full-matrix coding is intentional: compressing after TP12 sharding would throw
-away scale-plane context, especially for the eight-column local `w2` scale
-slices.  The container is decoded into TP12 operand slices only after the
-full-matrix record has been recovered.
+The stored matrix is the source of truth; rank-local W4A16 tensors are a
+load-time cache. `w1`/`w3` partition on 32-row groups and `w2` on 32-column
+groups. Equal divisors produce identical local shapes; other shard counts use
+the same bounded uneven partition and optional cache padding as the QSRT atom
+reader. The checkpoint never stores a rank count or rank-local X4T copy.
 
-The reference record/container implementation is `kquant/x4t.py`; the scale
-codec is `kquant/mxfp4_scale_codec.py`.
+The scalar scale codec remains `kquant/mxfp4_scale_codec.py`. The existing
+full-matrix `kquant/x4t.py` layer container is the canonical exact endpoint.
 
 ### X4T runtime refinement
 
@@ -251,16 +474,15 @@ Rate shifting and high-tier selection solve different problems.
    expert removes its measured routed damage and incurs that expert's exact X4T
    record bytes rather than a fixed nominal four-bit cost.
 
-The v1 byte cap is the logical TP12 expert-container size derived from the
-validated 3p09 allocation:
+The comparison byte cap inherited from the validated 3p09 allocation is:
 
 ```text
 target container bytes = 1,058,586,247,168
 ```
 
-This is the schema-level payload/alignment budget used by both allocation
-formats, rather than `du` output that also includes serializer headers.  The
-global allocator minimizes
+The final cap must be restated in canonical atom-container bytes before the
+next allocation; TP-rank padding is not a valid budget component. The global
+allocator minimizes
 
 ```text
 sum_e D_e(choice_e) + lambda * sum_e bytes_e(choice_e)
@@ -309,63 +531,31 @@ unsupported experts. Mode-selection and final-validation corpora remain
 document-disjoint. No old R44 candidate pool is eligible for the next
 checkpoint merely because it is complete.
 
-The exact SQG decoder has also crossed the representative TP12 runtime gate.
-The production B12X W4A16 path passed dense K2/K3/K4 GEMMs, both P24 and P33
-pair orientations, and a dynamic fused SiTU MoE containing both pair types,
-including CUDA graph replay.  This establishes numerical/runtime closure of
-the codec primitive; it is not yet an end-to-end checkpoint latency result.
+The mature B12X W4A16 kernel now has one QSRT serving reconstruction:
+QSRT-E4M3. The slow exact profile-5 graph, R44, MUL1, and MCG codebook branches
+have been removed from that kernel; the exact variants remain offline teachers
+where comparisons require them. QSRT-E4M3 passes dense K2/K3/K4 reconstruction,
+P24, P33, dynamic pair selection, and CUDA graph replay closure.
 
-The native compute path is split deliberately.  The general W4A16 path keeps
-BF16/FP16 activations and widens the exact E4M3 reconstruction before MMA; it
-is the correctness fallback.  The W4A8 path converts each Hadamard-domain
-activation block to E4M3 plus UE8M0 and feeds SQG's E4M3 weights directly to
-SM120 block-scaled MMA.
+The current mature split-K W4A16 implementation measures about 56.90 us for
+P33 and 65.09 us for P24 on the production-shaped benchmark and reproduces the
+CPU decoder for P33, P24, and dynamic pair layouts. P24 remains above the
+current latency target.
 
-The production W4A8 decoder uses exact, process-global execution tables rather
-than checkpoint metadata.  For one token (16 routed rows), a 106 KiB
-asymmetric table combines direct K3 labels with packed K2/K4 phase/syndrome
-states.  At higher route concurrency, a 58 KiB table stores the packed state
-for all K2/K3/K4 histories plus the 2 KiB rank-to-E4M3 staircase.  The host
-selects between them from the already-known route shape, without inspecting
-routing decisions or synchronizing the GPU.  Both reproduce all SQG labels
-bit-for-bit, are shared by every layer and expert, use no checkpoint bytes,
-and avoid the per-CTA 20--32 KiB shared-memory codebooks considered earlier.
+## Supported reconstruction path
 
-On synthetic TP12 routed mixtures with 16 experts and CUDA graph replay, the
-complete W4A8 MoE path measured 167--320 us for 1, 2, and 4 tokens across
-P33, P24, sparse, and mixed pair-mode fixtures.  Matched W4A16 measured
-600--759 us, so W4A8 took 27.9--44.7% of the time (2.24--3.58x faster).
-Relative to the same SQG weights on W4A16, activation quantization produced
-0.199--0.222% output NMSE with cosine similarity 0.998888--0.999007.  The
-dynamic separate-`r13`/`r2` route test and CUDA graph replay pass.  These
-measurements close the synthetic kernel gate; checkpoint-derived route
-fixtures and end-to-end model latency remain pending.
-
-## Supported reconstruction paths
-
-QSRT v1 keeps only three named reconstruction profiles:
+QSRT exposes one serving profile:
 
 | Profile | Role | Contract |
 | --- | --- | --- |
-| `sqg-normal-e4m3` | legacy R44 control | clipped R44 normal staircase with native SQG reachability |
-| `sqg-cheb-normal-e4m3` | exact normal control | one full-tail finite-E4M3 normal staircase shared by K2/K3/K4 |
-| `sqg-cheb-normal-k2-q8h4-w2-e4m3` | production profile, ID 5 | the same SQG-Cheb staircase, with Q8H4 K2 reachability only for `w2` |
+| `qsrt-e4m3` | sole runtime profile | carry-mixed bijective SQG graph plus the shared 12-bit approximation to the Chebyshev-derived finite-E4M3 staircase at K2/K3/K4 |
 
-SQG-Cheb uses a dyadically range-reduced Chebyshev evaluator synthesized
-against the rounding intervals of the final finite-E4M3 labels. The evaluator
-only has to land inside the interval that rounds to the intended byte;
-exhaustive validation reproduces all 65,536 L16 labels. The history mixer,
-syndrome mixer, branch permutation, baseline phase rule, and scalar staircase
-are otherwise common across K2, K3, and K4.
+There is no runtime R44, MUL1, MCG, exact profile-5 graph, alternate K2
+staircase, or per-expert codebook selector. Those names may appear in archived
+measurements and offline research controls, but they are not valid payload or
+kernel profile identities.
 
-Q8H4 changes reachability, not reconstruction values. At physical K2, two
-branch bits still select four outgoing edges. For `w2` only, retained
-codeword bit 4 supplies a virtual third stratum bit, so each state exposes four
-of eight SQG octiles and paired history classes expose all eight. Gate/up K2
-and every K3/K4 path retain native SQG reachability. This remains one
-codebook, with no K2-specific value table and no per-expert codebook selector.
-
-The production decision is supported by a confirmation study on 384 unseen,
+The preceding profile-5 decision was supported by a confirmation study on 384 unseen,
 support-stratified experts from layers 1, 24, and 40. It used production
 Hadamard ordering, TF32 dense-H BlockLDLQ, decoded-upstream conditional `H2`,
 the complete `R0/R1/R2` grid, and document-disjoint confirmation and external
@@ -382,11 +572,13 @@ and produced a +0.07074% to +0.20312% interval. Every fit-support quartile
 improved. The native K2 profile's aggregate fixed `R0/R2` exchange was
 slightly harmful relative to its own `R0/R0`; Q8H4 made it beneficial.
 
-The production encoder contract is therefore profile ID 5, rotation draw
-zero, `h2_reverse`, folded-scale power zero, decoded-upstream conditional
-expert-local `H2`, and TF32 dense-H LDLQ. R44 and base SQG-Cheb remain useful
-controls. Alternate per-rate staircases, companders, and graph variants are
-not supported code paths.
+That study remains evidence for QSRT's rate-shift architecture and calibration
+policy, but its stored paths are not reusable under the new graph. The next
+encoder contract uses `qsrt-e4m3`, rotation draw zero, `h2_reverse`,
+folded-scale power zero, decoded-upstream conditional expert-local `H2`, and
+TF32 dense-H LDLQ. The profile-5 pool is now a teacher/comparison artifact;
+the serving candidate pool must be re-encoded because changing continuation
+geometry changes Viterbi paths.
 
 ### Offline trellis-encoder optimization
 
@@ -424,7 +616,7 @@ re-encoding after a substantially broader audit.
 
 ### Interim all-expert mode-selection evidence
 
-The fresh profile-ID-5 production pool is being built at
+The profile-ID-5 production pool was built at
 `/models/Kimi-K3-QSRT-CHEB-Q8H4-CANDIDATES-v1`.  At the 2026-08-05 04:59 PDT
 snapshot, 44 complete atomic selection sidecars contained 27,176 unique
 experts across 33 partly or fully represented layers.  A nonzero mode was
@@ -451,12 +643,12 @@ show that the recovered effect is not confined to a few marginal R1 choices:
 the down axis remains the more frequent shifter, and joint `w13`/`w2` shifts
 are also common.
 
-This snapshot is confirmation-stage incidence, not a final model-wide mode
+This snapshot is historical confirmation-stage incidence, not a final model-wide mode
 distribution or a quality result.  The work-balanced schedule makes the set
 of completed layers nonuniform, incomplete sidecars are excluded, untouched
-validation must still verify generalization, and X4T endpoint allocation is a
-separate exact-byte optimization.  Freeze and cite final frequencies only
-after all 82,432 expert selections are sealed.
+validation did not turn it into a QSRT-E4M3 pool, and X4T endpoint allocation
+is a separate exact-byte optimization. A new all-expert encode must recompute
+the rate modes under the current graph and staircase.
 
 ## Execution checklist
 
@@ -465,7 +657,7 @@ after all 82,432 expert selections are sealed.
 - [x] Validate SQG endpoints and the separate `(r13,r2)` R0/R1/R2 gate.
 - [x] Start the resumable all-82,432-expert SQG candidate pool on 12 GPUs.
 - [x] Complete and seal the all-82,432-expert R44 SQG candidate pool.
-- [x] Freeze and unit-test exact X4T matrix records and sparse layer sidecars.
+- [x] Freeze and unit-test the exact X4T numerical representation.
 - [x] Add exact X4T load-time reconstruction and TP12 W4A16 preparation.
 - [x] Implement exact fixed-stride X4T records and the one-launch, graph-safe
       routed TP12 W4A16 scale predecoder.
@@ -485,7 +677,7 @@ after all 82,432 expert selections are sealed.
 - [ ] Score selected candidates on the untouched validation capture and run
       the matched-R0 rate-shift policy audit.
 - [ ] Freeze the global QSRT allocation at the target checkpoint budget.
-- [ ] Materialize compressed slabs plus selected X4T sidecars into a fresh
+- [ ] Materialize QSRT and X4T physical-slot extents into a fresh atom-major
       artifact.
 - [ ] Close the materialized artifact's structural validation, malformed-input
       rejection, exact state decode, exact X4T source reconstruction, and exact

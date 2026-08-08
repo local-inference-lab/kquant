@@ -1,6 +1,6 @@
 # QSRT calibration and dense-H workflow
 
-This document defines the calibration contract for the next TP12
+This document defines the calibration contract for the next
 `Kimi-K3-QSRT` checkpoint. The resident interim EXL3 checkpoint supplies
 routing and activation observations. The official Kimi-K3 checkpoint remains
 the offline source of canonical MXFP4 expert weights.

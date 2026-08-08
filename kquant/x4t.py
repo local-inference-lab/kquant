@@ -106,9 +106,9 @@ def pack_x4t_scale_components(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return X4T's GPU-facing fixed stream and exception words.
 
-    This is the payload behind the 64-byte standalone scale header.  Exposing
-    it directly lets TP-specific checkpoint builders preserve X4T all the way
-    to the GPU instead of reconstructing a dense scale plane at model load.
+    This is the payload behind the 64-byte standalone scale header. Exposing
+    it directly lets checkpoint preparation preserve X4T all the way to the
+    GPU instead of reconstructing a dense scale plane at model load.
     """
 
     rows, columns = _validate_scale(scale)
@@ -534,46 +534,64 @@ def x4t_expert_storage_bytes(scales: dict[str, torch.Tensor]) -> int:
     )
 
 
-def tp12_mxfp4_rank_components(
-    raw: "PackedMXFP4Matrix",
+def partition_x4t_components(
+    raw: "PackedMXFP4Matrix | X4TMatrix",
     matrix: str,
-    rank: int,
+    shard_count: int,
+    shard_index: int,
+    *,
+    require_equal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Slice one exact MXFP4 matrix into the production TP12 operand shape."""
+    """Slice an X4T-exact matrix on 32-channel storage groups.
 
-    from kquant.qsrt import (
-        INTERMEDIATE_CHANNELS,
-        RANK_MATRIX_WEIGHTS,
-        RANK_MXFP4_MATRIX_BYTES,
-        TP_SIZE,
-    )
+    Equal divisors yield identical local operand shapes. Other shard counts
+    cover the same canonical matrix with widths differing by one 32-channel
+    group, suitable for offline resharding or padded load-time preparation.
+    """
+
+    from kquant.qsrt import INTERMEDIATE_CHANNELS, LATENT_CHANNELS
     from kquant.source_weights import PackedMXFP4Matrix
 
-    if not isinstance(raw, PackedMXFP4Matrix):
-        raise TypeError("raw must be a PackedMXFP4Matrix")
+    if isinstance(raw, X4TMatrix):
+        if raw.matrix != matrix:
+            raise ValueError("X4T matrix identity does not match the requested matrix")
+    elif not isinstance(raw, PackedMXFP4Matrix):
+        raise TypeError("raw must be a PackedMXFP4Matrix or X4TMatrix")
     _validate_matrix_tensors(
         matrix,
         raw.packed,
         raw.scale,
         production_shape=True,
     )
-    if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < TP_SIZE:
-        raise ValueError(f"rank must be in 0..{TP_SIZE - 1}")
-    width = INTERMEDIATE_CHANNELS // TP_SIZE
+    groups = INTERMEDIATE_CHANNELS // C.MXFP4_BLOCK
+    if isinstance(shard_count, bool) or not isinstance(shard_count, int):
+        raise TypeError("shard_count must be an integer")
+    if not 1 <= shard_count <= groups:
+        raise ValueError(f"shard_count must be in 1..{groups}")
+    if isinstance(shard_index, bool) or not isinstance(shard_index, int):
+        raise TypeError("shard_index must be an integer")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(f"shard_index must be in 0..{shard_count - 1}")
+    if require_equal and groups % shard_count:
+        raise ValueError("shard_count must divide the 32-channel X4T group axis")
+    quotient, remainder = divmod(groups, shard_count)
+    group_count = quotient + int(shard_index < remainder)
+    first_group = shard_index * quotient + min(shard_index, remainder)
+    first = first_group * C.MXFP4_BLOCK
+    width = group_count * C.MXFP4_BLOCK
     if matrix in ("w1", "w3"):
-        packed = raw.packed.narrow(0, rank * width, width).contiguous()
-        scale = raw.scale.narrow(0, rank * width, width).contiguous()
+        packed = raw.packed.narrow(0, first, width).contiguous()
+        scale = raw.scale.narrow(0, first, width).contiguous()
     else:
         packed_width = width // 2
         scale_width = width // C.MXFP4_BLOCK
-        packed = raw.packed.narrow(1, rank * packed_width, packed_width).contiguous()
-        scale = raw.scale.narrow(1, rank * scale_width, scale_width).contiguous()
-    if (
-        packed.numel() != RANK_MATRIX_WEIGHTS // 2
-        or scale.numel() != RANK_MATRIX_WEIGHTS // C.MXFP4_BLOCK
-        or packed.numel() + scale.numel() != RANK_MXFP4_MATRIX_BYTES
+        packed = raw.packed.narrow(1, first // 2, packed_width).contiguous()
+        scale = raw.scale.narrow(1, first_group, scale_width).contiguous()
+    shard_weights = width * LATENT_CHANNELS
+    if packed.numel() != shard_weights // 2 or scale.numel() != (
+        shard_weights // C.MXFP4_BLOCK
     ):
-        raise AssertionError("TP12 MXFP4 matrix byte accounting drifted")
+        raise AssertionError("X4T shard byte accounting drifted")
     return packed, scale
 
 

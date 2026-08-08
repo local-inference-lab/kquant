@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a completed TP12 Kimi-K3 QSRT artifact."""
+"""Validate a completed TP-independent Kimi-K3 QSRT artifact."""
 
 from __future__ import annotations
 
