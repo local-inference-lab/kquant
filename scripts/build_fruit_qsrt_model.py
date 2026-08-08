@@ -524,7 +524,7 @@ def _rate_sweep_section(payload: dict[str, object]) -> str:
         validation_reference = 0.0
         endpoint_bytes = 0.0
         endpoint_bpw = 0.0
-        for index, result in enumerate(measured):
+        for result in measured:
             rates = result.get("rates")
             if not isinstance(rates, dict):
                 raise TypeError("Fruit measured rate result is malformed")
@@ -1082,12 +1082,14 @@ def _seed_parts(
             try:
                 shutil.copy2(source_tensor, target_tensor)
                 shutil.copy2(source_manifest, target_manifest)
-            except OSError:
+            except OSError as exc:
                 for target in (target_tensor, target_manifest):
                     if target.is_file():
                         target.unlink()
                     elif target.exists():
-                        raise ValueError(f"unexpected Fruit QSRT part path: {target}")
+                        raise ValueError(
+                            f"unexpected Fruit QSRT part path: {target}"
+                        ) from exc
                 continue
             copied += 1
     return copied
