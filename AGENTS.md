@@ -28,7 +28,7 @@ or external EXL encoder APIs.
   shards.
 - The lossy search is `R0/R1/R2`, with one `r13` decision shared by `w1` and
   `w3` and an independent `r2` decision for `w2`.
-- `qsrt-e4m3` is the primary and sole runtime codebook. It composes the
+- `qsrt_sqg_e4m3` is the primary and sole runtime codebook. It composes the
   carry-mixed bijective SQG graph with the 4,096-byte modal T12 approximation
   to the Chebyshev-derived finite-E4M3 staircase. K2/K3/K4 use one graph
   construction and one scalar law; rate changes only the history/branch split.
@@ -43,7 +43,7 @@ or external EXL encoder APIs.
   accepted a nonzero rate shift for 6,691 experts (24.62%); `w2` selected R1+
   for 24.13% and coupled `w13` selected R1+ for 20.35%. This is substantial
   evidence that rate shifting remains useful with the conditional dense-H
-  path, but it is not reusable under `qsrt-e4m3` and is not the final
+  path, but it is not reusable under `qsrt_sqg_e4m3` and is not the final
   82,432-expert frequency:
   the work-balanced partial schedule is not a uniform layer sample.
 - X4T is the exact endpoint. There is no raw-MXFP4 or old variable-rate X4 tier
@@ -75,7 +75,7 @@ or external EXL encoder APIs.
   A layer-24, 20-expert, production-shaped endpoint run fell from about 136 to
   89 seconds and emitted the same candidate-payload SHA-256 as the preceding
   C128 implementation. That run qualified the encoder optimization but does
-  not make its profile-5 payload reusable by `qsrt-e4m3`.
+  not make its profile-5 payload reusable by `qsrt_sqg_e4m3`.
 - `C32` remains a research-only screening context. On the initial 20-expert
   comparison it put every C128 confirmation winner in its top three, but that
   evidence is not broad enough to change production policy. Candidate
@@ -86,7 +86,7 @@ or external EXL encoder APIs.
   `h2_reverse`; every tested nonzero folded-scale strength (`0.25`, `0.5`,
   `1.0`) also increased routed validation SSE. Keep those alternatives as
   research controls rather than silently enabling them in production.
-- Build `qsrt-e4m3` only into a fresh candidate pool. Do not resume or mix the
+- Build `qsrt_sqg_e4m3` only into a fresh candidate pool. Do not resume or mix the
   profile-ID-5 or R44 candidate shards into the new artifact; changing the
   graph changes the Viterbi paths and requires full re-encoding.
 
@@ -313,7 +313,7 @@ time. It must use the new capture, the validated Hessian bundle, separate
   --hessians <validated-kqhess> \
   --hessian-policy captured_blend \
   --mode-ids 0,1,2 \
-  --codebook qsrt-e4m3 \
+  --codebook qsrt_sqg_e4m3 \
   --layout qsrt_guarded_reuse \
   --permutation-policy h2_reverse \
   --folded-scale-power 0 \

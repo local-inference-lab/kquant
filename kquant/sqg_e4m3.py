@@ -5,7 +5,7 @@ deliberately separates the rolling trellis graph from its numerical labels:
 the encoder still stores K branch bits per coefficient, while a deterministic
 K-specific mapping turns each 16-bit transition state into an E4M3 value.
 
-The primary ``qsrt-e4m3`` profile composes the carry-mixed bijective SQG rank
+The primary ``qsrt_sqg_e4m3`` profile composes the carry-mixed bijective SQG rank
 map with a modal 12-bit compression of the Chebyshev-derived finite-E4M3
 staircase.  The older exact-graph and R44 mappings remain explicit research
 controls.  All paths return raw E4M3 bytes so the offline encoder and serving
@@ -24,7 +24,7 @@ SQG_CHEB_NORMAL_E4M3 = "sqg-cheb-normal-e4m3"
 SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3 = (
     "sqg-cheb-normal-k2-q8h4-w2-e4m3"
 )
-QSRT_E4M3 = "qsrt-e4m3"
+QSRT_E4M3 = "qsrt_sqg_e4m3"
 
 _TRANSITIONS = 1 << 16
 _CLIP = 1.0 / 2048.0
@@ -248,7 +248,7 @@ def qsrt_e4m3_rank_lut_bytes() -> torch.Tensor:
     Each byte represents sixteen consecutive ranks of the exact normal
     staircase.  The modal byte is selected per block; ties select the lower
     raw byte.  This is the same immutable construction used by the B12X
-    ``qsrt-e4m3`` decoder.
+    ``qsrt_sqg_e4m3`` decoder.
     """
 
     exact = sqg_cheb_normal_rank_e4m3_bytes().reshape(1 << 12, 16)

@@ -551,7 +551,7 @@ QSRT exposes one serving profile:
 
 | Profile | Role | Contract |
 | --- | --- | --- |
-| `qsrt-e4m3` | sole runtime profile | carry-mixed bijective SQG graph plus the shared 12-bit approximation to the Chebyshev-derived finite-E4M3 staircase at K2/K3/K4 |
+| `qsrt_sqg_e4m3` | sole runtime profile | carry-mixed bijective SQG graph plus the shared 12-bit approximation to the Chebyshev-derived finite-E4M3 staircase at K2/K3/K4 |
 
 There is no runtime R44, MUL1, MCG, exact profile-5 graph, alternate K2
 staircase, or per-expert codebook selector. Those names may appear in archived
@@ -577,7 +577,7 @@ slightly harmful relative to its own `R0/R0`; Q8H4 made it beneficial.
 
 That study remains evidence for QSRT's rate-shift architecture and calibration
 policy, but its stored paths are not reusable under the new graph. The next
-encoder contract uses `qsrt-e4m3`, rotation draw zero, `h2_reverse`,
+encoder contract uses `qsrt_sqg_e4m3`, rotation draw zero, `h2_reverse`,
 folded-scale power zero, decoded-upstream conditional expert-local `H2`, and
 TF32 dense-H LDLQ. The profile-5 pool is now a teacher/comparison artifact;
 the serving candidate pool must be re-encoded because changing continuation

@@ -234,7 +234,7 @@ def validate_qsrt_materialization_allocation(
                 f"{meta.get(name)!r} != {expected!r}"
             )
     if pool.codebook != CODEBOOK_QSRT_E4M3 or pool.mode_ids != PHASE1_MODE_IDS:
-        raise ValueError("QSRT materialization requires qsrt-e4m3 and R0/R1/R2")
+        raise ValueError("QSRT materialization requires qsrt_sqg_e4m3 and R0/R1/R2")
     if x4t_index.manifest.get("source_revision") != pool.manifest.get(
         "source_revision"
     ):

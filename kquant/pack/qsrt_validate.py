@@ -134,7 +134,7 @@ def validate_qsrt_artifact(
         raise ValueError("QSRT build codec contract is missing")
     codebook = codec_contract.get("trellis_codebook")
     if codebook != CODEBOOK_QSRT_E4M3:
-        raise ValueError("QSRT build must use the qsrt-e4m3 runtime codebook")
+        raise ValueError("QSRT build must use the qsrt_sqg_e4m3 runtime codebook")
     expected_contract = {
         "trellis_codebook": codebook,
         "trellis_modes": list(PHASE1_MODE_IDS),
