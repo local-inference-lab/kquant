@@ -10,6 +10,7 @@ memory mapped and materializing only the requested matrix.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import stat
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
+from safetensors import safe_open
 
 FruitMatrix = Literal["w1", "w3", "w2"]
 FruitRepresentation = Literal["stacked", "per_expert"]
@@ -444,6 +446,252 @@ class FruitCheckpointStore:
         self._assert_source_unchanged()
         expected_shape = _matrix_shape(self.spec, matrix)
         if tuple(result.shape) != expected_shape:
+            raise AssertionError("validated Fruit matrix changed shape")
+        return result
+
+
+class FruitSafetensorsStore:
+    """Authenticated HF safetensors fallback for Fruit expert matrices."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        expected_manifest_sha256: str,
+        spec: FruitModelSpec = FRUIT_ANNEALED_SPEC,
+    ) -> None:
+        supplied_root = Path(root)
+        if supplied_root.is_symlink():
+            raise ValueError("Fruit safetensors root must not be a symbolic link")
+        try:
+            resolved = supplied_root.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Fruit safetensors root not found: {supplied_root}"
+            ) from exc
+        if not resolved.is_dir():
+            raise ValueError("Fruit safetensors root must name a directory")
+        if (
+            not isinstance(expected_manifest_sha256, str)
+            or _SHA256_RE.fullmatch(expected_manifest_sha256) is None
+        ):
+            raise ValueError("expected_manifest_sha256 must be 64 lowercase hex digits")
+
+        manifest_path = resolved / "MANIFEST.sha256"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise FileNotFoundError(manifest_path)
+        actual_manifest_sha256 = _sha256(manifest_path)
+        if actual_manifest_sha256 != expected_manifest_sha256:
+            raise ValueError(
+                "Fruit safetensors manifest SHA-256 mismatch: "
+                f"got {actual_manifest_sha256}, "
+                f"expected {expected_manifest_sha256}"
+            )
+        entries: dict[str, str] = {}
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                raise ValueError(f"malformed Fruit safetensors manifest line: {line!r}")
+            digest, filename = fields
+            if (
+                _SHA256_RE.fullmatch(digest) is None
+                or Path(filename).name != filename
+                or filename in entries
+            ):
+                raise ValueError(f"invalid Fruit safetensors manifest line: {line!r}")
+            entries[filename] = digest
+        required = {"config.json", "model.safetensors.index.json"}
+        if not required.issubset(entries):
+            raise ValueError("Fruit safetensors manifest omits config or tensor index")
+
+        file_identities: dict[str, tuple[int, int, int, int, int]] = {}
+        for filename, expected_sha256 in entries.items():
+            path = resolved / filename
+            if path.is_symlink() or not path.is_file():
+                raise FileNotFoundError(path)
+            before = path.stat()
+            actual_sha256 = _sha256(path)
+            after = path.stat()
+            before_identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if before_identity != after_identity:
+                raise ValueError(
+                    "Fruit safetensors file changed while it was authenticated"
+                )
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    f"Fruit safetensors SHA-256 mismatch for {filename}: "
+                    f"got {actual_sha256}, expected {expected_sha256}"
+                )
+            file_identities[filename] = after_identity
+
+        config = json.loads((resolved / "config.json").read_text(encoding="utf-8"))
+        expected_config = {
+            "dtype": "bfloat16",
+            "hidden_size": spec.hidden_size,
+            "moe_intermediate_size": spec.intermediate_size,
+            "n_routed_experts": spec.num_experts,
+            "num_hidden_layers": spec.mtp_layer,
+        }
+        if not isinstance(config, dict) or any(
+            config.get(name) != value for name, value in expected_config.items()
+        ):
+            raise ValueError("Fruit safetensors model geometry mismatch")
+        rope_theta = config.get("rope_theta")
+        if rope_theta is None:
+            rope_parameters = config.get("rope_parameters")
+            if isinstance(rope_parameters, dict):
+                rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta != spec.trained_rope_theta:
+            raise ValueError("Fruit safetensors trained rope theta mismatch")
+
+        index = json.loads(
+            (resolved / "model.safetensors.index.json").read_text(encoding="utf-8")
+        )
+        if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
+            raise TypeError("Fruit safetensors index has no weight_map")
+        weight_map = index["weight_map"]
+        if any(
+            not isinstance(name, str)
+            or not isinstance(filename, str)
+            or Path(filename).name != filename
+            or filename not in entries
+            for name, filename in weight_map.items()
+        ):
+            raise ValueError("Fruit safetensors index has invalid entries")
+
+        keys = {
+            (layer, expert, matrix): (
+                f"model.layers.{layer}.mlp.experts.{expert}."
+                f"{_PROJECTION_NAMES[matrix]}.weight"
+            )
+            for layer in (*spec.layers, spec.mtp_layer)
+            for expert in range(spec.num_experts)
+            for matrix in FRUIT_EXPERT_MATRICES
+        }
+        expected_expert_keys = set(keys.values())
+        actual_expert_keys = {name for name in weight_map if ".mlp.experts." in name}
+        if actual_expert_keys != expected_expert_keys:
+            raise ValueError(
+                "Fruit safetensors expert inventory is not exact: "
+                + _format_key_difference(
+                    expected_expert_keys - actual_expert_keys,
+                    actual_expert_keys - expected_expert_keys,
+                )
+            )
+
+        names_by_file: dict[str, list[tuple[str, FruitMatrix]]] = {}
+        for (_, _, matrix), name in keys.items():
+            names_by_file.setdefault(weight_map[name], []).append((name, matrix))
+        for filename, names in names_by_file.items():
+            with safe_open(resolved / filename, framework="pt", device="cpu") as handle:
+                available = set(handle.keys())
+                for name, matrix in names:
+                    if name not in available:
+                        raise ValueError(
+                            f"Fruit safetensors shard {filename} omits {name}"
+                        )
+                    tensor = handle.get_slice(name)
+                    if tensor.get_dtype() != "BF16":
+                        raise ValueError(
+                            f"{name} has dtype {tensor.get_dtype()}, expected BF16"
+                        )
+                    if tuple(tensor.get_shape()) != _matrix_shape(spec, matrix):
+                        raise ValueError(
+                            f"{name} has shape {tuple(tensor.get_shape())}, "
+                            f"expected {_matrix_shape(spec, matrix)}"
+                        )
+
+        self.path = resolved
+        self.spec = spec
+        self.representation: FruitRepresentation = "per_expert"
+        self._entries = entries
+        self._file_identities = file_identities
+        self._weight_map: dict[str, str] = weight_map
+        self._keys = keys
+        self.evidence: dict[str, object] = {
+            "checkpoint_sha256": spec.checkpoint_sha256,
+            "conventions": {
+                "kind": "legacy",
+                "trained_rope_theta": float(spec.trained_rope_theta),
+                "trained_rope_theta_provenance": "model_spec",
+                "serve_conv_v": spec.serve_conv_v,
+            },
+            "expert_inventory": {
+                "dtypes": ["torch.bfloat16"],
+                "matrices": list(FRUIT_EXPERT_MATRICES),
+                "representation": "per_expert",
+                "tensor_count": len(keys),
+            },
+            "geometry": {
+                "hidden_size": spec.hidden_size,
+                "intermediate_size": spec.intermediate_size,
+                "layers": list(spec.layers),
+                "mtp_layer": spec.mtp_layer,
+                "num_experts": spec.num_experts,
+            },
+            "kind": "kquant-fruit-source-preflight",
+            "model_id": spec.model_id,
+            "path": str(resolved),
+            "safetensors_manifest_sha256": actual_manifest_sha256,
+            "source_container": "hf_bf16_safetensors",
+            "status": "pass",
+            "version": 1,
+        }
+
+    def _assert_file_unchanged(self, filename: str) -> None:
+        path = self.path / filename
+        try:
+            current = path.stat()
+        except OSError as exc:
+            raise ValueError(
+                "Fruit safetensors source became unavailable after authentication"
+            ) from exc
+        identity = (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+        if identity != self._file_identities[filename]:
+            raise ValueError("Fruit safetensors source changed after authentication")
+
+    def load_matrix(
+        self,
+        layer: int,
+        expert: int,
+        matrix: str,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Materialize one HF expert matrix as contiguous float32."""
+
+        _prefix(self.spec, layer)
+        if type(expert) is not int or not 0 <= expert < self.spec.num_experts:
+            raise ValueError(f"expert must be in 0..{self.spec.num_experts - 1}")
+        if matrix not in FRUIT_EXPERT_MATRICES:
+            raise ValueError(f"matrix must be one of {FRUIT_EXPERT_MATRICES}")
+        key = self._keys[(layer, expert, matrix)]
+        filename = self._weight_map[key]
+        self._assert_file_unchanged(filename)
+        with safe_open(self.path / filename, framework="pt", device="cpu") as handle:
+            source = handle.get_tensor(key)
+        target = torch.device("cpu") if device is None else torch.device(device)
+        result = source.to(device=target, dtype=torch.float32, copy=True).contiguous()
+        self._assert_file_unchanged(filename)
+        if tuple(result.shape) != _matrix_shape(self.spec, matrix):
             raise AssertionError("validated Fruit matrix changed shape")
         return result
 

@@ -15,10 +15,16 @@ from types import ModuleType
 from typing import Protocol
 
 import torch
+import torch.nn.functional as F
 
+from kquant.candidate_hessian import weighted_effective_sample_size
 from kquant.exl3_reference import (
     CODEBOOK_SQG_XOR_CHEB_T12,
     decode_qsrt_weight,
+)
+from kquant.fruit_calibration import (
+    FruitCalibrationRows,
+    FruitExpertCalibration,
 )
 from kquant.ldlq import SIGMA_REG, make_shared_h
 from kquant.logical_qsrt import (
@@ -33,6 +39,14 @@ from kquant.logical_qsrt import (
     repack_record_axis,
 )
 from kquant.qsrt import pack_trellis_edges, unpack_trellis_states
+from kquant.qsrt_candidates import (
+    PHASE1_MIN_CONFIRMATION_DOCUMENTS,
+    PHASE1_MIN_FIT_DOCUMENTS,
+    build_expert_hessians,
+    deterministic_expert_seed,
+    functional_sse_by_request,
+    select_phase1_rate_pair,
+)
 from kquant.sqg_e4m3 import sqg_xor_cheb_t12_bytes
 from kquant.tp_simulator import comparison_metrics
 
@@ -40,6 +54,7 @@ FRUIT_QSRT_SCHEMA = "kquant_fruit_qsrt_pairs_v1"
 FRUIT_QSRT_PROFILE_ID = 1
 FRUIT_QSRT_CODEBOOK = CODEBOOK_SQG_XOR_CHEB_T12
 FRUIT_QSRT_MATRICES: tuple[MatrixName, ...] = ("w1", "w3", "w2")
+FRUIT_CALIBRATION_MIN_FIT_EFFECTIVE_ROWS = 32.0
 FRUIT_QSRT_RECORD_CHANNELS = FRUIT_QSRT_GEOMETRY.record_channels
 FRUIT_QSRT_RECORD_TILES = FRUIT_QSRT_RECORD_CHANNELS // 16
 FRUIT_QSRT_PAIR_COUNT = FRUIT_QSRT_GEOMETRY.record_count // 2
@@ -50,6 +65,43 @@ FRUIT_QSRT_MATRIX_BYTES = (
     // 8
 )
 FRUIT_QSRT_PAIR_WORDS = FRUIT_QSRT_MATRIX_BYTES // FRUIT_QSRT_PAIR_COUNT // 2
+FRUIT_QSRT_ATOM_SCHEMA = "kquant_fruit_qsrt_atoms_v1"
+FRUIT_QSRT_ATOM_STORAGE = "qsrt_atoms_v1"
+FRUIT_QSRT_ATOM_CHANNELS = 32
+FRUIT_QSRT_ATOMS_PER_PAIR = FRUIT_QSRT_RECORD_CHANNELS // (
+    FRUIT_QSRT_ATOM_CHANNELS // 2
+)
+FRUIT_QSRT_ATOMS_PER_EXPERT = FRUIT_QSRT_PAIR_COUNT * FRUIT_QSRT_ATOMS_PER_PAIR
+FRUIT_QSRT_MATRIX_ATOM_TRELLIS_BYTES = (
+    FRUIT_QSRT_ATOM_CHANNELS * FRUIT_QSRT_GEOMETRY.hidden_channels * 3 // 8
+)
+FRUIT_QSRT_MATRIX_ATOM_SCALE_BYTES = FRUIT_QSRT_ATOM_CHANNELS * torch.float16.itemsize
+FRUIT_QSRT_ATOM_TRELLIS_BYTES = 3 * FRUIT_QSRT_MATRIX_ATOM_TRELLIS_BYTES
+FRUIT_QSRT_ATOM_BUNDLE_BYTES = (
+    FRUIT_QSRT_ATOM_TRELLIS_BYTES + 3 * FRUIT_QSRT_MATRIX_ATOM_SCALE_BYTES
+)
+FRUIT_QSRT_FORMAT_SECTION_BYTES = 4096
+FRUIT_QSRT_STORAGE_ALIGNMENT = 4096
+FRUIT_QSRT_FORMAT_TENSOR = "_qsrt_format_section"
+FRUIT_QSRT_SHARED_SCALE_TENSOR = "_qsrt_shared_scale_section"
+FRUIT_QSRT_ATOM_TENSOR = "qsrt_atoms"
+FRUIT_QSRT_ATOM_TENSORS = frozenset(
+    {
+        FRUIT_QSRT_FORMAT_TENSOR,
+        FRUIT_QSRT_SHARED_SCALE_TENSOR,
+        FRUIT_QSRT_ATOM_TENSOR,
+    }
+)
+_FRUIT_QSRT_MATRIX_ATOM_TRELLIS_OFFSETS = {
+    "w1": 0,
+    "w3": FRUIT_QSRT_MATRIX_ATOM_TRELLIS_BYTES,
+    "w2": 2 * FRUIT_QSRT_MATRIX_ATOM_TRELLIS_BYTES,
+}
+_FRUIT_QSRT_MATRIX_ATOM_SCALE_OFFSETS = {
+    "w1": FRUIT_QSRT_ATOM_TRELLIS_BYTES,
+    "w3": FRUIT_QSRT_ATOM_TRELLIS_BYTES + FRUIT_QSRT_MATRIX_ATOM_SCALE_BYTES,
+    "w2": FRUIT_QSRT_ATOM_TRELLIS_BYTES + 2 * FRUIT_QSRT_MATRIX_ATOM_SCALE_BYTES,
+}
 FRUIT_QSRT_ARTIFACT_TENSORS = (
     "expert_ids",
     "formats",
@@ -450,6 +502,392 @@ def unpack_fruit_trellis(
     return output
 
 
+def _validate_fruit_pair_payload(
+    payload: torch.Tensor, mode: LogicalRateMode, matrix: MatrixName
+) -> None:
+    if matrix not in FRUIT_QSRT_MATRICES:
+        raise ValueError(f"unknown Fruit expert matrix: {matrix!r}")
+    if not isinstance(mode, LogicalRateMode) or mode.record_count != 4:
+        raise ValueError("Fruit atom packing requires one four-record rate mode")
+    if payload.dtype != torch.int16 or tuple(payload.shape) != (
+        FRUIT_QSRT_PAIR_COUNT,
+        FRUIT_QSRT_PAIR_WORDS,
+    ):
+        raise ValueError(
+            "Fruit atom packing requires contiguous int16 pair payload "
+            f"{(FRUIT_QSRT_PAIR_COUNT, FRUIT_QSRT_PAIR_WORDS)}"
+        )
+    if not payload.is_contiguous():
+        raise ValueError("Fruit atom packing requires a contiguous pair payload")
+
+
+def pack_fruit_matrix_atoms(
+    payload: torch.Tensor,
+    mode: LogicalRateMode,
+    *,
+    matrix: MatrixName,
+) -> torch.Tensor:
+    """Transpose one fixed-pair matrix into 16 logical 32-channel atoms."""
+
+    _validate_fruit_pair_payload(payload, mode, matrix)
+    hidden_tiles = FRUIT_QSRT_GEOMETRY.hidden_channels // 16
+    words_per_atom = FRUIT_QSRT_MATRIX_ATOM_TRELLIS_BYTES // torch.int16.itemsize
+    output = torch.empty(
+        (FRUIT_QSRT_ATOMS_PER_EXPERT, words_per_atom),
+        dtype=torch.int16,
+        device=payload.device,
+    )
+    rates = paired_record_bits(mode)
+    fc1 = matrix in ("w1", "w3")
+    for pair in range(FRUIT_QSRT_PAIR_COUNT):
+        pair_payload = payload[pair]
+        cursor = 0
+        sides: list[torch.Tensor] = []
+        for side in range(2):
+            bits = rates[2 * pair + side]
+            side_words = hidden_tiles * FRUIT_QSRT_ATOMS_PER_PAIR * 16 * bits
+            side_payload = pair_payload.narrow(0, cursor, side_words)
+            if fc1:
+                side_payload = side_payload.reshape(
+                    hidden_tiles, FRUIT_QSRT_ATOMS_PER_PAIR, 16 * bits
+                ).permute(1, 0, 2)
+            else:
+                side_payload = side_payload.reshape(
+                    FRUIT_QSRT_ATOMS_PER_PAIR, hidden_tiles, 16 * bits
+                )
+            sides.append(side_payload.reshape(FRUIT_QSRT_ATOMS_PER_PAIR, -1))
+            cursor += side_words
+        if cursor != FRUIT_QSRT_PAIR_WORDS:
+            raise AssertionError("Fruit atom packer did not consume one pair")
+        begin = pair * FRUIT_QSRT_ATOMS_PER_PAIR
+        output.narrow(0, begin, FRUIT_QSRT_ATOMS_PER_PAIR).copy_(
+            torch.cat(sides, dim=1)
+        )
+    return output.contiguous()
+
+
+def unpack_fruit_matrix_atoms(
+    atoms: torch.Tensor,
+    mode: LogicalRateMode,
+    *,
+    matrix: MatrixName,
+) -> torch.Tensor:
+    """Invert :func:`pack_fruit_matrix_atoms` without decoding trellis states."""
+
+    if matrix not in FRUIT_QSRT_MATRICES:
+        raise ValueError(f"unknown Fruit expert matrix: {matrix!r}")
+    words_per_atom = FRUIT_QSRT_MATRIX_ATOM_TRELLIS_BYTES // torch.int16.itemsize
+    if (
+        atoms.dtype != torch.int16
+        or tuple(atoms.shape) != (FRUIT_QSRT_ATOMS_PER_EXPERT, words_per_atom)
+        or not atoms.is_contiguous()
+    ):
+        raise ValueError(
+            "Fruit matrix atoms must be contiguous int16 "
+            f"{(FRUIT_QSRT_ATOMS_PER_EXPERT, words_per_atom)}"
+        )
+    if not isinstance(mode, LogicalRateMode) or mode.record_count != 4:
+        raise ValueError("Fruit atom unpacking requires one four-record rate mode")
+    hidden_tiles = FRUIT_QSRT_GEOMETRY.hidden_channels // 16
+    rates = paired_record_bits(mode)
+    fc1 = matrix in ("w1", "w3")
+    output = torch.empty(
+        (FRUIT_QSRT_PAIR_COUNT, FRUIT_QSRT_PAIR_WORDS),
+        dtype=torch.int16,
+        device=atoms.device,
+    )
+    for pair in range(FRUIT_QSRT_PAIR_COUNT):
+        source = atoms.narrow(
+            0, pair * FRUIT_QSRT_ATOMS_PER_PAIR, FRUIT_QSRT_ATOMS_PER_PAIR
+        )
+        source_cursor = 0
+        pieces: list[torch.Tensor] = []
+        for side in range(2):
+            bits = rates[2 * pair + side]
+            side_words_per_atom = hidden_tiles * 16 * bits
+            side = source.narrow(1, source_cursor, side_words_per_atom)
+            if fc1:
+                side = side.reshape(
+                    FRUIT_QSRT_ATOMS_PER_PAIR, hidden_tiles, 16 * bits
+                ).permute(1, 0, 2)
+            pieces.append(side.contiguous().reshape(-1))
+            source_cursor += side_words_per_atom
+        if source_cursor != words_per_atom:
+            raise AssertionError("Fruit atom unpacker did not consume one atom")
+        output[pair].copy_(torch.cat(pieces))
+    return output.contiguous()
+
+
+def pack_fruit_local_scale_atoms(scale: torch.Tensor) -> torch.Tensor:
+    """Transpose one physical 512-value local scale into logical atoms."""
+
+    expected_shape = (FRUIT_QSRT_GEOMETRY.intermediate_channels,)
+    if (
+        scale.dtype != torch.float16
+        or tuple(scale.shape) != expected_shape
+        or not scale.is_contiguous()
+    ):
+        raise ValueError(
+            f"Fruit local scale must be contiguous float16 {expected_shape}"
+        )
+    side_channels = FRUIT_QSRT_ATOM_CHANNELS // 2
+    output = torch.empty(
+        (FRUIT_QSRT_ATOMS_PER_EXPERT, FRUIT_QSRT_ATOM_CHANNELS),
+        dtype=torch.float16,
+        device=scale.device,
+    )
+    for pair in range(FRUIT_QSRT_PAIR_COUNT):
+        for stripe in range(FRUIT_QSRT_ATOMS_PER_PAIR):
+            atom = pair * FRUIT_QSRT_ATOMS_PER_PAIR + stripe
+            for side in range(2):
+                record = 2 * pair + side
+                source_begin = (
+                    record * FRUIT_QSRT_RECORD_CHANNELS + stripe * side_channels
+                )
+                output[atom, side * side_channels : (side + 1) * side_channels].copy_(
+                    scale.narrow(0, source_begin, side_channels)
+                )
+    return output.contiguous()
+
+
+def unpack_fruit_local_scale_atoms(atoms: torch.Tensor) -> torch.Tensor:
+    """Invert :func:`pack_fruit_local_scale_atoms`."""
+
+    expected_shape = (
+        FRUIT_QSRT_ATOMS_PER_EXPERT,
+        FRUIT_QSRT_ATOM_CHANNELS,
+    )
+    if (
+        atoms.dtype != torch.float16
+        or tuple(atoms.shape) != expected_shape
+        or not atoms.is_contiguous()
+    ):
+        raise ValueError(
+            f"Fruit local-scale atoms must be contiguous float16 {expected_shape}"
+        )
+    side_channels = FRUIT_QSRT_ATOM_CHANNELS // 2
+    output = torch.empty(
+        FRUIT_QSRT_GEOMETRY.intermediate_channels,
+        dtype=torch.float16,
+        device=atoms.device,
+    )
+    for pair in range(FRUIT_QSRT_PAIR_COUNT):
+        for stripe in range(FRUIT_QSRT_ATOMS_PER_PAIR):
+            atom = pair * FRUIT_QSRT_ATOMS_PER_PAIR + stripe
+            for side in range(2):
+                record = 2 * pair + side
+                target_begin = (
+                    record * FRUIT_QSRT_RECORD_CHANNELS + stripe * side_channels
+                )
+                output.narrow(0, target_begin, side_channels).copy_(
+                    atoms[atom, side * side_channels : (side + 1) * side_channels]
+                )
+    return output.contiguous()
+
+
+def fruit_physical_atom_rotation(layer: int, expert: int) -> int:
+    """Return the whole-pair storage rotation for one Fruit expert."""
+
+    if isinstance(layer, bool) or not isinstance(layer, int) or layer < 0:
+        raise ValueError("Fruit atom layer must be a nonnegative integer")
+    if isinstance(expert, bool) or not isinstance(expert, int) or expert < 0:
+        raise ValueError("Fruit atom expert must be a nonnegative integer")
+    pair_rotation = (5 * expert + layer) % FRUIT_QSRT_PAIR_COUNT
+    return pair_rotation * FRUIT_QSRT_ATOMS_PER_PAIR
+
+
+def rotate_fruit_expert_atoms(
+    logical_atoms: torch.Tensor, layer: int, expert: int
+) -> torch.Tensor:
+    """Place logical Fruit atoms in global physical-slot order."""
+
+    if logical_atoms.ndim < 1 or logical_atoms.shape[0] != FRUIT_QSRT_ATOMS_PER_EXPERT:
+        raise ValueError(
+            "logical Fruit atoms must have leading dimension "
+            f"{FRUIT_QSRT_ATOMS_PER_EXPERT}"
+        )
+    return torch.roll(
+        logical_atoms,
+        shifts=fruit_physical_atom_rotation(layer, expert),
+        dims=0,
+    ).contiguous()
+
+
+def unrotate_fruit_expert_atoms(
+    physical_atoms: torch.Tensor, layer: int, expert: int
+) -> torch.Tensor:
+    """Return physical Fruit atoms to logical record-pair order."""
+
+    if (
+        physical_atoms.ndim < 1
+        or physical_atoms.shape[0] != FRUIT_QSRT_ATOMS_PER_EXPERT
+    ):
+        raise ValueError(
+            "physical Fruit atoms must have leading dimension "
+            f"{FRUIT_QSRT_ATOMS_PER_EXPERT}"
+        )
+    return torch.roll(
+        physical_atoms,
+        shifts=-fruit_physical_atom_rotation(layer, expert),
+        dims=0,
+    ).contiguous()
+
+
+def pack_fruit_expert_atoms(
+    *,
+    layer: int,
+    expert: int,
+    r13: int,
+    r2: int,
+    w13_trellis: torch.Tensor,
+    w2_trellis: torch.Tensor,
+    intermediate_rotations: torch.Tensor,
+) -> torch.Tensor:
+    """Pack one pair-shaped Fruit expert as physical byte atoms."""
+
+    modes = fruit_rate_modes()
+    if r13 not in range(len(modes)) or r2 not in range(len(modes)):
+        raise ValueError("Fruit atom formats must encode R0/R1/R2")
+    if (
+        w13_trellis.dtype != torch.int16
+        or tuple(w13_trellis.shape) != (2, FRUIT_QSRT_PAIR_COUNT, FRUIT_QSRT_PAIR_WORDS)
+        or not w13_trellis.is_contiguous()
+    ):
+        raise ValueError("Fruit w13 atom source has the wrong pair contract")
+    if (
+        w2_trellis.dtype != torch.int16
+        or tuple(w2_trellis.shape) != (FRUIT_QSRT_PAIR_COUNT, FRUIT_QSRT_PAIR_WORDS)
+        or not w2_trellis.is_contiguous()
+    ):
+        raise ValueError("Fruit w2 atom source has the wrong pair contract")
+    if (
+        intermediate_rotations.dtype != torch.float16
+        or tuple(intermediate_rotations.shape)
+        != (3 * FRUIT_QSRT_GEOMETRY.intermediate_channels,)
+        or not intermediate_rotations.is_contiguous()
+    ):
+        raise ValueError("Fruit local rotations have the wrong atom contract")
+
+    logical = torch.empty(
+        (FRUIT_QSRT_ATOMS_PER_EXPERT, FRUIT_QSRT_ATOM_BUNDLE_BYTES),
+        dtype=torch.uint8,
+        device=w13_trellis.device,
+    )
+    for matrix, payload, mode_id, local_index in (
+        ("w1", w13_trellis[0].contiguous(), r13, 0),
+        ("w3", w13_trellis[1].contiguous(), r13, 1),
+        ("w2", w2_trellis, r2, 2),
+    ):
+        trellis = pack_fruit_matrix_atoms(payload, modes[mode_id], matrix=matrix).view(
+            torch.uint8
+        )
+        trellis_begin = _FRUIT_QSRT_MATRIX_ATOM_TRELLIS_OFFSETS[matrix]
+        logical[
+            :, trellis_begin : trellis_begin + FRUIT_QSRT_MATRIX_ATOM_TRELLIS_BYTES
+        ].copy_(trellis.reshape(FRUIT_QSRT_ATOMS_PER_EXPERT, -1))
+        scale_begin = _FRUIT_QSRT_MATRIX_ATOM_SCALE_OFFSETS[matrix]
+        local = intermediate_rotations.narrow(
+            0,
+            local_index * FRUIT_QSRT_GEOMETRY.intermediate_channels,
+            FRUIT_QSRT_GEOMETRY.intermediate_channels,
+        )
+        scale_atoms = pack_fruit_local_scale_atoms(local.contiguous()).view(torch.uint8)
+        logical[
+            :, scale_begin : scale_begin + FRUIT_QSRT_MATRIX_ATOM_SCALE_BYTES
+        ].copy_(scale_atoms.reshape(FRUIT_QSRT_ATOMS_PER_EXPERT, -1))
+    return rotate_fruit_expert_atoms(logical, layer, expert)
+
+
+def _align_fruit_atom_section(value: int) -> int:
+    return (
+        (value + FRUIT_QSRT_STORAGE_ALIGNMENT - 1)
+        // FRUIT_QSRT_STORAGE_ALIGNMENT
+        * FRUIT_QSRT_STORAGE_ALIGNMENT
+    )
+
+
+def pack_fruit_atom_layer(
+    tensors: Mapping[str, torch.Tensor], *, layer: int
+) -> dict[str, torch.Tensor]:
+    """Convert a complete pair-shaped layer into the serving atom tensors."""
+
+    required = {
+        "expert_ids",
+        "formats",
+        "w13_trellis",
+        "w2_trellis",
+        "gate_suh",
+        "up_suh",
+        "intermediate_rotations",
+        "down_svh",
+    }
+    if not required.issubset(tensors):
+        raise ValueError("Fruit pair layer is missing atom source tensors")
+    expert_ids = tensors["expert_ids"]
+    formats = tensors["formats"]
+    experts = int(expert_ids.numel())
+    if (
+        expert_ids.dtype != torch.int32
+        or tuple(expert_ids.shape) != (experts,)
+        or not torch.equal(expert_ids, torch.arange(experts, dtype=torch.int32))
+    ):
+        raise ValueError("Fruit atom layers require dense ordered expert IDs")
+    if (
+        formats.dtype != torch.int8
+        or tuple(formats.shape) != (experts, 2)
+        or bool(torch.any((formats < 0) | (formats > 2)))
+    ):
+        raise ValueError("Fruit atom layer formats must be [experts,2] R0/R1/R2")
+    atoms = torch.empty(
+        (FRUIT_QSRT_ATOMS_PER_EXPERT, experts, FRUIT_QSRT_ATOM_BUNDLE_BYTES),
+        dtype=torch.uint8,
+    )
+    for expert in range(experts):
+        atoms[:, expert].copy_(
+            pack_fruit_expert_atoms(
+                layer=layer,
+                expert=expert,
+                r13=int(formats[expert, 0]),
+                r2=int(formats[expert, 1]),
+                w13_trellis=tensors["w13_trellis"][:, expert].contiguous(),
+                w2_trellis=tensors["w2_trellis"][expert].contiguous(),
+                intermediate_rotations=tensors["intermediate_rotations"][
+                    expert
+                ].contiguous(),
+            )
+        )
+
+    format_section = torch.zeros(FRUIT_QSRT_FORMAT_SECTION_BYTES, dtype=torch.uint8)
+    format_section[:experts] = (formats[:, 0].to(torch.uint8) << 4) | formats[:, 1].to(
+        torch.uint8
+    )
+    shared = torch.stack(
+        (tensors["gate_suh"], tensors["up_suh"], tensors["down_svh"])
+    ).contiguous()
+    expected_shared = (3, experts, FRUIT_QSRT_GEOMETRY.hidden_channels)
+    if shared.dtype != torch.float16 or tuple(shared.shape) != expected_shared:
+        raise ValueError(f"Fruit shared rotations must have shape {expected_shared}")
+    shared_raw = shared.view(torch.uint8).reshape(-1)
+    shared_section = torch.zeros(
+        _align_fruit_atom_section(shared_raw.numel()), dtype=torch.uint8
+    )
+    shared_section[: shared_raw.numel()].copy_(shared_raw)
+
+    payload_bytes = experts * FRUIT_QSRT_ATOM_BUNDLE_BYTES
+    stride_bytes = _align_fruit_atom_section(payload_bytes)
+    atom_slab = torch.zeros(
+        (FRUIT_QSRT_ATOMS_PER_EXPERT, stride_bytes), dtype=torch.uint8
+    )
+    atom_slab[:, :payload_bytes].copy_(
+        atoms.reshape(FRUIT_QSRT_ATOMS_PER_EXPERT, payload_bytes)
+    )
+    return {
+        FRUIT_QSRT_FORMAT_TENSOR: format_section,
+        FRUIT_QSRT_SHARED_SCALE_TENSOR: shared_section,
+        FRUIT_QSRT_ATOM_TENSOR: atom_slab,
+    }
+
+
 def decode_fruit_matrix(
     payload: torch.Tensor,
     suh: torch.Tensor,
@@ -645,67 +1083,71 @@ def _encode_matrix_family(
     return result
 
 
-def encode_fruit_expert(
-    store: FruitMatrixStore,
+def _finalize_expert(
+    sources: Mapping[MatrixName, torch.Tensor],
+    selected: Mapping[MatrixName, FruitMatrixCandidate],
+    encoder_permutation: torch.Tensor,
+    physical_permutation: torch.Tensor,
+    *,
+    layer: int,
+    expert: int,
+    r13: int,
+    r2: int,
+    selection: dict[str, object],
+) -> FruitExpertEncoding:
+    finalized = {
+        matrix: _finalize_candidate(
+            selected[matrix],
+            sources[matrix],
+            encoder_permutation,
+            physical_permutation,
+        )
+        for matrix in FRUIT_QSRT_MATRICES
+    }
+    return FruitExpertEncoding(
+        layer=layer,
+        expert=expert,
+        r13=r13,
+        r2=r2,
+        encoder_permutation=encoder_permutation.detach().cpu().contiguous(),
+        physical_permutation=physical_permutation.detach().cpu().contiguous(),
+        matrices=finalized,
+        selection=selection,
+    )
+
+
+def _encode_identity_expert(
+    sources: Mapping[MatrixName, torch.Tensor],
     *,
     layer: int,
     expert: int,
     device: torch.device,
-    hessians: Mapping[MatrixName, torch.Tensor] | None = None,
-    quantizer_module: ModuleType | object | None = None,
+    quantizer_module: ModuleType | object,
+    global_h13: torch.Tensor | None = None,
+    fallback_evidence: Mapping[str, object] | None = None,
+    force_r0_reason: str | None = None,
+    calibration_fingerprint: str | None = None,
 ) -> FruitExpertEncoding:
-    """Encode one real Fruit expert and select R13/R2 by normalized weight SSE.
-
-    The selection policy is intentionally diagnostic and weight-only. A future
-    corpus-calibrated caller may supply dense Hessians, but must not relabel this
-    selector as activation-calibrated without changing the artifact evidence.
-    """
-
-    if device.type != "cuda":
-        raise ValueError("Fruit QSRT encoding requires a CUDA device")
-    sources = {
-        matrix: store.load_matrix(layer, expert, matrix, device=device)
-        for matrix in FRUIT_QSRT_MATRICES
-    }
     encoder_permutation, physical_permutation, group_scores = fruit_weight_permutations(
         sources["w1"], sources["w3"], sources["w2"]
     )
-    resolved_hessians: dict[MatrixName, torch.Tensor] = {}
-    supplied = {} if hessians is None else dict(hessians)
-    if set(supplied) - set(FRUIT_QSRT_MATRICES):
-        raise ValueError("Fruit Hessian map contains an unknown matrix")
-    for matrix in FRUIT_QSRT_MATRICES:
-        dimension = (
-            FRUIT_QSRT_GEOMETRY.intermediate_channels
-            if matrix == "w2"
-            else FRUIT_QSRT_GEOMETRY.hidden_channels
+    if global_h13 is None:
+        h13 = torch.eye(
+            FRUIT_QSRT_GEOMETRY.hidden_channels, dtype=torch.float32, device=device
         )
-        value = supplied.get(matrix)
-        if value is None:
-            value = torch.eye(dimension, dtype=torch.float32, device=device)
-        else:
-            value = value.to(device=device, dtype=torch.float32).contiguous()
-        if tuple(value.shape) != (dimension, dimension):
-            raise ValueError(
-                f"{matrix} Hessian must have shape {(dimension, dimension)}"
-            )
-        if matrix == "w2":
-            value = value.index_select(0, encoder_permutation).index_select(
-                1, encoder_permutation
-            )
-        resolved_hessians[matrix] = value
-
-    if quantizer_module is None:
-        raise ValueError(
-            "quantizer_module is required; load it with "
-            "kquant.exl3_loader.load_qsrt_encoder and install the SQG quantizer"
-        )
-
+    else:
+        expected_h13 = (FRUIT_QSRT_GEOMETRY.hidden_channels,) * 2
+        if global_h13.dtype != torch.float32 or tuple(global_h13.shape) != expected_h13:
+            raise ValueError("Fruit fallback global H13 has the wrong contract")
+        h13 = global_h13.to(device=device, dtype=torch.float32).contiguous()
+    identity_h2 = torch.eye(
+        FRUIT_QSRT_GEOMETRY.intermediate_channels, dtype=torch.float32, device=device
+    )
     upstream = _encode_matrix_family(
         (sources["w1"], sources["w3"]),
         ("w1", "w3"),
         encoder_permutation,
-        hessians=(resolved_hessians["w1"], resolved_hessians["w3"]),
+        hessians=(h13, h13),
         layer=layer,
         expert=expert,
         device=device,
@@ -715,14 +1157,13 @@ def encode_fruit_expert(
         (sources["w2"],),
         ("w2",),
         encoder_permutation,
-        hessians=(resolved_hessians["w2"],),
+        hessians=(identity_h2,),
         layer=layer,
         expert=expert,
         device=device,
         quantizer_module=quantizer_module,
     )
     candidates = {**upstream, **downstream}
-
     r13_scores = torch.stack(
         [
             _normalized_sse(sources["w1"], candidates["w1"][mode].reconstruction)
@@ -736,39 +1177,404 @@ def encode_fruit_expert(
             for mode in range(3)
         ]
     )
-    r13, r2 = (int(r13_scores.argmin().cpu()), int(r2_scores.argmin().cpu()))
-    selected = {
-        "w1": candidates["w1"][r13],
-        "w3": candidates["w3"][r13],
-        "w2": candidates["w2"][r2],
-    }
-    finalized = {
-        matrix: _finalize_candidate(
-            selected[matrix],
-            sources[matrix],
-            encoder_permutation,
-            physical_permutation,
-        )
-        for matrix in FRUIT_QSRT_MATRICES
-    }
-    selection = {
-        "policy": "weight_normalized_sse_v1",
-        "calibrated_activations": False,
-        "hessian_policy": "identity" if hessians is None else "caller_supplied",
-        "r13_scores": [float(value) for value in r13_scores.cpu().tolist()],
-        "r2_scores": [float(value) for value in r2_scores.cpu().tolist()],
-        "group_score_min": float(group_scores.min().cpu()),
-        "group_score_max": float(group_scores.max().cpu()),
-    }
-    return FruitExpertEncoding(
+    if force_r0_reason is None:
+        r13, r2 = (int(r13_scores.argmin().cpu()), int(r2_scores.argmin().cpu()))
+        selection: dict[str, object] = {
+            "policy": "weight_normalized_sse_v1",
+            "calibrated_activations": False,
+            "hessian_policy": "identity",
+        }
+    else:
+        r13 = r2 = 0
+        selection = {
+            "policy": "activation_coupled_functional_sse_v1",
+            "calibrated_activations": True,
+            "hessian_policy": (
+                "global_fit_h13_identity_h2_fallback"
+                if global_h13 is not None
+                else "identity_fallback"
+            ),
+            "accepted": False,
+            "reason": force_r0_reason,
+            "calibration_fingerprint": calibration_fingerprint,
+        }
+        if fallback_evidence is not None:
+            selection["support"] = dict(fallback_evidence)
+    selection.update(
+        {
+            "r13_scores": [float(value) for value in r13_scores.cpu().tolist()],
+            "r2_scores": [float(value) for value in r2_scores.cpu().tolist()],
+            "group_score_min": float(group_scores.min().cpu()),
+            "group_score_max": float(group_scores.max().cpu()),
+        }
+    )
+    return _finalize_expert(
+        sources,
+        {
+            "w1": candidates["w1"][r13],
+            "w3": candidates["w3"][r13],
+            "w2": candidates["w2"][r2],
+        },
+        encoder_permutation,
+        physical_permutation,
         layer=layer,
         expert=expert,
         r13=r13,
         r2=r2,
-        encoder_permutation=encoder_permutation.detach().cpu().contiguous(),
-        physical_permutation=physical_permutation.detach().cpu().contiguous(),
-        matrices=finalized,
         selection=selection,
+    )
+
+
+def _middle_rows(
+    rows: FruitCalibrationRows,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    values = rows.inputs.to(device=device, dtype=torch.float32)
+    return F.silu(values @ gate.T) * (values @ up.T)
+
+
+def _activation_permutations(
+    middle: torch.Tensor,
+    gates: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if middle.ndim != 2 or middle.shape[1] != FRUIT_QSRT_GEOMETRY.intermediate_channels:
+        raise ValueError("Fruit calibration middle rows have the wrong shape")
+    if gates.ndim != 1 or gates.numel() != middle.shape[0] or not gates.numel():
+        raise ValueError("Fruit calibration permutation requires routed fit rows")
+    weights = gates.to(device=middle.device, dtype=torch.float32).square()
+    denominator = weights.sum()
+    if not bool(torch.isfinite(denominator)) or float(denominator) <= 0:
+        raise ValueError("Fruit calibration permutation has no positive route weight")
+    channel_scores = (middle.square() * weights[:, None]).sum(dim=0) / denominator
+    group_scores = channel_scores.reshape(-1, 4).mean(dim=1)
+    group_order = torch.argsort(group_scores, stable=True)
+    offsets = torch.arange(4, device=middle.device)
+    encoder = (group_order[:, None] * 4 + offsets[None]).flatten().contiguous()
+    physical = repack_record_axis(
+        encoder,
+        paired_record_order(fruit_rate_modes()[0]),
+        axis=0,
+        record_channels=FRUIT_QSRT_RECORD_CHANNELS,
+    ).contiguous()
+    return encoder, physical, group_scores.contiguous()
+
+
+def _functional_metric(
+    rows: FruitCalibrationRows,
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return functional_sse_by_request(
+        reference,
+        candidate,
+        rows.gates,
+        rows.document_ids,
+        rows.requests,
+    )
+
+
+def _metric_summary(
+    metric: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> dict[str, object]:
+    sse, energy, counts = metric
+    sse_total = float(sse.double().sum())
+    energy_total = float(energy.double().sum())
+    return {
+        "routed_sse": sse_total,
+        "reference_energy": energy_total,
+        "normalized_sse": sse_total / energy_total if energy_total > 0 else None,
+        "documents": int(torch.count_nonzero(counts)),
+        "rows": int(counts.sum()),
+    }
+
+
+def _calibration_support(
+    calibration: FruitExpertCalibration,
+) -> tuple[str | None, dict[str, object]]:
+    fit_documents = int(torch.unique(calibration.fit.document_ids).numel())
+    confirmation_documents = int(
+        torch.unique(calibration.confirmation.document_ids).numel()
+    )
+    fit_effective_rows = (
+        weighted_effective_sample_size(calibration.fit.gates.float().square())
+        if calibration.fit.row_count
+        else 0.0
+    )
+    evidence: dict[str, object] = {
+        "fit_documents": fit_documents,
+        "minimum_fit_documents": PHASE1_MIN_FIT_DOCUMENTS,
+        "confirmation_documents": confirmation_documents,
+        "minimum_confirmation_documents": PHASE1_MIN_CONFIRMATION_DOCUMENTS,
+        "fit_effective_rows": fit_effective_rows,
+        "minimum_fit_effective_rows": FRUIT_CALIBRATION_MIN_FIT_EFFECTIVE_ROWS,
+    }
+    if fit_documents == 0:
+        reason = "no routed fit rows; deterministic R0/R0 fallback"
+    elif fit_documents < PHASE1_MIN_FIT_DOCUMENTS:
+        reason = "insufficient fit-document support; deterministic R0/R0 fallback"
+    elif fit_effective_rows < FRUIT_CALIBRATION_MIN_FIT_EFFECTIVE_ROWS:
+        reason = "insufficient effective fit rows; deterministic R0/R0 fallback"
+    elif confirmation_documents < PHASE1_MIN_CONFIRMATION_DOCUMENTS:
+        reason = (
+            "insufficient confirmation-document support; deterministic R0/R0 fallback"
+        )
+    else:
+        reason = None
+    return reason, evidence
+
+
+def _encode_calibrated_expert(
+    sources: Mapping[MatrixName, torch.Tensor],
+    calibration: FruitExpertCalibration,
+    *,
+    layer: int,
+    expert: int,
+    device: torch.device,
+    quantizer_module: ModuleType | object,
+) -> FruitExpertEncoding:
+    if calibration.layer != layer or calibration.expert != expert:
+        raise ValueError("Fruit calibration assignment does not match the expert")
+    fallback_reason, support_evidence = _calibration_support(calibration)
+    if fallback_reason is not None:
+        return _encode_identity_expert(
+            sources,
+            layer=layer,
+            expert=expert,
+            device=device,
+            quantizer_module=quantizer_module,
+            global_h13=calibration.global_h13,
+            fallback_evidence=support_evidence,
+            force_r0_reason=fallback_reason,
+            calibration_fingerprint=calibration.fingerprint,
+        )
+
+    global_h13 = calibration.global_h13.to(
+        device=device, dtype=torch.float32
+    ).contiguous()
+    source_middle = {
+        split: _middle_rows(rows, sources["w1"], sources["w3"], device=device)
+        for split, rows in (
+            ("fit", calibration.fit),
+            ("confirmation", calibration.confirmation),
+            ("validation", calibration.validation),
+        )
+    }
+    encoder_permutation, physical_permutation, group_scores = _activation_permutations(
+        source_middle["fit"], calibration.fit.gates
+    )
+    upstream = _encode_matrix_family(
+        (sources["w1"], sources["w3"]),
+        ("w1", "w3"),
+        encoder_permutation,
+        hessians=(global_h13, global_h13),
+        layer=layer,
+        expert=expert,
+        device=device,
+        quantizer_module=quantizer_module,
+    )
+
+    downstream_by_r13: dict[
+        int, dict[MatrixName, tuple[FruitMatrixCandidate, ...]]
+    ] = {}
+    h2_evidence: dict[str, object] = {}
+    identity_h2 = torch.eye(
+        FRUIT_QSRT_GEOMETRY.intermediate_channels,
+        dtype=torch.float32,
+        device=device,
+    )
+    fit_middle_by_r13: dict[int, torch.Tensor] = {}
+    for r13 in range(3):
+        middle = _middle_rows(
+            calibration.fit,
+            upstream["w1"][r13].reconstruction,
+            upstream["w3"][r13].reconstruction,
+            device=device,
+        )
+        fit_middle_by_r13[r13] = middle
+        _, h2, evidence = build_expert_hessians(
+            calibration.fit.inputs,
+            calibration.fit.gates,
+            middle,
+            global_h13=global_h13,
+            global_h2=identity_h2,
+            device=device,
+        )
+        h2 = h2.index_select(0, encoder_permutation).index_select(
+            1, encoder_permutation
+        )
+        downstream_by_r13[r13] = _encode_matrix_family(
+            (sources["w2"],),
+            ("w2",),
+            encoder_permutation,
+            hessians=(h2,),
+            layer=layer,
+            expert=expert,
+            device=device,
+            quantizer_module=quantizer_module,
+        )
+        h2_evidence[f"R{r13}"] = evidence
+
+    rows_by_split = {
+        "fit": calibration.fit,
+        "confirmation": calibration.confirmation,
+        "validation": calibration.validation,
+    }
+    reference_outputs = {
+        split: middle @ sources["w2"].T for split, middle in source_middle.items()
+    }
+    middle_by_mode_split: dict[tuple[int, str], torch.Tensor] = {}
+    for r13 in range(3):
+        middle_by_mode_split[(r13, "fit")] = fit_middle_by_r13[r13]
+        for split in ("confirmation", "validation"):
+            middle_by_mode_split[(r13, split)] = _middle_rows(
+                rows_by_split[split],
+                upstream["w1"][r13].reconstruction,
+                upstream["w3"][r13].reconstruction,
+                device=device,
+            )
+
+    modes = tuple((r13, r2) for r13 in range(3) for r2 in range(3))
+    metrics: dict[
+        str, dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    ] = {split: {} for split in rows_by_split}
+    for r13, r2 in modes:
+        down = downstream_by_r13[r13]["w2"][r2].reconstruction
+        for split, rows in rows_by_split.items():
+            candidate_output = middle_by_mode_split[(r13, split)] @ down.T
+            metrics[split][(r13, r2)] = _functional_metric(
+                rows,
+                reference_outputs[split],
+                candidate_output,
+            )
+
+    fit_counts = metrics["fit"][(0, 0)][2]
+    confirmation_counts = metrics["confirmation"][(0, 0)][2]
+    for split, expected_counts in (
+        ("fit", fit_counts),
+        ("confirmation", confirmation_counts),
+    ):
+        if any(
+            not torch.equal(metric[2], expected_counts)
+            for metric in metrics[split].values()
+        ):
+            raise ValueError(f"Fruit {split} metric support changed across formats")
+    decision = select_phase1_rate_pair(
+        {mode: metrics["fit"][mode][0] for mode in modes},
+        {mode: metrics["confirmation"][mode][0] for mode in modes},
+        fit_counts=fit_counts,
+        confirmation_counts=confirmation_counts,
+        modes=modes,
+        seed=deterministic_expert_seed(layer, expert),
+    )
+    r13, r2 = decision.selected
+    selected_mode = (r13, r2)
+    baseline_validation = metrics["validation"][(0, 0)][0].double().sum()
+    selected_validation = metrics["validation"][selected_mode][0].double().sum()
+    validation_improvement = (
+        1.0 - float(selected_validation / baseline_validation)
+        if float(baseline_validation) > 0
+        else None
+    )
+    selection = {
+        "policy": "activation_coupled_functional_sse_v1",
+        "calibrated_activations": True,
+        "hessian_policy": "global_fit_h13_candidate_conditional_expert_h2",
+        "permutation_policy": "gate_square_post_situ_energy_h2_reverse",
+        "calibration_fingerprint": calibration.fingerprint,
+        "proposed": {
+            "r13": decision.proposed_r13,
+            "r2": decision.proposed_r2,
+        },
+        "selected": {
+            "r13": decision.selected_r13,
+            "r2": decision.selected_r2,
+        },
+        "accepted": decision.accepted,
+        "reason": decision.reason,
+        "fit_documents": decision.fit_documents,
+        "confirmation_documents": decision.confirmation_documents,
+        "confirmation_relative_improvement": (
+            decision.confirmation_relative_improvement
+        ),
+        "confirmation_ci95": list(decision.confirmation_ci95),
+        "bootstrap_replicates_valid": decision.bootstrap_replicates_valid,
+        "group_score_min": float(group_scores.min().cpu()),
+        "group_score_max": float(group_scores.max().cpu()),
+        "candidate_conditional_h2": h2_evidence,
+        "functional_metrics": {
+            split: {
+                f"R13={mode[0]},R2={mode[1]}": _metric_summary(metric)
+                for mode, metric in sorted(values.items())
+            }
+            for split, values in metrics.items()
+        },
+        "validation_selected_vs_r0_relative_improvement": validation_improvement,
+    }
+    return _finalize_expert(
+        sources,
+        {
+            "w1": upstream["w1"][r13],
+            "w3": upstream["w3"][r13],
+            "w2": downstream_by_r13[r13]["w2"][r2],
+        },
+        encoder_permutation,
+        physical_permutation,
+        layer=layer,
+        expert=expert,
+        r13=r13,
+        r2=r2,
+        selection=selection,
+    )
+
+
+def encode_fruit_expert(
+    store: FruitMatrixStore,
+    *,
+    layer: int,
+    expert: int,
+    device: torch.device,
+    hessians: Mapping[MatrixName, torch.Tensor] | None = None,
+    calibration: FruitExpertCalibration | None = None,
+    quantizer_module: ModuleType | object | None = None,
+) -> FruitExpertEncoding:
+    """Encode one Fruit expert with diagnostic or document-disjoint calibration."""
+
+    if device.type != "cuda":
+        raise ValueError("Fruit QSRT encoding requires a CUDA device")
+    if hessians is not None and calibration is not None:
+        raise ValueError("Fruit expert cannot mix direct Hessians and calibration")
+    sources = {
+        matrix: store.load_matrix(layer, expert, matrix, device=device)
+        for matrix in FRUIT_QSRT_MATRICES
+    }
+    if quantizer_module is None:
+        raise ValueError(
+            "quantizer_module is required; load it with "
+            "kquant.exl3_loader.load_qsrt_encoder and install the SQG quantizer"
+        )
+    if calibration is not None:
+        return _encode_calibrated_expert(
+            sources,
+            calibration,
+            layer=layer,
+            expert=expert,
+            device=device,
+            quantizer_module=quantizer_module,
+        )
+    if hessians is not None:
+        raise ValueError(
+            "direct Fruit Hessians are unsupported; provide an authenticated "
+            "document-disjoint calibration capture"
+        )
+    return _encode_identity_expert(
+        sources,
+        layer=layer,
+        expert=expert,
+        device=device,
+        quantizer_module=quantizer_module,
     )
 
 

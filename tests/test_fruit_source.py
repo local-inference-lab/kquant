@@ -8,11 +8,13 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from kquant.fruit_source import (
     FRUIT_ANNEALED_SPEC,
     FruitCheckpointStore,
     FruitModelSpec,
+    FruitSafetensorsStore,
     preflight_fruit_checkpoint,
 )
 
@@ -103,6 +105,53 @@ def _save(
     return replace(spec, checkpoint_sha256=digest)
 
 
+def _save_safetensors_store(
+    root: Path,
+    *,
+    spec: FruitModelSpec = _BASE_SPEC,
+    omit: str | None = None,
+) -> str:
+    root.mkdir()
+    filename = "model-00001-of-00001.safetensors"
+    tensors = {
+        (
+            f"model.layers.{layer}.mlp.experts.{expert}.{_PROJECTION[matrix]}.weight"
+        ): _matrix(
+            spec,
+            matrix,
+            offset=1000 * layer_index + 100 * matrix_index + expert,
+        )
+        for layer_index, layer in enumerate((*spec.layers, spec.mtp_layer))
+        for expert in range(spec.num_experts)
+        for matrix_index, matrix in enumerate(("w1", "w3", "w2"))
+    }
+    if omit is not None:
+        del tensors[omit]
+    save_file(tensors, root / filename)
+    config = {
+        "dtype": "bfloat16",
+        "hidden_size": spec.hidden_size,
+        "moe_intermediate_size": spec.intermediate_size,
+        "n_routed_experts": spec.num_experts,
+        "num_hidden_layers": spec.mtp_layer,
+        "rope_theta": spec.trained_rope_theta,
+    }
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    index = {"weight_map": {name: filename for name in tensors}}
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps(index), encoding="utf-8"
+    )
+    entries = {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in ("config.json", "model.safetensors.index.json", filename)
+    }
+    (root / "MANIFEST.sha256").write_text(
+        "".join(f"{digest}  {name}\n" for name, digest in sorted(entries.items())),
+        encoding="utf-8",
+    )
+    return hashlib.sha256((root / "MANIFEST.sha256").read_bytes()).hexdigest()
+
+
 def test_real_annealed_spec_freezes_source_identity_and_geometry() -> None:
     assert FRUIT_ANNEALED_SPEC == FruitModelSpec(
         model_id="malaiwah/GLM-5.2-SIQ-Fruit",
@@ -166,6 +215,57 @@ def test_per_expert_wrapper_maps_w3_to_up_proj(tmp_path: Path) -> None:
         rtol=0,
         atol=0,
     )
+
+
+def test_safetensors_store_authenticates_and_maps_mtp_matrix(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hf"
+    manifest_sha256 = _save_safetensors_store(root)
+
+    store = FruitSafetensorsStore(
+        root,
+        spec=_BASE_SPEC,
+        expected_manifest_sha256=manifest_sha256,
+    )
+    result = store.load_matrix(13, 2, "w3")
+
+    assert store.evidence["source_container"] == "hf_bf16_safetensors"
+    assert result.dtype == torch.float32
+    assert result.is_contiguous()
+    torch.testing.assert_close(
+        result,
+        _matrix(_BASE_SPEC, "w3", offset=2102).float(),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_safetensors_store_fails_closed_on_inventory_and_mutation(
+    tmp_path: Path,
+) -> None:
+    omitted = "model.layers.4.mlp.experts.1.up_proj.weight"
+    incomplete = tmp_path / "incomplete"
+    incomplete_manifest = _save_safetensors_store(incomplete, omit=omitted)
+    with pytest.raises(ValueError, match="inventory is not exact"):
+        FruitSafetensorsStore(
+            incomplete,
+            spec=_BASE_SPEC,
+            expected_manifest_sha256=incomplete_manifest,
+        )
+
+    intact = tmp_path / "intact"
+    intact_manifest = _save_safetensors_store(intact)
+    store = FruitSafetensorsStore(
+        intact,
+        spec=_BASE_SPEC,
+        expected_manifest_sha256=intact_manifest,
+    )
+    shard = intact / "model-00001-of-00001.safetensors"
+    with shard.open("ab") as handle:
+        handle.write(b"changed")
+    with pytest.raises(ValueError, match="changed after authentication"):
+        store.load_matrix(3, 0, "w1")
 
 
 def test_preflight_is_json_serializable_and_pins_legacy_theta(tmp_path: Path) -> None:
