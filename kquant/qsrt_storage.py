@@ -43,7 +43,8 @@ from kquant.qsrt import (
 SCHEMA = "kquant_kimi_k3_qsrt_atoms_v1"
 MAGIC = b"KQSRTA1\0"
 VERSION = 1
-PROFILE_ID_QSRT_E4M3 = 1
+ENCODING_QSRT_SQG_E4M3 = "qsrt_sqg_e4m3"
+PROFILE_ID_QSRT_SQG_E4M3 = 1
 _HEADER = struct.Struct("<8s14I4Q")
 
 ATOM_SIDE_CHANNELS = TILE_CHANNELS
@@ -521,14 +522,14 @@ class QSRTLayerHeader:
 
     layer: int
     layout: QSRTLayerLayout
-    profile_id: int = PROFILE_ID_QSRT_E4M3
+    profile_id: int = PROFILE_ID_QSRT_SQG_E4M3
 
     def __post_init__(self) -> None:
         if isinstance(self.layer, bool) or not isinstance(self.layer, int):
             raise TypeError("layer must be an integer")
         if not 1 <= self.layer <= 92:
             raise ValueError("K3 MoE layer must be in 1..92")
-        if self.profile_id != PROFILE_ID_QSRT_E4M3:
+        if self.profile_id != PROFILE_ID_QSRT_SQG_E4M3:
             raise ValueError("unsupported QSRT reconstruction profile")
 
     def to_bytes(self) -> bytes:

@@ -6,17 +6,17 @@ import pytest
 import torch
 
 from kquant.exl3_reference import (
-    CODEBOOK_QSRT_E4M3,
+    CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
+    CODEBOOK_SQG_CHEB,
     CODEBOOK_SQG_NORMAL_E4M3,
     decode_qsrt_regularized_weight,
     decode_regularized_weight,
 )
 from kquant.sqg_e4m3 import (
-    qsrt_e4m3_bytes,
-    qsrt_e4m3_rank_lut_bytes,
-    qsrt_e4m3_rank_permutation,
+    sqg_xor_cheb_t12_bytes,
+    sqg_xor_cheb_t12_rank_lut_bytes,
+    sqg_xor_rank_permutation,
     sqg_cheb_normal_e4m3_bytes,
     sqg_cheb_normal_rank_e4m3_bytes,
     sqg_codebook_bytes,
@@ -29,7 +29,7 @@ from kquant.sqg_e4m3 import (
 )
 
 
-_QSRT_E4M3_SHA256 = {
+_SQG_XOR_CHEB_T12_SHA256 = {
     "t12": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e",
     2: "62027916386245a84c86156a0a08b6cf07e41548871af0e56fb40780558f6293",
     3: "afe7b3633e7d243b00b379b18ec4dca573722b3727cafef47fcb6470d7e7e6c9",
@@ -41,19 +41,19 @@ def _sha256(tensor: torch.Tensor) -> str:
     return hashlib.sha256(tensor.contiguous().numpy().tobytes()).hexdigest()
 
 
-def test_primary_qsrt_e4m3_t12_matches_runtime_contract() -> None:
-    table = qsrt_e4m3_rank_lut_bytes()
+def test_primary_sqg_xor_cheb_t12_matches_runtime_contract() -> None:
+    table = sqg_xor_cheb_t12_rank_lut_bytes()
     assert table.dtype == torch.uint8
     assert table.shape == (1 << 12,)
-    assert _sha256(table) == _QSRT_E4M3_SHA256["t12"]
+    assert _sha256(table) == _SQG_XOR_CHEB_T12_SHA256["t12"]
 
 
 @pytest.mark.parametrize("bits", (2, 3, 4))
-def test_primary_qsrt_e4m3_graph_and_labels_match_runtime_contract(
+def test_primary_sqg_xor_cheb_t12_graph_and_labels_match_runtime_contract(
     bits: int,
 ) -> None:
-    ranks = qsrt_e4m3_rank_permutation(bits)
-    labels = qsrt_e4m3_bytes(bits)
+    ranks = sqg_xor_rank_permutation(bits)
+    labels = sqg_xor_cheb_t12_bytes(bits)
     width = 16 - bits
     strata = (ranks >> width).reshape(1 << width, 1 << bits)
 
@@ -62,11 +62,11 @@ def test_primary_qsrt_e4m3_graph_and_labels_match_runtime_contract(
         torch.sort(strata, dim=1).values,
         torch.arange(1 << bits).expand_as(strata),
     )
-    assert torch.equal(labels, qsrt_e4m3_rank_lut_bytes()[ranks >> 4])
-    assert torch.equal(labels, sqg_codebook_bytes(bits, CODEBOOK_QSRT_E4M3))
+    assert torch.equal(labels, sqg_xor_cheb_t12_rank_lut_bytes()[ranks >> 4])
+    assert torch.equal(labels, sqg_codebook_bytes(bits, CODEBOOK_SQG_XOR_CHEB_T12))
     assert bool(torch.isfinite(labels.view(torch.float8_e4m3fn).float()).all())
     assert not bool(((labels & 0x7F) == 0).logical_and(labels != 0).any())
-    assert _sha256(labels) == _QSRT_E4M3_SHA256[bits]
+    assert _sha256(labels) == _SQG_XOR_CHEB_T12_SHA256[bits]
 
 
 @pytest.mark.parametrize("bits", (2, 3, 4))
@@ -139,7 +139,7 @@ def test_w2_k2_q8h4_profile_changes_only_k_axis_k2(
 ) -> None:
     actual = sqg_codebook_bytes(
         bits,
-        CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
+        CODEBOOK_SQG_CHEB,
         rate_axis=rate_axis,
     )
     rank_lut = sqg_cheb_normal_rank_e4m3_bytes()
@@ -157,7 +157,7 @@ def test_w2_k2_q8h4_profile_changes_only_k_axis_k2(
 
 def test_w2_k2_q8h4_profile_requires_rate_axis() -> None:
     with pytest.raises(ValueError, match="requires rate_axis"):
-        sqg_codebook_bytes(2, CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3)
+        sqg_codebook_bytes(2, CODEBOOK_SQG_CHEB)
 
 
 def test_reference_decoder_accepts_custom_codebook() -> None:
@@ -209,13 +209,13 @@ def test_reference_decoder_applies_w2_only_k2_q8h4_profile() -> None:
         states,
         rate_axis="k",
         tile_bits=tile_bits,
-        codebook=CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
+        codebook=CODEBOOK_SQG_CHEB,
     )
     upstream = decode_qsrt_regularized_weight(
         states,
         rate_axis="n",
         tile_bits=tile_bits,
-        codebook=CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
+        codebook=CODEBOOK_SQG_CHEB,
     )
     native_down = decode_qsrt_regularized_weight(
         states,

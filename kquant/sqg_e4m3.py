@@ -5,7 +5,7 @@ deliberately separates the rolling trellis graph from its numerical labels:
 the encoder still stores K branch bits per coefficient, while a deterministic
 K-specific mapping turns each 16-bit transition state into an E4M3 value.
 
-The primary ``qsrt_sqg_e4m3`` profile composes the carry-mixed bijective SQG rank
+The primary ``sqg_xor_cheb_t12`` codebook composes the carry-mixed bijective SQG rank
 map with a modal 12-bit compression of the Chebyshev-derived finite-E4M3
 staircase.  The older exact-graph and R44 mappings remain explicit research
 controls.  All paths return raw E4M3 bytes so the offline encoder and serving
@@ -21,10 +21,8 @@ import torch
 
 SQG_NORMAL_E4M3 = "sqg-normal-e4m3"
 SQG_CHEB_NORMAL_E4M3 = "sqg-cheb-normal-e4m3"
-SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3 = (
-    "sqg-cheb-normal-k2-q8h4-w2-e4m3"
-)
-QSRT_E4M3 = "qsrt_sqg_e4m3"
+SQG_CHEB = "sqg_cheb"
+SQG_XOR_CHEB_T12 = "sqg_xor_cheb_t12"
 
 _TRANSITIONS = 1 << 16
 _CLIP = 1.0 / 2048.0
@@ -242,13 +240,13 @@ def sqg_cheb_normal_e4m3_bytes(bits: int) -> torch.Tensor:
 
 
 @lru_cache(maxsize=1)
-def qsrt_e4m3_rank_lut_bytes() -> torch.Tensor:
+def sqg_xor_cheb_t12_rank_lut_bytes() -> torch.Tensor:
     """Return the frozen 4 KiB modal T12 reconstruction staircase.
 
     Each byte represents sixteen consecutive ranks of the exact normal
     staircase.  The modal byte is selected per block; ties select the lower
     raw byte.  This is the same immutable construction used by the B12X
-    ``qsrt_sqg_e4m3`` decoder.
+    ``sqg_xor_cheb_t12`` decoder.
     """
 
     exact = sqg_cheb_normal_rank_e4m3_bytes().reshape(1 << 12, 16)
@@ -260,7 +258,7 @@ def qsrt_e4m3_rank_lut_bytes() -> torch.Tensor:
 
 
 @lru_cache(maxsize=None)
-def qsrt_e4m3_rank_permutation(bits: int) -> torch.Tensor:
+def sqg_xor_rank_permutation(bits: int) -> torch.Tensor:
     """Return the primary carry-mixed SQG rank for every L16 codeword.
 
     The two triangular xorshifts are bijections over the retained history,
@@ -288,12 +286,12 @@ def qsrt_e4m3_rank_permutation(bits: int) -> torch.Tensor:
 
 
 @lru_cache(maxsize=None)
-def _qsrt_e4m3_cpu_bytes(bits: int) -> torch.Tensor:
-    ranks = qsrt_e4m3_rank_permutation(bits)
-    return qsrt_e4m3_rank_lut_bytes().index_select(0, ranks >> 4).contiguous()
+def _sqg_xor_cheb_t12_cpu_bytes(bits: int) -> torch.Tensor:
+    ranks = sqg_xor_rank_permutation(bits)
+    return sqg_xor_cheb_t12_rank_lut_bytes().index_select(0, ranks >> 4).contiguous()
 
 
-def qsrt_e4m3_bytes(
+def sqg_xor_cheb_t12_bytes(
     bits: int,
     *,
     device: torch.device | str = "cpu",
@@ -301,7 +299,7 @@ def qsrt_e4m3_bytes(
     """Return the primary QSRT-E4M3 labels for all L16 codewords."""
 
     _validate(bits, "normal")
-    return _qsrt_e4m3_cpu_bytes(bits).to(device=device).contiguous()
+    return _sqg_xor_cheb_t12_cpu_bytes(bits).to(device=device).contiguous()
 
 
 def sqg_codebook_bytes(
@@ -313,13 +311,13 @@ def sqg_codebook_bytes(
 ) -> torch.Tensor:
     """Return exact state-indexed E4M3 labels for a named SQG codebook."""
 
-    if codebook == QSRT_E4M3:
-        return qsrt_e4m3_bytes(bits, device=device)
+    if codebook == SQG_XOR_CHEB_T12:
+        return sqg_xor_cheb_t12_bytes(bits, device=device)
     if codebook == SQG_NORMAL_E4M3:
         return sqg_e4m3_bytes(bits, "normal", device=device)
     if codebook == SQG_CHEB_NORMAL_E4M3:
         return sqg_cheb_normal_e4m3_bytes(bits).to(device=device).contiguous()
-    if codebook == SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3:
+    if codebook == SQG_CHEB:
         if rate_axis not in ("k", "n"):
             raise ValueError(
                 "the w2-only K2-Q8H4 profile requires rate_axis 'k' or 'n'"

@@ -36,7 +36,7 @@ from kquant.capture import (
 )
 from kquant.io.safetensors_stream import AtomicSafetensorsWriter, TensorSpec
 from kquant.exl3_reference import (
-    CODEBOOK_QSRT_E4M3,
+    CODEBOOK_SQG_XOR_CHEB_T12,
     QSRT_CODEBOOKS,
 )
 from kquant.sqg_quantizer import install_sqg_quantizer
@@ -719,7 +719,7 @@ def _validate_sample_cache_contract(sample_cache: Path, capture: Path) -> None:
         raise ValueError(f"sample cache capture {source} != {capture.resolve()}")
 
 
-def _load_quantizer_module(root: Path, codebook: str = CODEBOOK_QSRT_E4M3):
+def _load_quantizer_module(root: Path, codebook: str = CODEBOOK_SQG_XOR_CHEB_T12):
     # Import only the encoder namespace.  The full exllamav3 package pulls in
     # serving/tokenizer dependencies that are intentionally absent here.
     from kquant.exl3_loader import load_qsrt_encoder
@@ -1786,7 +1786,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--codebook",
         choices=QSRT_CODEBOOKS,
-        default=CODEBOOK_QSRT_E4M3,
+        default=CODEBOOK_SQG_XOR_CHEB_T12,
         help="procedural reconstruction family used by the Viterbi encoder",
     )
     parser.add_argument(

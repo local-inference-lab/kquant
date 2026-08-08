@@ -4,9 +4,9 @@ import pytest
 import torch
 
 from kquant.exl3_reference import (
-    CODEBOOK_QSRT_E4M3,
+    CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
+    CODEBOOK_SQG_CHEB,
     CODEBOOK_SQG_NORMAL_E4M3,
 )
 from kquant.qsrt import (
@@ -111,7 +111,7 @@ def test_qsrt_quant_args_selects_sqg() -> None:
     for bits, labels in primary_args["sqg_e4m3_luts_by_bits"].items():
         assert torch.equal(
             labels,
-            sqg_codebook_bytes(bits, CODEBOOK_QSRT_E4M3),
+            sqg_codebook_bytes(bits, CODEBOOK_SQG_XOR_CHEB_T12),
         )
 
     args = _qsrt_quant_args(
@@ -143,7 +143,7 @@ def test_qsrt_quant_args_selects_sqg() -> None:
         layer=1,
         device=torch.device("cuda", 0),
         shared_scale_scope=None,
-        codebook=CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
+        codebook=CODEBOOK_SQG_CHEB,
     )
     assert not torch.equal(
         q8_down_args["sqg_e4m3_luts_by_bits"][2],
@@ -163,7 +163,7 @@ def test_qsrt_quant_args_selects_sqg() -> None:
         layer=1,
         device=torch.device("cuda", 0),
         shared_scale_scope=None,
-        codebook=CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
+        codebook=CODEBOOK_SQG_CHEB,
     )
     for bits in (2, 3, 4):
         assert torch.equal(

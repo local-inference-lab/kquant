@@ -21,9 +21,9 @@ from typing import Literal
 import torch
 
 from kquant.exl3_reference import (
-    CODEBOOK_QSRT_E4M3,
+    CODEBOOK_SQG_XOR_CHEB_T12,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
-    CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
+    CODEBOOK_SQG_CHEB,
     CODEBOOK_SQG_NORMAL_E4M3,
     QSRT_CODEBOOKS,
     decode_qsrt_weight,
@@ -1109,7 +1109,7 @@ def decode_qsrt_exl3_weight(
     suh: torch.Tensor,
     svh: torch.Tensor,
     *,
-    codebook: str = CODEBOOK_QSRT_E4M3,
+    codebook: str = CODEBOOK_SQG_XOR_CHEB_T12,
 ) -> torch.Tensor:
     """Decode a complete QSRT payload to its physical EXL-oriented weight."""
 

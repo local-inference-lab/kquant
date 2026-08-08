@@ -24,7 +24,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 
 from kquant import constants as C
-from kquant.exl3_reference import CODEBOOK_QSRT_E4M3, QSRT_CODEBOOKS
+from kquant.exl3_reference import CODEBOOK_SQG_XOR_CHEB_T12, QSRT_CODEBOOKS
 from kquant.io.hf_cache import read_safetensors_header
 from kquant.qsrt import (
     EXPERTS_PER_LAYER,
@@ -78,7 +78,7 @@ class QSRTCandidatePool:
     content_sha256: str | None = None
     trellis_schema: str | None = None
     mode_ids: tuple[int, ...] = (0, 1, 2)
-    codebook: str = CODEBOOK_QSRT_E4M3
+    codebook: str = CODEBOOK_SQG_XOR_CHEB_T12
 
 
 @dataclass(frozen=True)

@@ -198,7 +198,7 @@ def main() -> None:
     codebook = candidate_manifest.get("codebook")
     if codebook is None:
         raise ValueError("candidate manifest is missing its QSRT codebook")
-    if codebook != "qsrt_sqg_e4m3":
+    if codebook != "sqg_xor_cheb_t12":
         raise ValueError(
             f"B12X performance harness does not support codebook {codebook!r}"
         )
