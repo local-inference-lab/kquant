@@ -247,6 +247,7 @@ _CALIBRATION_EVIDENCE_NAME = "qsrt-calibration-evidence.json"
 
 _RATE_SWEEP_SCHEMA = "kquant_fruit_uniform_rate_sweep_v1"
 _RATE_SWEEP_NAME = "evaluation/fruit-uniform-rate-sweep.json"
+_ENCODER_FINGERPRINT_SCHEMA = "kquant_fruit_qsrt_encoder_source_v2"
 _DTYPE_BYTES = {
     "BOOL": 1,
     "U8": 1,
@@ -340,6 +341,17 @@ def _source_tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _encoder_fingerprint_payload(encoder: dict[str, object]) -> dict[str, object]:
+    return {
+        "schema": _ENCODER_FINGERPRINT_SCHEMA,
+        "kquant_source_sha256": encoder["kquant_source_sha256"],
+        "exllamav3_source_sha256": encoder["exllamav3_source_sha256"],
+        "calibration_fingerprint": encoder["calibration_fingerprint"],
+        "calibration_capture_id": encoder["calibration_capture_id"],
+        "calibration_manifest_sha256": encoder["calibration_manifest_sha256"],
+    }
+
+
 def current_encoder_provenance(
     *,
     exllamav3_root: Path,
@@ -355,9 +367,10 @@ def current_encoder_provenance(
         "calibration_fingerprint": calibration.fingerprint,
         "calibration_capture_id": calibration.capture_id,
         "calibration_manifest_sha256": calibration.manifest_sha256,
+        "fingerprint_schema": _ENCODER_FINGERPRINT_SCHEMA,
     }
     encoder["fingerprint"] = hashlib.sha256(
-        _canonical_json(encoder).encode("utf-8")
+        _canonical_json(_encoder_fingerprint_payload(encoder)).encode("utf-8")
     ).hexdigest()
     return encoder
 
@@ -432,11 +445,16 @@ def _validate_rate_sweep(
         "fingerprint": calibration.fingerprint,
         "manifest_sha256": calibration.manifest_sha256,
     }
+    measured_encoder = signature.get("encoder")
+    expected_encoder = producer.get("encoder")
+    if not isinstance(measured_encoder, dict) or not isinstance(expected_encoder, dict):
+        raise TypeError("Fruit rate sweep omits its encoder identity")
     if (
         signature.get("schema") != _RATE_SWEEP_SCHEMA
         or signature.get("source") != source_evidence
         or signature.get("calibration") != expected_calibration
-        or signature.get("encoder") != producer.get("encoder")
+        or measured_encoder.get("fingerprint_schema") != _ENCODER_FINGERPRINT_SCHEMA
+        or measured_encoder.get("fingerprint") != expected_encoder.get("fingerprint")
         or signature.get("rates") != [2, 3, 4]
     ):
         raise ValueError("Fruit rate-sweep provenance does not match this build")

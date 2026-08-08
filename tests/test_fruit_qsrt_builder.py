@@ -34,6 +34,33 @@ def test_current_encoder_provenance_hashes_local_source_trees(tmp_path: Path) ->
     assert before["fingerprint"] != after["fingerprint"]
 
 
+def test_encoder_fingerprint_is_content_addressed_not_revision_addressed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    package = tmp_path / "exllamav3" / "exllamav3"
+    package.mkdir(parents=True)
+    (package / "codec.py").write_text("CODEBOOK = 1\n", encoding="utf-8")
+    calibration = SimpleNamespace(
+        fingerprint="calibration-fingerprint",
+        capture_id="capture-id",
+        manifest_sha256="manifest-sha256",
+    )
+    revisions = iter(("first-revision", "second-revision"))
+    monkeypatch.setattr(builder, "_git_revision", lambda _root: next(revisions))
+
+    first = builder.current_encoder_provenance(
+        exllamav3_root=package.parent,
+        calibration=calibration,
+    )
+    second = builder.current_encoder_provenance(
+        exllamav3_root=package.parent,
+        calibration=calibration,
+    )
+
+    assert first["kquant_revision"] != second["kquant_revision"]
+    assert first["fingerprint"] == second["fingerprint"]
+
+
 def _rate_sweep(
     *,
     source: dict[str, object] | None = None,
@@ -151,7 +178,10 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
         fingerprint=calibration_identity["fingerprint"],
         manifest_sha256=calibration_identity["manifest_sha256"],
     )
-    encoder = {"fingerprint": "c" * 64}
+    encoder = {
+        "fingerprint_schema": builder._ENCODER_FINGERPRINT_SCHEMA,
+        "fingerprint": "c" * 64,
+    }
     producer = {"encoder": encoder}
     payload = _rate_sweep(
         source=source,
@@ -171,7 +201,10 @@ def test_rate_sweep_validation_binds_build_provenance(tmp_path: Path) -> None:
         == payload
     )
 
-    producer["encoder"] = {"fingerprint": "d" * 64}
+    producer["encoder"] = {
+        "fingerprint_schema": builder._ENCODER_FINGERPRINT_SCHEMA,
+        "fingerprint": "d" * 64,
+    }
     with pytest.raises(ValueError, match="provenance"):
         builder._validate_rate_sweep(
             path,

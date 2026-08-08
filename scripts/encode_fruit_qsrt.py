@@ -22,9 +22,16 @@ from kquant.fruit_qsrt import (
     FRUIT_QSRT_SCHEMA,
     encode_fruit_expert,
 )
-from kquant.fruit_source import FRUIT_ANNEALED_SPEC, FruitCheckpointStore
+from kquant.fruit_source import (
+    FRUIT_ANNEALED_SPEC,
+    FruitCheckpointStore,
+    FruitSafetensorsStore,
+)
 from kquant.sqg_quantizer import install_sqg_quantizer
-from scripts.build_fruit_qsrt_model import current_encoder_provenance
+from scripts.build_fruit_qsrt_model import (
+    BASE_MANIFEST_SHA256,
+    current_encoder_provenance,
+)
 
 SAMPLED_ASSIGNMENTS: tuple[tuple[int, int], ...] = (
     (3, 0),
@@ -210,8 +217,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--exllamav3-root", required=True, type=Path)
     parser.add_argument("--calibration", required=True, type=Path)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.shard_count < 1:
+        parser.error("--shard-count must be positive")
+    if not 0 <= args.shard_index < args.shard_count:
+        parser.error("--shard-index must lie in 0..shard-count-1")
+    return args
 
 
 def main() -> None:
@@ -231,18 +245,28 @@ def main() -> None:
         )
     else:
         assignments = tuple(sorted(set(args.assignment)))
+    assignments = assignments[args.shard_index :: args.shard_count]
     if not assignments:
         raise ValueError("no Fruit assignments selected")
 
-    store = FruitCheckpointStore(
-        args.checkpoint,
-        spec=FRUIT_ANNEALED_SPEC,
-        expected_sha256=FRUIT_ANNEALED_SPEC.checkpoint_sha256,
-    )
+    if args.checkpoint.is_dir():
+        store = FruitSafetensorsStore(
+            args.checkpoint,
+            spec=FRUIT_ANNEALED_SPEC,
+            expected_manifest_sha256=BASE_MANIFEST_SHA256,
+        )
+    else:
+        store = FruitCheckpointStore(
+            args.checkpoint,
+            spec=FRUIT_ANNEALED_SPEC,
+            expected_sha256=FRUIT_ANNEALED_SPEC.checkpoint_sha256,
+        )
     calibration_store = FruitCalibrationStore(args.calibration)
     quantizer_module = load_qsrt_encoder(args.exllamav3_root)
     install_sqg_quantizer(quantizer_module)
-    source_sha256 = FRUIT_ANNEALED_SPEC.checkpoint_sha256
+    source_sha256 = store.evidence.get("source_sha256")
+    if not isinstance(source_sha256, str):
+        raise TypeError("Fruit source evidence has no authenticated source digest")
     encoder = current_encoder_provenance(
         exllamav3_root=args.exllamav3_root,
         calibration=calibration_store,
@@ -326,6 +350,10 @@ def main() -> None:
             if args.all
             else "explicit_assignments"
         ),
+        "shard": {
+            "count": args.shard_count,
+            "index": args.shard_index,
+        },
         "assignments": [list(value) for value in assignments],
         "assignment_count": len(assignments),
         "assignments_by_layer": {str(key): value for key, value in by_layer.items()},
