@@ -60,7 +60,6 @@ BASE_MANIFEST_SHA256 = (
     "8a7e30f3a948bbac203013160b2e6bb8d0ed50c36cf2ca1c3978701124cc7671"
 )
 EXLLAMAV3_REVISION = "791c83073f7f90c44f765a0ceeab7a05fa15b96b"
-SPARKINFER_REVISION = "680d8195b80420296d7fed2688b75406be15eb38"
 _COMPLETE_MARKER_NAME = "QSRT_COMPLETE.json"
 MODEL_CARD_TEMPLATE = r"""---
 license: mit
@@ -178,26 +177,18 @@ merge:
   encoded with KQuant revision `__KQUANT_REVISION__`.
 - B12X kernels: [`local-inference-lab/b12x#129`](https://github.com/local-inference-lab/b12x/pull/129),
   tested revision `__B12X_REVISION__`.
-- SparkInfer attention runtime:
-  [`local-inference-lab/sparkinfer`](https://github.com/local-inference-lab/sparkinfer),
-  tested revision `__SPARKINFER_REVISION__`.
 - vLLM loader: [`local-inference-lab/vllm#269`](https://github.com/local-inference-lab/vllm/pull/269),
   tested revision `__VLLM_REVISION__`.
 
 ```bash
 git clone --branch feat/fruit-qsrt-runtime https://github.com/malaiwah/sparkinfer.git b12x-fruit
 git -C b12x-fruit checkout __B12X_REVISION__
-git clone https://github.com/local-inference-lab/sparkinfer.git sparkinfer
-git -C sparkinfer checkout __SPARKINFER_REVISION__
-
-
 git clone --branch feat/fruit-qsrt-runtime https://github.com/malaiwah/vllm-voipmonitor.git vllm-fruit
 git -C vllm-fruit checkout __VLLM_REVISION__
 
 hf download malaiwah/GLM-5.2-QSRT-Fruit --local-dir GLM-5.2-QSRT-Fruit
 
 B12X_ROOT="$PWD/b12x-fruit" \
-SPARKINFER_ROOT="$PWD/sparkinfer" \
 MODEL="$PWD/GLM-5.2-QSRT-Fruit" \
 PYTHON_BIN="$PWD/vllm-fruit/.venv/bin/python" \
 CUDA_VISIBLE_DEVICES=0 \
@@ -246,8 +237,8 @@ activation modes, metadata, or incomplete manifests fail closed.
 
 ## License
 
-MIT, matching the packaged Fruit source license. KQuant, B12X, SparkInfer, and
-vLLM retain their respective repository licenses.
+MIT, matching the packaged Fruit source license. KQuant, B12X, and vLLM retain
+their respective repository licenses.
 """
 _SOURCE_EVIDENCE_NAME = ".qsrt-source-evidence.json"
 _SOURCE_EVIDENCE_SHA_NAME = ".qsrt-source-evidence.sha256"
@@ -388,7 +379,6 @@ def _producer_provenance(
     exllamav3_root: Path,
     b12x_root: Path,
     vllm_root: Path,
-    sparkinfer_root: Path,
     calibration: FruitCalibrationStore,
 ) -> dict[str, object]:
     encoder = current_encoder_provenance(
@@ -398,8 +388,6 @@ def _producer_provenance(
     runtime = {
         "b12x_revision": _git_revision(b12x_root),
         "b12x_source_sha256": _source_tree_sha256(b12x_root / "b12x"),
-        "sparkinfer_revision": _git_revision(sparkinfer_root),
-        "sparkinfer_source_sha256": _source_tree_sha256(sparkinfer_root / "sparkinfer"),
         "vllm_revision": _git_revision(vllm_root),
         "vllm_source_sha256": _source_tree_sha256(vllm_root / "vllm"),
     }
@@ -706,7 +694,6 @@ def _render_model_card(
         "__RATE_SWEEP_SECTION__": _rate_sweep_section(rate_sweep),
         "__KQUANT_REVISION__": str(encoder["kquant_revision"]),
         "__B12X_REVISION__": str(runtime["b12x_revision"]),
-        "__SPARKINFER_REVISION__": str(runtime["sparkinfer_revision"]),
         "__VLLM_REVISION__": str(runtime["vllm_revision"]),
         "__SOURCE_KIND__": str(source_evidence["source_kind"]),
         "__SOURCE_SHA256__": str(source_evidence["source_sha256"]),
@@ -2043,7 +2030,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("output", type=Path)
     parser.add_argument("--exllamav3-root", required=True, type=Path)
     parser.add_argument("--b12x-root", required=True, type=Path)
-    parser.add_argument("--sparkinfer-root", required=True, type=Path)
     parser.add_argument("--vllm-root", required=True, type=Path)
     parser.add_argument("--calibration", required=True, type=Path)
     parser.add_argument("--rate-sweep", required=True, type=Path)
@@ -2065,7 +2051,6 @@ def main() -> None:
         (Path(__file__).resolve().parents[1], "kquant"),
         (args.exllamav3_root, "exllamav3"),
         (args.b12x_root, "b12x"),
-        (args.sparkinfer_root, "sparkinfer"),
         (args.vllm_root, "vllm"),
     )
     for source_root, pathspec in source_roots:
@@ -2073,12 +2058,9 @@ def main() -> None:
     calibration = FruitCalibrationStore(args.calibration)
     if _git_revision(args.exllamav3_root) != EXLLAMAV3_REVISION:
         raise ValueError("ExLlamaV3 source revision does not match the pinned encoder")
-    if _git_revision(args.sparkinfer_root) != SPARKINFER_REVISION:
-        raise ValueError("SparkInfer source revision does not match the pinned runtime")
     producer = _producer_provenance(
         exllamav3_root=args.exllamav3_root,
         b12x_root=args.b12x_root,
-        sparkinfer_root=args.sparkinfer_root,
         vllm_root=args.vllm_root,
         calibration=calibration,
     )

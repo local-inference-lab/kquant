@@ -139,7 +139,6 @@ def test_model_card_uses_sealed_calibration_and_layer_evidence(monkeypatch) -> N
         "encoder": {"kquant_revision": "kquant-revision"},
         "runtime": {
             "b12x_revision": "b12x-revision",
-            "sparkinfer_revision": "sparkinfer-revision",
             "vllm_revision": "vllm-revision",
         },
     }
