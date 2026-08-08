@@ -230,6 +230,19 @@ def test_package_files_include_evaluation_but_exclude_resume_cache(
     assert set(files) == {"config.json", "evaluation/report.json"}
 
 
+def test_remove_part_cache_preserves_package_files(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    config.write_text("{}", encoding="utf-8")
+    parts = tmp_path / ".qsrt-parts" / "layer-003"
+    parts.mkdir(parents=True)
+    (parts / "expert-000.safetensors").write_bytes(b"resume")
+
+    builder._remove_part_cache(tmp_path)
+
+    assert not (tmp_path / ".qsrt-parts").exists()
+    assert config.read_text(encoding="utf-8") == "{}"
+
+
 def test_seed_parts_validate_source_read_only_before_copy(
     monkeypatch, tmp_path: Path
 ) -> None:

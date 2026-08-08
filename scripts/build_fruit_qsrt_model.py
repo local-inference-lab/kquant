@@ -1711,6 +1711,17 @@ def _write_config(
     _atomic_text(output / "config.json", _canonical_json(config))
 
 
+def _remove_part_cache(output: Path) -> None:
+    parts = output / ".qsrt-parts"
+    if parts.is_symlink():
+        raise ValueError(f"Fruit QSRT part cache must not be a symbolic link: {parts}")
+    if not parts.exists():
+        return
+    if not parts.is_dir():
+        raise ValueError(f"Fruit QSRT part cache is not a directory: {parts}")
+    shutil.rmtree(parts)
+
+
 def _package_files(output: Path) -> dict[str, Path]:
     files: dict[str, Path] = {}
     for path in output.iterdir():
@@ -2132,6 +2143,7 @@ def main() -> None:
         source_sha256=source_sha256,
         encoder_fingerprint=encoder_fingerprint,
     )
+    _remove_part_cache(args.output)
     _materialize_base_model(args.base_model, args.output)
     _write_config(args.base_model, args.output, producer, source_evidence)
     _write_source_evidence_seal(args.output, source_evidence, producer)
