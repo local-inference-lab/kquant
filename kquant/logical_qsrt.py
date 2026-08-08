@@ -89,6 +89,36 @@ def rate_transfer_mode(geometry: LogicalQSRTGeometry, transfer: int) -> LogicalR
     return LogicalRateMode(geometry.record_count, transfer)
 
 
+def paired_record_order(mode: LogicalRateMode) -> tuple[int, ...]:
+    """Interleave low/high records into fixed six-bit physical pairs."""
+
+    if not isinstance(mode, LogicalRateMode):
+        raise TypeError("mode must be a LogicalRateMode")
+    if mode.record_count % 2:
+        raise ValueError("paired storage requires an even record count")
+    return tuple(
+        record
+        for low in range(mode.record_count // 2)
+        for record in (low, mode.record_count - 1 - low)
+    )
+
+
+def paired_record_bits(mode: LogicalRateMode) -> tuple[int, ...]:
+    """Return physical record rates after low/high pair interleaving."""
+
+    return tuple(mode.record_bits[record] for record in paired_record_order(mode))
+
+
+def pair_kinds(mode: LogicalRateMode) -> tuple[str, ...]:
+    """Return one ``P33`` or ``P24`` descriptor per fixed-size pair."""
+
+    bits = paired_record_bits(mode)
+    pairs = tuple(zip(bits[0::2], bits[1::2], strict=True))
+    if any(pair not in ((3, 3), (2, 4)) for pair in pairs):
+        raise ValueError("paired storage supports only K3/K3 and K2/K4")
+    return tuple("P33" if pair == (3, 3) else "P24" for pair in pairs)
+
+
 FRUIT_QSRT_GEOMETRY = LogicalQSRTGeometry(
     hidden_channels=1024,
     intermediate_channels=512,

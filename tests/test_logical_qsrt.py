@@ -18,6 +18,9 @@ from kquant.logical_qsrt import (
     matrix_payload_bytes,
     matrix_rate_axis,
     matrix_shape,
+    pair_kinds,
+    paired_record_bits,
+    paired_record_order,
     rate_transfer_mode,
     repack_record_axis,
 )
@@ -45,6 +48,13 @@ def test_rate_modes_derive_canonical_record_bit_sequences() -> None:
     assert R0.record_bits == (3, 3, 3, 3)
     assert R1.record_bits == (2, 3, 3, 4)
     assert R2.record_bits == (2, 2, 4, 4)
+    assert paired_record_order(R0) == (0, 3, 1, 2)
+    assert paired_record_bits(R0) == (3, 3, 3, 3)
+    assert paired_record_bits(R1) == (2, 4, 3, 3)
+    assert paired_record_bits(R2) == (2, 4, 2, 4)
+    assert pair_kinds(R0) == ("P33", "P33")
+    assert pair_kinds(R1) == ("P24", "P33")
+    assert pair_kinds(R2) == ("P24", "P24")
 
     geometry = LogicalQSRTGeometry(
         hidden_channels=17,
