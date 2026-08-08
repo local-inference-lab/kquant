@@ -67,7 +67,7 @@ _SOURCE_SUFFIXES = frozenset(
 _COMPLETE_MARKER_NAME = "QSRT_COMPLETE.json"
 MODEL_CARD = r"""---
 license: mit
-library_name: transformers
+library_name: vllm
 pipeline_tag: text-generation
 tags:
 - glm
