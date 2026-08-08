@@ -13,7 +13,7 @@ new code, schemas, artifacts, or documentation. `X4T` is the only current X4
 format. MCG and MUL1 may remain only where they are active numerical controls
 or external EXL encoder APIs.
 
-## Current state (2026-08-06)
+## Current state (2026-08-07)
 
 - Kimi-K3 has 93 decoder layers. Layers 1-92 contain 896 routed experts each,
   for 82,432 layer/expert assignments.
@@ -28,25 +28,23 @@ or external EXL encoder APIs.
   shards.
 - The lossy search is `R0/R1/R2`, with one `r13` decision shared by `w1` and
   `w3` and an independent `r2` decision for `w2`.
-- `sqg-normal-e4m3` is the frozen R44 control. The next production pool uses
-  immutable codebook/profile ID 5,
-  `sqg-cheb-normal-k2-q8h4-w2-e4m3`: one shared finite-E4M3 Chebyshev-normal
-  staircase at K2/K3/K4, native SQG reachability for `w1`/`w3` and K3/K4, and
-  retained codeword history bit 4 as a virtual third octile-selector bit only
-  for K2 on `w2`. On 384 unseen, support-stratified experts, fixed `R0/R2`
-  routed SSE improved by 0.13345% with 269/384 wins. The layer-stratified
-  expert bootstrap interval was +0.0771% to +0.1974% improvement and the
-  independent document-cluster interval was +0.0707% to +0.2031%. This is one
-  reconstruction staircase with matrix/rate-specific graph reachability, not
-  a second K2 codebook or a per-expert mode.
-- The fresh profile-ID-5 candidate pool is active at
+- `qsrt-e4m3` is the primary and sole runtime codebook. It composes the
+  carry-mixed bijective SQG graph with the 4,096-byte modal T12 approximation
+  to the Chebyshev-derived finite-E4M3 staircase. K2/K3/K4 use one graph
+  construction and one scalar law; rate changes only the history/branch split.
+  kquant generates the complete direct encoder labels internally and freezes
+  SHA-256 identities for the T12 table and all three rate tables against B12X.
+  `sqg-normal-e4m3` and the exact profile-5 mappings remain offline controls
+  only; they are not valid materialized runtime profiles.
+- The prior profile-ID-5 candidate pool is at
   `/models/Kimi-K3-QSRT-CHEB-Q8H4-CANDIDATES-v1`. At the 2026-08-05 04:59 PDT
   snapshot, 44 complete atomic selection sidecars covered 27,176 experts in
   33 partly or fully represented layers. The document-confirmation gate
   accepted a nonzero rate shift for 6,691 experts (24.62%); `w2` selected R1+
   for 24.13% and coupled `w13` selected R1+ for 20.35%. This is substantial
-  evidence that rate shifting remains useful with the new codebook and
-  conditional dense-H path, but it is not the final 82,432-expert frequency:
+  evidence that rate shifting remains useful with the conditional dense-H
+  path, but it is not reusable under `qsrt-e4m3` and is not the final
+  82,432-expert frequency:
   the work-balanced partial schedule is not a uniform layer sample.
 - X4T is the exact endpoint. There is no raw-MXFP4 or old variable-rate X4 tier
   in a QSRT artifact.
@@ -76,20 +74,21 @@ or external EXL encoder APIs.
   and production/control LUTs were bit-exact; the full 374-test suite passed.
   A layer-24, 20-expert, production-shaped endpoint run fell from about 136 to
   89 seconds and emitted the same candidate-payload SHA-256 as the preceding
-  C128 implementation. The active pool was resumed with this encoder on all
-  12 workers at 2026-08-05 06:13 PDT.
+  C128 implementation. That run qualified the encoder optimization but does
+  not make its profile-5 payload reusable by `qsrt-e4m3`.
 - `C32` remains a research-only screening context. On the initial 20-expert
   comparison it put every C128 confirmation winner in its top three, but that
-  evidence is not broad enough to change this production pool. Candidate
-  construction and final selection for the active pool remain full `C128`.
+  evidence is not broad enough to change production policy. Candidate
+  construction and final selection for the next pool remain full `C128`.
 - The next pool keeps `h2_reverse` neuron ordering, rotation draw zero, and
   `folded_scale_power=0`. On the 24-expert production panel, identity,
   energy-balanced, and stratified-energy-balanced permutations all lost to
   `h2_reverse`; every tested nonzero folded-scale strength (`0.25`, `0.5`,
   `1.0`) also increased routed validation SSE. Keep those alternatives as
   research controls rather than silently enabling them in production.
-- Resume the active profile-ID-5 pool only with identical settings. Do not
-  resume the stopped R44/X4T build or mix its shards into the new artifact.
+- Build `qsrt-e4m3` only into a fresh candidate pool. Do not resume or mix the
+  profile-ID-5 or R44 candidate shards into the new artifact; changing the
+  graph changes the Viterbi paths and requires full re-encoding.
 
 The active design is documented in [docs/qsrt-technical-brief.md](docs/qsrt-technical-brief.md).
 Capture and covariance requirements are in
@@ -314,7 +313,7 @@ time. It must use the new capture, the validated Hessian bundle, separate
   --hessians <validated-kqhess> \
   --hessian-policy captured_blend \
   --mode-ids 0,1,2 \
-  --codebook sqg-cheb-normal-k2-q8h4-w2-e4m3 \
+  --codebook qsrt-e4m3 \
   --layout qsrt_guarded_reuse \
   --permutation-policy h2_reverse \
   --folded-scale-power 0 \

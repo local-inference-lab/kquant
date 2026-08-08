@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from kquant import constants as C
-from kquant.exl3_reference import QSRT_CODEBOOKS
+from kquant.exl3_reference import CODEBOOK_QSRT_E4M3
 from kquant.qsrt import (
     EXPERT_TRELLIS_BYTES,
     INTERMEDIATE_CHANNELS,
@@ -133,8 +133,8 @@ def validate_qsrt_artifact(
     if not isinstance(codec_contract, dict):
         raise ValueError("QSRT build codec contract is missing")
     codebook = codec_contract.get("trellis_codebook")
-    if codebook not in QSRT_CODEBOOKS:
-        raise ValueError("QSRT build trellis codebook is unsupported")
+    if codebook != CODEBOOK_QSRT_E4M3:
+        raise ValueError("QSRT build must use the qsrt-e4m3 runtime codebook")
     expected_contract = {
         "trellis_codebook": codebook,
         "trellis_modes": list(PHASE1_MODE_IDS),

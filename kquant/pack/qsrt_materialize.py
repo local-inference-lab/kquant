@@ -20,7 +20,7 @@ import torch
 from safetensors import safe_open
 
 from kquant import constants as C
-from kquant.exl3_reference import QSRT_CODEBOOKS
+from kquant.exl3_reference import CODEBOOK_QSRT_E4M3
 from kquant.pack.qsrt_allocation import (
     HIGH_TIER_STORAGE,
     QSRT_ALLOCATION_KIND,
@@ -233,8 +233,8 @@ def validate_qsrt_materialization_allocation(
                 f"QSRT allocation meta {name} mismatch: "
                 f"{meta.get(name)!r} != {expected!r}"
             )
-    if pool.codebook not in QSRT_CODEBOOKS or pool.mode_ids != PHASE1_MODE_IDS:
-        raise ValueError("QSRT requires a production codebook and R0/R1/R2")
+    if pool.codebook != CODEBOOK_QSRT_E4M3 or pool.mode_ids != PHASE1_MODE_IDS:
+        raise ValueError("QSRT materialization requires qsrt-e4m3 and R0/R1/R2")
     if x4t_index.manifest.get("source_revision") != pool.manifest.get(
         "source_revision"
     ):

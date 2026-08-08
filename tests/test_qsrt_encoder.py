@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from kquant.exl3_reference import (
+    CODEBOOK_QSRT_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
@@ -15,6 +16,7 @@ from kquant.qsrt import (
     RECORDS_PER_EXPERT,
     record_bits,
 )
+from kquant.sqg_e4m3 import sqg_codebook_bytes
 from kquant.pack.qsrt_encoder import (
     QSRTTransformSeeds,
     _qsrt_quant_args,
@@ -98,6 +100,20 @@ def test_qsrt_quant_args_selects_sqg() -> None:
     plan = plan_qsrt_matrix(
         _scrambled_record_contexts(), RATE_TRANSFER_MODES[1], matrix="w2"
     )
+    primary_args = _qsrt_quant_args(
+        plan,
+        matrix="w2",
+        layer=1,
+        device=torch.device("cuda", 0),
+        shared_scale_scope=None,
+    )
+    assert set(primary_args["sqg_e4m3_luts_by_bits"]) == {2, 3, 4}
+    for bits, labels in primary_args["sqg_e4m3_luts_by_bits"].items():
+        assert torch.equal(
+            labels,
+            sqg_codebook_bytes(bits, CODEBOOK_QSRT_E4M3),
+        )
+
     args = _qsrt_quant_args(
         plan,
         matrix="w2",

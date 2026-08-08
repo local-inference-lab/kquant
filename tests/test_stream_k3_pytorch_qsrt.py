@@ -118,7 +118,7 @@ def test_qsrt_compressed_decode_uses_matrix_mode_and_orientation(
     assert isinstance(actual_descriptor, QSRTTrellisDescriptor)
     assert actual_descriptor.mode_id == 2
     assert actual_descriptor.rate_axis == "n"
-    assert observed["codebook"] == "sqg-normal-e4m3"
+    assert observed["codebook"] == "qsrt-e4m3"
     assert (actual_descriptor.k_tiles, actual_descriptor.n_tiles) == (224, 192)
     assert dense.dtype == torch.bfloat16
     assert tuple(dense.shape) == expected

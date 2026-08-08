@@ -34,7 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from kquant import constants as KQ_C
 from kquant.correctness import DEFAULT_PROMPT, write_json
-from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3, QSRT_CODEBOOKS
+from kquant.exl3_reference import CODEBOOK_QSRT_E4M3, QSRT_CODEBOOKS
 from kquant.kimi_stream import (
     MODEL_TENSOR_PREFIX,
     IndexedSafetensors,
@@ -733,7 +733,7 @@ def _decode_qsrt_trellis_matrix(
     matrix: str,
     expected: tuple[int, ...],
     device: torch.device,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
 ) -> tuple[torch.Tensor, int]:
     """Reconstruct one QSRT trellis matrix as an official ``[out, in]`` weight."""
 
@@ -793,7 +793,7 @@ class QSRTStagedExperts:
         scheme: Any,
         compressor: Any,
         device: torch.device,
-        codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+        codebook: str = CODEBOOK_QSRT_E4M3,
     ):
         if reader.header.layer != layer_idx:
             raise ValueError(

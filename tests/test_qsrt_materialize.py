@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from kquant import constants as C
-from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3
+from kquant.exl3_reference import CODEBOOK_QSRT_E4M3
 from kquant.qsrt import PHASE1_MODE_IDS
 from kquant.pack.qsrt_pool import QSRTCandidatePool
 from kquant.pack.qsrt_allocation import (
@@ -53,7 +53,7 @@ def _fixtures(tmp_path: Path) -> tuple[QSRTCandidatePool, X4TCostIndex]:
         completion={},
         content_sha256="ab" * 32,
         mode_ids=PHASE1_MODE_IDS,
-        codebook=CODEBOOK_SQG_NORMAL_E4M3,
+        codebook=CODEBOOK_QSRT_E4M3,
     )
     matrix_costs = np.full((*shape, 3), 5_566_464, dtype=np.int64)
     expert_costs = matrix_costs.sum(axis=2)

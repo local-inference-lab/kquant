@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 import torch
 
 from kquant.exl3_reference import (
+    CODEBOOK_QSRT_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
@@ -11,6 +14,9 @@ from kquant.exl3_reference import (
     decode_regularized_weight,
 )
 from kquant.sqg_e4m3 import (
+    qsrt_e4m3_bytes,
+    qsrt_e4m3_rank_lut_bytes,
+    qsrt_e4m3_rank_permutation,
     sqg_cheb_normal_e4m3_bytes,
     sqg_cheb_normal_rank_e4m3_bytes,
     sqg_codebook_bytes,
@@ -21,6 +27,46 @@ from kquant.sqg_e4m3 import (
     sqg_k2_eight_stratum_rank_permutation,
     sqg_rank_permutation,
 )
+
+
+_QSRT_E4M3_SHA256 = {
+    "t12": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e",
+    2: "62027916386245a84c86156a0a08b6cf07e41548871af0e56fb40780558f6293",
+    3: "afe7b3633e7d243b00b379b18ec4dca573722b3727cafef47fcb6470d7e7e6c9",
+    4: "5a9620f0c4d8f0a60d0b6fbea921dcecbd193e6febf31043aaa6403c20389c2f",
+}
+
+
+def _sha256(tensor: torch.Tensor) -> str:
+    return hashlib.sha256(tensor.contiguous().numpy().tobytes()).hexdigest()
+
+
+def test_primary_qsrt_e4m3_t12_matches_runtime_contract() -> None:
+    table = qsrt_e4m3_rank_lut_bytes()
+    assert table.dtype == torch.uint8
+    assert table.shape == (1 << 12,)
+    assert _sha256(table) == _QSRT_E4M3_SHA256["t12"]
+
+
+@pytest.mark.parametrize("bits", (2, 3, 4))
+def test_primary_qsrt_e4m3_graph_and_labels_match_runtime_contract(
+    bits: int,
+) -> None:
+    ranks = qsrt_e4m3_rank_permutation(bits)
+    labels = qsrt_e4m3_bytes(bits)
+    width = 16 - bits
+    strata = (ranks >> width).reshape(1 << width, 1 << bits)
+
+    assert torch.equal(torch.sort(ranks).values, torch.arange(1 << 16))
+    assert torch.equal(
+        torch.sort(strata, dim=1).values,
+        torch.arange(1 << bits).expand_as(strata),
+    )
+    assert torch.equal(labels, qsrt_e4m3_rank_lut_bytes()[ranks >> 4])
+    assert torch.equal(labels, sqg_codebook_bytes(bits, CODEBOOK_QSRT_E4M3))
+    assert bool(torch.isfinite(labels.view(torch.float8_e4m3fn).float()).all())
+    assert not bool(((labels & 0x7F) == 0).logical_and(labels != 0).any())
+    assert _sha256(labels) == _QSRT_E4M3_SHA256[bits]
 
 
 @pytest.mark.parametrize("bits", (2, 3, 4))

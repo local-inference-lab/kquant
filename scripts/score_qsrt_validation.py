@@ -26,7 +26,7 @@ from safetensors.torch import load_file, save_file
 
 from kquant import constants as C
 from kquant.capture import index_layer_samples, load_capture
-from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3, QSRT_CODEBOOKS
+from kquant.exl3_reference import QSRT_CODEBOOKS
 from kquant.qsrt_candidates import index_expert_rows, request_documents
 from kquant.pack.qsrt_pool import (
     load_qsrt_candidate_pool,

@@ -1,13 +1,15 @@
-"""Stratified-quantile-graph (SQG) E4M3 reconstruction tables.
+"""QSRT and research-control SQG E4M3 reconstruction tables.
 
 This module implements the independently proposed L16 SQG labelling.  It
 deliberately separates the rolling trellis graph from its numerical labels:
 the encoder still stores K branch bits per coefficient, while a deterministic
 K-specific mapping turns each 16-bit transition state into an E4M3 value.
 
-The CUDA validation path consumes the raw FP8 bytes returned by
-``sqg_e4m3_bytes``.  ``sqg_e4m3_codebook`` widens the same bytes back to FP16
-for reference reconstruction and closure checks.
+The primary ``qsrt-e4m3`` profile composes the carry-mixed bijective SQG rank
+map with a modal 12-bit compression of the Chebyshev-derived finite-E4M3
+staircase.  The older exact-graph and R44 mappings remain explicit research
+controls.  All paths return raw E4M3 bytes so the offline encoder and serving
+kernel can share one byte-exact numerical contract.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ SQG_CHEB_NORMAL_E4M3 = "sqg-cheb-normal-e4m3"
 SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3 = (
     "sqg-cheb-normal-k2-q8h4-w2-e4m3"
 )
+QSRT_E4M3 = "qsrt-e4m3"
 
 _TRANSITIONS = 1 << 16
 _CLIP = 1.0 / 2048.0
@@ -238,6 +241,69 @@ def sqg_cheb_normal_e4m3_bytes(bits: int) -> torch.Tensor:
     ).contiguous()
 
 
+@lru_cache(maxsize=1)
+def qsrt_e4m3_rank_lut_bytes() -> torch.Tensor:
+    """Return the frozen 4 KiB modal T12 reconstruction staircase.
+
+    Each byte represents sixteen consecutive ranks of the exact normal
+    staircase.  The modal byte is selected per block; ties select the lower
+    raw byte.  This is the same immutable construction used by the B12X
+    ``qsrt-e4m3`` decoder.
+    """
+
+    exact = sqg_cheb_normal_rank_e4m3_bytes().reshape(1 << 12, 16)
+    result = torch.empty(1 << 12, dtype=torch.uint8)
+    for index, block in enumerate(exact):
+        labels, counts = torch.unique(block, return_counts=True)
+        result[index] = labels[counts == counts.max()].min()
+    return result.contiguous()
+
+
+@lru_cache(maxsize=None)
+def qsrt_e4m3_rank_permutation(bits: int) -> torch.Tensor:
+    """Return the primary carry-mixed SQG rank for every L16 codeword.
+
+    The two triangular xorshifts are bijections over the retained history,
+    the multiplier is odd, and bit reversal followed by XOR is a branch
+    permutation.  The resulting map is therefore bijective over all 65,536
+    ``(stratum, phase)`` coordinates while preserving one outgoing edge per
+    stratum in every state.
+    """
+
+    _validate(bits, "normal")
+    width = 16 - bits
+    history_mask = (1 << width) - 1
+    branch_mask = (1 << bits) - 1
+    codeword = torch.arange(_TRANSITIONS, dtype=torch.int64)
+    history = codeword >> bits
+    branch = codeword & branch_mask
+
+    mixed = history ^ (history >> 11)
+    mixed ^= (mixed << 11) & history_mask
+    product = (0x3FA7D929 * mixed + 0xC928FD8E) & 0xFFFFFFFF
+    phase = product & history_mask
+    syndrome = product >> (32 - bits)
+    stratum = _reverse_low_bits(branch, bits) ^ syndrome
+    return ((stratum << width) | phase).contiguous()
+
+
+@lru_cache(maxsize=None)
+def _qsrt_e4m3_cpu_bytes(bits: int) -> torch.Tensor:
+    ranks = qsrt_e4m3_rank_permutation(bits)
+    return qsrt_e4m3_rank_lut_bytes().index_select(0, ranks >> 4).contiguous()
+
+
+def qsrt_e4m3_bytes(
+    bits: int,
+    *,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Return the primary QSRT-E4M3 labels for all L16 codewords."""
+
+    _validate(bits, "normal")
+    return _qsrt_e4m3_cpu_bytes(bits).to(device=device).contiguous()
+
+
 def sqg_codebook_bytes(
     bits: int,
     codebook: str,
@@ -247,6 +313,8 @@ def sqg_codebook_bytes(
 ) -> torch.Tensor:
     """Return exact state-indexed E4M3 labels for a named SQG codebook."""
 
+    if codebook == QSRT_E4M3:
+        return qsrt_e4m3_bytes(bits, device=device)
     if codebook == SQG_NORMAL_E4M3:
         return sqg_e4m3_bytes(bits, "normal", device=device)
     if codebook == SQG_CHEB_NORMAL_E4M3:

@@ -7,6 +7,7 @@ import math
 import torch
 
 from kquant.sqg_e4m3 import (
+    QSRT_E4M3,
     SQG_CHEB_NORMAL_E4M3,
     SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     SQG_NORMAL_E4M3,
@@ -17,11 +18,13 @@ from kquant.sqg_e4m3 import (
 TILE_VALUES = 256
 HADAMARD_BLOCK = 128
 CODEBOOK_SQG_NORMAL_E4M3 = SQG_NORMAL_E4M3
+CODEBOOK_QSRT_E4M3 = QSRT_E4M3
 CODEBOOK_SQG_CHEB_NORMAL_E4M3 = SQG_CHEB_NORMAL_E4M3
 CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3 = (
     SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3
 )
 QSRT_CODEBOOKS = (
+    CODEBOOK_QSRT_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
@@ -110,7 +113,7 @@ def tensor_core_permutation(device: torch.device | str = "cpu") -> torch.Tensor:
 def decode_regularized_weight(
     states: torch.Tensor,
     *,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     codebook_values: torch.Tensor | None = None,
     bits: int | None = None,
 ) -> torch.Tensor:
@@ -232,7 +235,7 @@ def decode_exl3_weight(
     suh: torch.Tensor,
     svh: torch.Tensor,
     *,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     codebook_values: torch.Tensor | None = None,
     bits: int | None = None,
 ) -> torch.Tensor:
@@ -259,7 +262,7 @@ def decode_qsrt_weight(
     *,
     rate_axis: str,
     tile_bits: tuple[int, ...],
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
 ) -> torch.Tensor:
     """Decode stored QSRT states and scales to an EXL ``[K, N]`` weight."""
 

@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 
 from kquant import constants as C
-from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3
+from kquant.exl3_reference import CODEBOOK_QSRT_E4M3
 from kquant.qsrt_candidates import RoutedRows, functional_sse_by_request
 from kquant.qsrt import (
     SCHEMA,
@@ -269,7 +269,7 @@ def decode_candidate_matrix(
     mode_id: int,
     device: torch.device,
     logical_trellis_schema: str = SCHEMA,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
 ) -> torch.Tensor:
     """Decode one stored matrix to EXL's physical ``[input, output]`` order."""
 
@@ -315,7 +315,7 @@ def selected_candidate_output(
     r2_mode_id: int,
     device: torch.device,
     logical_trellis_schema: str = SCHEMA,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
 ) -> torch.Tensor:
     """Decode and execute one selected candidate with bounded matrix residency."""
 
@@ -372,7 +372,7 @@ def score_selected_expert(
     r2_mode_id: int,
     device: torch.device,
     logical_trellis_schema: str = SCHEMA,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return held-out routed SSE, reference energy, and counts by document."""
 

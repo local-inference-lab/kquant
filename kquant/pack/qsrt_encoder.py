@@ -23,6 +23,7 @@ from typing import Literal
 import torch
 
 from kquant.exl3_reference import (
+    CODEBOOK_QSRT_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_E4M3,
     CODEBOOK_SQG_CHEB_NORMAL_K2_Q8H4_W2_E4M3,
     CODEBOOK_SQG_NORMAL_E4M3,
@@ -30,6 +31,7 @@ from kquant.exl3_reference import (
     decode_qsrt_weight,
 )
 from kquant.sqg_e4m3 import (
+    qsrt_e4m3_bytes,
     sqg_cheb_normal_e4m3_bytes,
     sqg_cheb_normal_rank_e4m3_bytes,
     sqg_k2_eight_stratum_e4m3_bytes_from_rank_lut,
@@ -372,7 +374,7 @@ def _validate_source_and_hessian(
         raise ValueError("QSRT Hessian contains non-finite values")
 
 
-def _load_quantizer_module(codebook: str = CODEBOOK_SQG_NORMAL_E4M3) -> ModuleType:
+def _load_quantizer_module(codebook: str = CODEBOOK_QSRT_E4M3) -> ModuleType:
     if codebook not in QSRT_CODEBOOKS:
         raise ValueError(f"unsupported QSRT codebook: {codebook!r}")
     from kquant.exl3_loader import load_qsrt_encoder
@@ -475,7 +477,7 @@ def _qsrt_quant_args(
     layer: int,
     device: torch.device,
     shared_scale_scope: object | None,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     sqg_e4m3_luts_by_bits: Mapping[int, torch.Tensor | None] | None = None,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
@@ -511,7 +513,11 @@ def _qsrt_quant_args(
         quant_args["sqg_e4m3_mode"] = "normal"
     else:
         if sqg_e4m3_luts_by_bits is None:
-            if codebook == CODEBOOK_SQG_CHEB_NORMAL_E4M3:
+            if codebook == CODEBOOK_QSRT_E4M3:
+                sqg_e4m3_luts_by_bits = {
+                    bits: qsrt_e4m3_bytes(bits) for bits in (2, 3, 4)
+                }
+            elif codebook == CODEBOOK_SQG_CHEB_NORMAL_E4M3:
                 sqg_e4m3_luts_by_bits = {
                     bits: sqg_cheb_normal_e4m3_bytes(bits) for bits in (2, 3, 4)
                 }
@@ -574,7 +580,7 @@ def quantize_qsrt_matrix_candidates_batched(
     quantizer_module: ModuleType | object | None = None,
     shared_scale_scope: object | None = None,
     layout: Layout = "importance_ordered",
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     sqg_e4m3_luts_by_bits: Mapping[int, torch.Tensor | None] | None = None,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
@@ -621,7 +627,7 @@ def quantize_qsrt_matrix_expert_batch(
     quantizer_module: ModuleType | object | None = None,
     shared_scale_scope: object | None = None,
     layout: Layout = "importance_ordered",
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     sqg_e4m3_luts_by_bits: Mapping[int, torch.Tensor | None] | None = None,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
@@ -905,7 +911,7 @@ def finalize_qsrt_matrix_candidate(
     *,
     layer: int,
     logical_trellis_schema: str = SCHEMA,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     tailbite_context: int = 128,
 ) -> QSRTMatrixEncoding:
     """Pack and independently decode one selected rate-shifted candidate."""
@@ -1078,7 +1084,7 @@ def quantize_qsrt_matrix(
     shared_scale_scope: object | None = None,
     shared_h_data: dict[str, object] | None = None,
     logical_trellis_schema: str = SCHEMA,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
     transform_seeds: QSRTTransformSeeds | None = None,
@@ -1309,7 +1315,7 @@ def quantize_qsrt_expert(
     shared_scale_scope: object,
     quantizer_module: ModuleType | object | None = None,
     logical_trellis_schema: str = SCHEMA,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
     transform_seeds: Mapping[str, QSRTTransformSeeds] | None = None,

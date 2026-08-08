@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from kquant.capture import LayerSamples
-from kquant.exl3_reference import CODEBOOK_SQG_NORMAL_E4M3
+from kquant.exl3_reference import CODEBOOK_QSRT_E4M3
 from kquant.qsrt_candidates import (
     PERMUTATION_POLICIES,
     PermutationPolicy,
@@ -532,7 +532,7 @@ def encode_phase1_expert(
     bootstrap_replicates: int = 2_000,
     minimum_improvement: float = 0.0,
     logical_trellis_schema: str = SCHEMA,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     layout: SearchLayout = "importance_ordered",
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,
@@ -859,7 +859,7 @@ def encode_phase1_expert_batch(
     bootstrap_replicates: int = 2_000,
     minimum_improvement: float = 0.0,
     logical_trellis_schema: str = SCHEMA,
-    codebook: str = CODEBOOK_SQG_NORMAL_E4M3,
+    codebook: str = CODEBOOK_QSRT_E4M3,
     layout: SearchLayout = "importance_ordered",
     ldlq_tf32: bool = False,
     tailbite_context: int = 128,

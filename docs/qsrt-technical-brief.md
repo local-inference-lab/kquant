@@ -199,11 +199,14 @@ $$
 \text{modal 16-rank execution label}.
 $$
 
-The authoritative runtime rank map and 4,096-byte staircase live in B12X.
-Before building a new candidate pool, kquant must import their byte-identical
-K2/K3/K4 direct labels into `kquant/sqg_e4m3.py` and use them through
-`kquant/sqg_quantizer.py`. A payload encoded under a different graph cannot be
-relabelled in place because $\{F_j\}$ and the selected Viterbi paths differ.
+The authoritative construction is implemented independently in
+`kquant/sqg_e4m3.py` and B12X. kquant generates the 4,096-byte staircase and
+complete K2/K3/K4 direct encoder labels and passes them through
+`kquant/sqg_quantizer.py`; B12X evaluates the same immutable construction at
+runtime. Frozen SHA-256 checks over the T12 table and all three 65,536-byte
+direct tables make cross-repository drift fail in unit tests. A payload
+encoded under a different graph cannot be relabelled in place because
+$\{F_j\}$ and the selected Viterbi paths differ.
 
 ## Fixed-payload rate shifting
 
